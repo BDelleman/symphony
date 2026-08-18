@@ -28,6 +28,9 @@ export type ValidationErrorCode =
   | 'invalid_hooks_timeout_ms'
   | 'invalid_agent_max_concurrent_agents'
   | 'invalid_agent_max_turns'
+  | 'invalid_agent_runtime'
+  | 'invalid_claude_command'
+  | 'invalid_claude_model'
   | 'invalid_agent_max_retry_backoff_ms'
   | 'invalid_agent_respawn_window_minutes'
   | 'invalid_agent_respawn_max_attempts_without_progress'
@@ -108,6 +111,14 @@ export interface AgentConfig {
     control_plane_stale_after_ms: number;
     host_load_per_cpu?: number | null;
   };
+}
+
+export interface AgentRuntimeConfig {
+  selected: 'codex' | 'claude-cli';
+  claude_command: string;
+  claude_model: string | null;
+  claude_allow_non_subscription_auth: boolean;
+  claude_supported_version: '2.1.224';
 }
 
 export type BudgetHardLimitPolicy = 'block_requires_resume' | 'terminate_attempt';
@@ -203,6 +214,7 @@ export interface EffectiveConfig {
   };
   hooks: HooksConfig;
   agent: AgentConfig;
+  agent_runtime?: AgentRuntimeConfig;
   budget?: BudgetConfig;
   codex: CodexConfig;
   persistence: PersistenceConfig;

@@ -124,6 +124,49 @@ function readString(value: unknown, fallback = ''): string {
   return fallback;
 }
 
+function readTruthyEnvironmentFlag(value: string | undefined): boolean {
+  return typeof value === 'string' && ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+}
+
+function resolveAgentRuntime(env: NodeJS.ProcessEnv): 'codex' | 'claude-cli' {
+  const value = env.SYMPHONY_AGENT_RUNTIME?.trim() || 'codex';
+  if (value !== 'codex' && value !== 'claude-cli') {
+    throw new WorkflowConfigError(
+      'invalid_agent_runtime',
+      `SYMPHONY_AGENT_RUNTIME must be codex or claude-cli, received ${JSON.stringify(value)}`
+    );
+  }
+  return value;
+}
+
+function resolveClaudeCommand(env: NodeJS.ProcessEnv): string {
+  const value = env.SYMPHONY_CLAUDE_COMMAND?.trim() || 'claude';
+  if (/\s|\0/.test(value) || (value.includes(path.sep) && !path.isAbsolute(value))) {
+    throw new WorkflowConfigError(
+      'invalid_claude_command',
+      'SYMPHONY_CLAUDE_COMMAND must be one executable name or an absolute path'
+    );
+  }
+  return value;
+}
+
+function resolveClaudeModel(env: NodeJS.ProcessEnv, runtime: 'codex' | 'claude-cli'): string | null {
+  const value = env.ANTHROPIC_MODEL?.trim() || null;
+  if (runtime === 'claude-cli' && !value) {
+    throw new WorkflowConfigError('invalid_claude_model', 'ANTHROPIC_MODEL is required for claude-cli');
+  }
+  if (
+    value &&
+    (Buffer.byteLength(value, 'utf8') > 256 || !/^claude-[a-z0-9][a-z0-9.-]*\d[a-z0-9.-]*$/i.test(value))
+  ) {
+    throw new WorkflowConfigError(
+      'invalid_claude_model',
+      'ANTHROPIC_MODEL must be a full pinned Claude model ID, for example claude-sonnet-4-6'
+    );
+  }
+  return value;
+}
+
 function readBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === 'boolean') {
     return value;
@@ -363,6 +406,8 @@ export class ConfigResolver {
     const logging = asRecord(config.logging);
     const worker = asRecord(config.worker);
     const server = asRecord(config.server);
+    const selectedAgentRuntime = resolveAgentRuntime(this.env);
+    const claudeModel = resolveClaudeModel(this.env, selectedAgentRuntime);
 
     const trackerKind = readString(tracker.kind, '');
     const trackerEndpoint =
@@ -605,6 +650,15 @@ export class ConfigResolver {
             ? { host_load_per_cpu: Number(dispatchBackpressure.host_load_per_cpu) }
             : {})
         }
+      },
+      agent_runtime: {
+        selected: selectedAgentRuntime,
+        claude_command: resolveClaudeCommand(this.env),
+        claude_model: claudeModel,
+        claude_allow_non_subscription_auth: readTruthyEnvironmentFlag(
+          this.env.SYMPHONY_CLAUDE_ALLOW_NON_SUBSCRIPTION_AUTH
+        ),
+        claude_supported_version: '2.1.224'
       },
       budget: {
         ...(budget.per_run_total_tokens !== undefined
