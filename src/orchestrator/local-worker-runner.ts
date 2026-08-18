@@ -2,6 +2,7 @@ import type { Issue } from '../tracker';
 import type { WorkspaceManager } from '../workspace';
 import type { CodexRunner } from '../codex';
 import type { CodexRunnerEvent } from '../codex';
+import { CodexAgentRunner, type AgentRunResult, type AgentRunner, type AgentRunnerEvent } from '../agent';
 import type { CodexCancellationOutcome, CodexInputRequestPayload } from '../codex/types';
 import { CodexRunnerError } from '../codex/errors';
 import type { EffectiveConfig } from '../workflow';
@@ -20,13 +21,15 @@ export interface LocalWorkerRunInput {
   attempt: number | null;
   worker_host?: string;
   workspaceManager: WorkspaceManager;
-  codexRunner: CodexRunner;
+  codexRunner?: CodexRunner;
+  agentRunner?: AgentRunner;
   config: EffectiveConfig;
   renderPrompt: (params: { issue: Issue; attempt: number | null }) => Promise<string>;
   resumeContext?: string | null;
   recoverWorkspaceAttemptResidue?: boolean;
   issueStateFetcher: (issue_ids: string[]) => Promise<Issue[]>;
   onCodexEvent?: (event: CodexRunnerEvent) => void;
+  onAgentEvent?: (event: AgentRunnerEvent) => void;
   cancellationSignal?: AbortSignal;
 }
 
@@ -38,10 +41,21 @@ export interface LocalWorkerRunResult {
   error?: string;
   cancellation_outcome?: CodexCancellationOutcome;
   input_required_payload?: CodexInputRequestPayload;
+  retryable?: boolean;
 }
 
 export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise<LocalWorkerRunResult> {
   let workspacePath: string | null = null;
+  const emitCompatibilityEvent = (event: CodexRunnerEvent): void => {
+    input.onCodexEvent?.(event);
+    if (input.onAgentEvent && input.onAgentEvent !== input.onCodexEvent) {
+      input.onAgentEvent({
+        ...event,
+        agent_runtime: input.agentRunner?.runtime ?? 'codex-app-server',
+        worker_process_pid: event.codex_app_server_pid
+      });
+    }
+  };
 
   try {
     const workspace = await input.workspaceManager.ensureWorkspace(input.issue.identifier);
@@ -49,7 +63,7 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
     const normalizedWorkspace = path.resolve(workspace.path);
     const normalizedRoot = path.resolve(input.config.workspace.root);
     if (normalizedWorkspace === normalizedRoot) {
-      input.onCodexEvent?.({
+      emitCompatibilityEvent({
         event: CANONICAL_EVENT.codex.startupFailed,
         timestamp: new Date().toISOString(),
         codex_app_server_pid: null,
@@ -70,16 +84,22 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
     let lastSessionId: string | null = null;
     const maxTurns = Math.max(1, input.config.agent.max_turns);
     const codexSpawnCommand = buildCodexSpawnCommand(input.config.codex);
+    const agentRunner: AgentRunner | null =
+      input.agentRunner ?? (input.codexRunner ? new CodexAgentRunner(input.codexRunner) : null);
+    if (!agentRunner) {
+      throw new Error('agent_runner_missing');
+    }
+    const onAgentEvent = input.onAgentEvent ?? (input.onCodexEvent as ((event: AgentRunnerEvent) => void) | undefined);
 
     if (input.config.codex.codex_resolution_mode === 'legacy') {
-      input.onCodexEvent?.({
+      emitCompatibilityEvent({
         event: CANONICAL_EVENT.codex.commandLegacyPathUsed,
         timestamp: new Date().toISOString(),
         codex_app_server_pid: null,
         detail: 'codex_command_legacy_path_used'
       });
     } else if (input.config.codex.codex_resolution_mode === 'mixed') {
-      input.onCodexEvent?.({
+      emitCompatibilityEvent({
         event: CANONICAL_EVENT.codex.commandMixedTypedOverridesApplied,
         timestamp: new Date().toISOString(),
         codex_app_server_pid: null,
@@ -97,10 +117,13 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
           : DEFAULT_CONTINUATION_PROMPT;
       const prompt = turnNumber === 1 && input.resumeContext ? `${input.resumeContext}\n\n${basePrompt}` : basePrompt;
 
-      const turnResult = await input.codexRunner.startSessionAndRunTurn({
-        command: codexSpawnCommand.command,
-        commandArgs: codexSpawnCommand.args,
-        commandEnv: codexSpawnCommand.env,
+      const runInput = {
+        command:
+          agentRunner.runtime === 'claude-cli'
+            ? (input.config.agent_runtime?.claude_command ?? 'claude')
+            : codexSpawnCommand.command,
+        commandArgs: agentRunner.runtime === 'claude-cli' ? [] : codexSpawnCommand.args,
+        commandEnv: agentRunner.runtime === 'claude-cli' ? undefined : codexSpawnCommand.env,
         workspaceCwd: workspace.path,
         workerHost: input.worker_host,
         prompt,
@@ -112,11 +135,29 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
         turnSandboxPolicy: input.config.codex.turn_sandbox_policy
           ? { type: input.config.codex.turn_sandbox_policy }
           : undefined,
-        onEvent: input.onCodexEvent,
+        onEvent: onAgentEvent,
         cancellationSignal: input.cancellationSignal,
         readTimeoutMs: input.config.codex.read_timeout_ms,
-        turnTimeoutMs: input.config.codex.turn_timeout_ms
-      });
+        turnTimeoutMs: input.config.codex.turn_timeout_ms,
+        runBinding: {
+          project_identity: input.config.workspace.provisioner.repo_root ?? input.config.workspace.root,
+          issue_id: currentIssue.id,
+          issue_identifier: currentIssue.identifier,
+          attempt: input.attempt
+        }
+      };
+      const turnResult: AgentRunResult | undefined =
+        turnNumber > 1 && lastSessionId && agentRunner.capabilities.native_resume === 'within-attempt'
+          ? await agentRunner.resumeSessionAndRunTurn?.({ ...runInput, previousSessionId: lastSessionId })
+          : await agentRunner.startSessionAndRunTurn(runInput);
+
+      if (!turnResult) {
+        return {
+          reason: 'abnormal',
+          session_id: lastSessionId,
+          error: 'agent_native_resume_unavailable'
+        };
+      }
 
       if (turnResult.status !== 'completed') {
         const error =
@@ -135,7 +176,8 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
           session_id: turnResult.session_id,
           error,
           cancellation_outcome: turnResult.cancellation_outcome,
-          input_required_payload: turnResult.input_required_payload
+          input_required_payload: turnResult.input_required_payload,
+          retryable: turnResult.retryable
         };
       }
       lastSessionId = turnResult.session_id;
@@ -250,6 +292,20 @@ export async function runLocalWorkerRecoveryAttempt(
   let workspacePath: string | null = null;
 
   try {
+    if (input.config.agent_runtime?.selected === 'claude-cli') {
+      return {
+        reason: 'abnormal',
+        session_id: input.previousSessionId,
+        error: 'claude_missing_tool_output_recovery_unsupported'
+      };
+    }
+    if (!input.codexRunner) {
+      return {
+        reason: 'abnormal',
+        session_id: input.previousSessionId,
+        error: 'codex_runner_missing'
+      };
+    }
     const workspace = await input.workspaceManager.ensureWorkspace(input.issue.identifier);
     workspacePath = workspace.path;
     const normalizedWorkspace = path.resolve(workspace.path);
