@@ -214,6 +214,17 @@ export interface ProjectHistoryConsumerSummaryResponse {
     requested_models: string[];
     effective_models: string[];
     telemetry_confidences: string[];
+    runtime_providers: string[];
+    provider_turn_count: number | null;
+    estimated_cost_usd: number | null;
+    by_runtime_and_model: Array<{
+      runtime_provider: string;
+      effective_model: string;
+      fact_count: number;
+      total_tokens: number | null;
+      provider_turn_count: number | null;
+      estimated_cost_usd: number | null;
+    }>;
     recent: Array<{
       requested_model: string | null;
       effective_model: string | null;
@@ -224,6 +235,9 @@ export interface ProjectHistoryConsumerSummaryResponse {
       reasoning_output_tokens: number | null;
       total_tokens: number | null;
       model_context_window: number | null;
+      runtime_provider: string | null;
+      provider_turn_count: number | null;
+      estimated_cost_usd: number | null;
       telemetry_confidence: string;
       observed_at: string;
     }>;
@@ -371,6 +385,7 @@ export function buildProjectHistoryConsumerSummaryResponse(
     resolved_at: blocker.resolved_at
   }));
   const recentTokenFacts = latestItems(timeline.token_model_facts, (fact) => fact.observed_at, 5);
+  const providerGroups = groupProviderFacts(timeline.token_model_facts);
   const recentAppServerEvents = latestItems(timeline.app_server_events, (event) => event.observed_at, 5);
   const appServerPolicy = classifyAppServerLitePolicy(recentAppServerEvents);
   const appServerExcerpts = recentAppServerEvents.map((event) => ({
@@ -420,6 +435,10 @@ export function buildProjectHistoryConsumerSummaryResponse(
       requested_models: uniqueStrings(timeline.token_model_facts.map((fact) => fact.requested_model)),
       effective_models: uniqueStrings(timeline.token_model_facts.map((fact) => fact.effective_model)),
       telemetry_confidences: uniqueStrings(timeline.token_model_facts.map((fact) => fact.telemetry_confidence)),
+      runtime_providers: uniqueStrings(timeline.token_model_facts.map((fact) => fact.runtime_provider ?? null)),
+      provider_turn_count: sumNullable(timeline.token_model_facts.map((fact) => fact.provider_turn_count ?? null)),
+      estimated_cost_usd: sumNullable(timeline.token_model_facts.map((fact) => fact.estimated_cost_usd ?? null)),
+      by_runtime_and_model: providerGroups,
       recent: recentTokenFacts.map((fact) => ({
         requested_model: fact.requested_model,
         effective_model: fact.effective_model,
@@ -430,6 +449,9 @@ export function buildProjectHistoryConsumerSummaryResponse(
         reasoning_output_tokens: fact.reasoning_output_tokens,
         total_tokens: fact.total_tokens,
         model_context_window: fact.model_context_window,
+        runtime_provider: fact.runtime_provider ?? null,
+        provider_turn_count: fact.provider_turn_count ?? null,
+        estimated_cost_usd: fact.estimated_cost_usd ?? null,
         telemetry_confidence: fact.telemetry_confidence,
         observed_at: fact.observed_at
       }))
@@ -1044,6 +1066,43 @@ function sumNullable(values: Array<number | null>): number | null {
     return null;
   }
   return present.reduce((sum, value) => sum + value, 0);
+}
+
+function groupProviderFacts(facts: TicketTimelineRecord['token_model_facts']): ProjectHistoryConsumerSummaryResponse['token_model']['by_runtime_and_model'] {
+  const groups = new Map<string, ProjectHistoryConsumerSummaryResponse['token_model']['by_runtime_and_model'][number] & {
+    token_values: Array<number | null>;
+    turn_values: Array<number | null>;
+    cost_values: Array<number | null>;
+  }>();
+  for (const fact of facts) {
+    const runtimeProvider = fact.runtime_provider ?? 'codex-app-server';
+    const effectiveModel = fact.effective_model ?? 'unknown';
+    const key = `${runtimeProvider}\u0000${effectiveModel}`;
+    const group = groups.get(key) ?? {
+      runtime_provider: runtimeProvider,
+      effective_model: effectiveModel,
+      fact_count: 0,
+      total_tokens: null,
+      provider_turn_count: null,
+      estimated_cost_usd: null,
+      token_values: [],
+      turn_values: [],
+      cost_values: []
+    };
+    group.fact_count += 1;
+    group.token_values.push(fact.total_tokens);
+    group.turn_values.push(fact.provider_turn_count ?? null);
+    group.cost_values.push(fact.estimated_cost_usd ?? null);
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .map(({ token_values, turn_values, cost_values, ...group }) => ({
+      ...group,
+      total_tokens: sumNullable(token_values),
+      provider_turn_count: sumNullable(turn_values),
+      estimated_cost_usd: sumNullable(cost_values)
+    }))
+    .sort((a, b) => `${a.runtime_provider}/${a.effective_model}`.localeCompare(`${b.runtime_provider}/${b.effective_model}`));
 }
 
 function uniqueStrings(values: Array<string | null>): string[] {

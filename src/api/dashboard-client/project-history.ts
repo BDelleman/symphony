@@ -387,7 +387,10 @@ export function renderProjectHistoryDetail() {
         return item.source_event_name + ' • ' + item.detail_status + ' • ' + (item.summary || item.redacted_excerpt || item.unavailable_reason_code || 'no excerpt');
       }),
       createProjectHistorySection('Token And Model Facts', detail.token_model_summaries, function (item: any) {
-        return (item.effective_model || item.requested_model || 'model unknown') + ' • tokens ' + (item.total_tokens === null || item.total_tokens === undefined ? 'n/a' : formatNumber(item.total_tokens)) + ' • ' + (item.telemetry_confidence || 'confidence unknown');
+        const runtime = item.runtime_provider || 'codex-app-server';
+        const turns = item.provider_turn_count === null || item.provider_turn_count === undefined ? 'n/a' : formatNumber(item.provider_turn_count);
+        const cost = item.estimated_cost_usd === null || item.estimated_cost_usd === undefined ? 'n/a' : '$' + Number(item.estimated_cost_usd).toFixed(4);
+        return runtime + ' • ' + (item.effective_model || item.requested_model || 'model unknown') + ' • tokens ' + (item.total_tokens === null || item.total_tokens === undefined ? 'n/a' : formatNumber(item.total_tokens)) + ' • turns ' + turns + ' • estimated ' + cost + ' • ' + (item.telemetry_confidence || 'confidence unknown');
       }),
       createProjectHistorySection('Blocked Input Events', detail.blocked_input_events, function (item: any) {
         return (item.request_id || 'request') + ' • ' + (item.status || 'status unknown') + ' • ' + (item.reason_code || 'no reason');
