@@ -224,6 +224,22 @@ Notes:
   - `SYMPHONY_CODEX_REASONING` (override reasoning effort)
   - `SYMPHONY_CODEX_FLAGS` (append extra Codex CLI flags as a JSON string array, for example `["--config","shell_environment_policy.inherit=all"]`)
 - `.env` is loaded automatically for startup scripts (or `SYMPHONY_ENV_FILE` for a custom file path).
+- An opt-in local Claude CLI runtime can be selected entirely from the project `.env`:
+
+  ```dotenv
+  SYMPHONY_AGENT_RUNTIME=claude-cli
+  ANTHROPIC_MODEL=claude-sonnet-4-6
+  # SYMPHONY_CLAUDE_COMMAND=/opt/homebrew/bin/claude
+  ```
+
+  Codex remains the default. Claude support is pinned to CLI `2.1.224`, local
+  macOS/Linux workers, and Team/Enterprise subscription authentication unless
+  `SYMPHONY_CLAUDE_ALLOW_NON_SUBSCRIPTION_AUTH=true` is explicitly set. Run
+  `symphony doctor` before opting in. Runtime selection is fixed at process
+  startup, so `.env` changes require a restart. Claude receives prompts over
+  stdin, has no Symphony turn or dollar cap inside one invocation, and inherits
+  the process environment; use only in trusted workspaces where the inherited
+  credential boundary is accepted.
 - If backend startup fails, the desktop window now stays open and displays an actionable boot error instead of exiting hard.
 
 ## API Endpoints
