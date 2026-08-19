@@ -28,10 +28,16 @@ description:
 - Optional helper scripts under this skill directory may be used when their
   runtime prerequisites are available; otherwise use the equivalent `gh`
   commands shown below.
+- Linear MCP is connected and the current issue identifier is known. Do not
+  fall back to raw HTTP or inherited `LINEAR_API_KEY` when readiness is missing.
 
 ## Steps
 
 1. Locate the PR for the current branch.
+1.1 Run the landing-start preflight: refresh the current Linear issue through
+    MCP and capture its issue version and labels; capture the PR head SHA,
+    checks, review decision, and exact-head approval. If `Human Review` is
+    present case-insensitively, stop and leave the issue unchanged.
 2. Confirm the current project's required local validation is green before any
    push. If the project does not define validation commands, run at least
    `git diff --check` and record that no stronger project-specific command was
@@ -46,7 +52,12 @@ description:
 7. Watch checks until complete.
 8. If checks fail, pull logs, fix the issue, commit with the `commit` skill,
    push with the `push` skill, and re-run checks.
-9. When all checks are green and review feedback is addressed, merge with
+9. When all checks are green and review feedback is addressed, repeat the full
+   Linear/PR preflight against the current PR head. The approval must apply to
+   that exact head SHA. If the issue version, labels, head, checks, or decision
+   changed, reevaluate from the new snapshot; if `Human Review` is present,
+   stop without merging. Persist the observed preflight facts in the issue
+   workpad or landing evidence. Then merge with
    merge-commit semantics (`--merge`) using the PR title/body for the merge
    subject/body, then follow the current repository's branch cleanup policy.
 9.1 Before final merge, refresh the PR body through the repository's expected PR

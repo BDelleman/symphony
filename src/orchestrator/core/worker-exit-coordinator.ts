@@ -462,7 +462,8 @@ export async function coordinateWorkerExit(
             ...workerTerminationResultContext(terminationResult),
             cleanup_workspace: normalStop.cleanup_workspace,
             worker_termination_requested: normalStop.cleanup_workspace,
-            worker_process_identity_known: Boolean(running.codex_app_server_pid),
+            worker_process_identity_known: Boolean(running.worker_process_pid ?? running.codex_app_server_pid),
+            worker_process_pid: running.worker_process_pid ?? null,
             codex_app_server_pid: running.codex_app_server_pid,
             same_issue_process_cleanup_verified: false
           }

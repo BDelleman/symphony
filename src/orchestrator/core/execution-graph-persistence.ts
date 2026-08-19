@@ -132,6 +132,9 @@ function appServerLiteSourceEventId(workerEvent: WorkerObservabilityEvent): stri
 }
 
 function appServerLiteSummaryForWorkerEvent(workerEvent: WorkerObservabilityEvent): AppServerLiteSummary | null {
+  if (workerEvent.provider_usage?.status === 'partial' && workerEvent.provider_usage_step_facts?.length) {
+    return null;
+  }
   const baseFields: Record<string, unknown> = {
     event: workerEvent.event,
     reason_code: workerEvent.reason_code ?? null,
@@ -271,16 +274,20 @@ function phaseSpanNameForWorkerEvent(eventName: string): string | null {
       return 'prompt_sent';
     case CANONICAL_EVENT.codex.phasePlanning:
     case CANONICAL_EVENT.codex.turnWaiting:
+    case CANONICAL_EVENT.agentRunner.sessionStarted:
       return 'planning';
     case CANONICAL_EVENT.codex.phaseImplementation:
+    case CANONICAL_EVENT.agentRunner.activity:
       return 'implementation';
     case CANONICAL_EVENT.codex.phaseValidation:
     case CANONICAL_EVENT.codex.turnCompleted:
-    case CANONICAL_EVENT.agentRunner.turnCompleted:
       return 'validation';
+    case CANONICAL_EVENT.agentRunner.turnCompleted:
+      return 'completed';
     case CANONICAL_EVENT.codex.turnFailed:
     case CANONICAL_EVENT.agentRunner.turnFailed:
     case CANONICAL_EVENT.agentRunner.turnTimedOut:
+    case CANONICAL_EVENT.agentRunner.turnCancelled:
       return 'failed';
     case CANONICAL_EVENT.codex.turnInputRequired:
       return 'blocked_input';
@@ -352,7 +359,10 @@ function tokenModelFactSource(workerEvent: WorkerObservabilityEvent): string {
   );
 }
 
-function tokenModelFactConfidence(workerEvent: WorkerObservabilityEvent): 'observed_live' | 'backfilled' | 'missing' {
+function tokenModelFactConfidence(
+  workerEvent: WorkerObservabilityEvent
+): 'observed_live' | 'backfilled' | 'provider_step' | 'provider_result' | 'legacy_partial' | 'missing' {
+  if (workerEvent.provider_usage) return workerEvent.provider_usage.confidence;
   if (workerEvent.token_telemetry_status === 'unavailable') {
     return 'missing';
   }
@@ -363,6 +373,29 @@ function tokenModelFactConfidence(workerEvent: WorkerObservabilityEvent): 'obser
     workerEvent.effective_model
     ? 'observed_live'
     : 'missing';
+}
+
+function stableProviderFactId(
+  runningEntry: RunningEntry,
+  threadId: string | null,
+  turnId: string | null,
+  kind: 'invocation' | 'model',
+  model: string | null = null
+): string {
+  const digest = createHash('sha256')
+    .update(runningEntry.issue_run_id ?? '')
+    .update('\0')
+    .update(runningEntry.attempt_id ?? '')
+    .update('\0')
+    .update(threadId ?? '')
+    .update('\0')
+    .update(turnId ?? '')
+    .update('\0')
+    .update(kind)
+    .update('\0')
+    .update(model ?? '')
+    .digest('hex');
+  return `claude_${kind}:${digest}`;
 }
 
 function phaseSpanKeysForRunningEntry(
@@ -382,15 +415,38 @@ export function beginExecutionGraphWorkerTurnObservation(
   workerEvent: WorkerObservabilityEvent
 ): boolean {
   const observedTurnId = workerEvent.turn_id ?? runningEntry.turn_id;
+  const observedThreadId = workerEvent.thread_id ?? runningEntry.thread_id;
   const persistedTurnIds = (runningEntry.persisted_turn_ids ??= []);
   const pendingTurnIds = (runningEntry.pending_persisted_turn_ids ??= []);
   const turnAlreadyObserved = Boolean(
     observedTurnId && (persistedTurnIds.includes(observedTurnId) || pendingTurnIds.includes(observedTurnId))
   );
-  if (observedTurnId && !turnAlreadyObserved) {
+  const startsTurn =
+    workerEvent.event === CANONICAL_EVENT.agentRunner.turnStarted ||
+    workerEvent.event === CANONICAL_EVENT.codex.turnStarted;
+  const startsGenericProcess = workerEvent.event === CANONICAL_EVENT.agentRunner.processStarted;
+  if ((startsGenericProcess || startsTurn) && !observedThreadId) {
+    const observedAt = asIso(workerEvent.timestamp_ms);
+    const current = runningEntry.pending_execution_graph_thread_started_at;
+    runningEntry.pending_execution_graph_thread_started_at = !current || observedAt < current ? observedAt : current;
+  }
+  const turnIndices = (runningEntry.execution_graph_turn_indices ??= {});
+  if (startsTurn && observedTurnId && turnIndices[observedTurnId] === undefined) {
+    turnIndices[observedTurnId] = Math.max(0, runningEntry.turn_count - 1);
+  }
+  if (startsTurn && observedTurnId && !observedThreadId) {
+    runningEntry.pending_execution_graph_turn = {
+      turn_id: observedTurnId,
+      turn_index: turnIndices[observedTurnId] ?? 0,
+      started_at: asIso(workerEvent.timestamp_ms)
+    };
+  }
+  if (startsTurn && observedThreadId && observedTurnId && !turnAlreadyObserved) {
     pendingTurnIds.push(observedTurnId);
   }
-  return turnAlreadyObserved;
+  // Process/session/activity events may carry future lineage, but only an
+  // authoritative turn-start event may reserve and create a durable turn.
+  return turnAlreadyObserved || !startsTurn;
 }
 
 function markExecutionGraphWorkerTurnPersisted(runningEntry: RunningEntry, turnId: string): void {
@@ -630,18 +686,128 @@ export async function persistExecutionGraphWorkerEvent(params: {
     const at = asIso(workerEvent.timestamp_ms);
     const threadId = workerEvent.thread_id ?? runningEntry.thread_id;
     const turnId = workerEvent.turn_id ?? runningEntry.turn_id;
+    if (!threadId) {
+      if (shouldPersistTokenModelFact(workerEvent)) {
+        operation = 'appendTokenModelFact';
+        await persistence.appendTokenModelFact?.({
+          token_model_fact_id: workerEvent.agent_runtime === 'claude-cli'
+            ? stableProviderFactId(runningEntry, null, null, 'invocation')
+            : undefined,
+          issue_run_id: runningEntry.issue_run_id,
+          attempt_id: runningEntry.attempt_id,
+          thread_id: null,
+          turn_id: null,
+          requested_model: workerEvent.requested_model ?? runningEntry.requested_model ?? null,
+          effective_model: workerEvent.effective_model ?? runningEntry.effective_model ?? null,
+          model_source: tokenModelFactSource(workerEvent),
+          input_tokens: workerEvent.usage?.input_tokens ?? workerEvent.provider_usage?.input_tokens ?? null,
+          output_tokens: workerEvent.usage?.output_tokens ?? workerEvent.provider_usage?.output_tokens ?? null,
+          cached_input_tokens: workerEvent.usage?.cached_input_tokens ?? workerEvent.provider_usage?.cache_read_tokens ?? null,
+          cache_creation_input_tokens: workerEvent.provider_usage?.cache_creation_tokens ?? null,
+          reasoning_output_tokens: workerEvent.usage?.reasoning_output_tokens ?? null,
+          total_tokens: workerEvent.usage?.total_tokens ?? null,
+          model_context_window: workerEvent.usage?.model_context_window ?? null,
+          runtime_provider: workerEvent.agent_runtime ?? null,
+          provider_turn_count: workerEvent.provider_usage?.provider_turn_count ?? null,
+          estimated_cost_usd: workerEvent.provider_usage?.estimated_cost_usd ?? null,
+          provider_usage_status: workerEvent.provider_usage?.status ?? null,
+          provider_usage_source: workerEvent.provider_usage?.source ?? null,
+          api_retry_count: workerEvent.provider_usage?.api_retry_count ?? null,
+          permission_denial_count: workerEvent.provider_usage?.permission_denial_count ?? null,
+          unknown_event_count: workerEvent.provider_usage?.unknown_event_count ?? null,
+          auxiliary_result_count: workerEvent.provider_usage?.auxiliary_result_count ?? null,
+          effective_models: workerEvent.provider_usage?.effective_models ?? null,
+          tool_counts: workerEvent.provider_usage?.tool_counts ?? null,
+          mcp_counts: workerEvent.provider_usage?.mcp_counts ?? null,
+          missing_reason: workerEvent.provider_usage?.missing_reason ?? null,
+          nested_session_detected: workerEvent.provider_usage?.nested_session_detected ?? null,
+          supervised_session_coverage: workerEvent.provider_usage?.supervised_session_coverage ?? null,
+          telemetry_confidence: tokenModelFactConfidence(workerEvent),
+          observed_at: workerEvent.provider_usage?.updated_at ?? at
+        });
+      }
+      return;
+    }
 
-    if (threadId && runningEntry.persisted_thread_id !== threadId) {
+    if (
+      threadId &&
+      (
+        runningEntry.persisted_thread_id !== threadId ||
+        workerEvent.event === CANONICAL_EVENT.agentRunner.processStarted ||
+        workerEvent.event === CANONICAL_EVENT.agentRunner.sessionStarted ||
+        workerEvent.event === CANONICAL_EVENT.agentRunner.turnStarted ||
+        workerEvent.event === CANONICAL_EVENT.codex.turnStarted
+      )
+    ) {
       operation = 'appendThread';
       await persistence.appendThread?.({
         attempt_id: runningEntry.attempt_id,
         thread_id: threadId,
-        started_at: at,
+        session_id: workerEvent.session_id ?? runningEntry.session_id,
+        agent_runtime: workerEvent.agent_runtime ?? runningEntry.agent_runtime ?? null,
+        worker_instance_id: workerEvent.worker_instance_id ?? runningEntry.worker_instance_id ?? null,
+        worker_process_pid: workerEvent.worker_process_pid ?? workerEvent.codex_app_server_pid ?? null,
+        started_at: runningEntry.pending_execution_graph_thread_started_at ?? at,
         status: 'running',
         reason_code: REASON_CODES.codexSessionStarted,
         reason_detail: workerEvent.session_id ?? runningEntry.session_id
       });
       runningEntry.persisted_thread_id = threadId;
+    }
+
+    const startsTurn =
+      workerEvent.event === CANONICAL_EVENT.agentRunner.turnStarted ||
+      workerEvent.event === CANONICAL_EVENT.codex.turnStarted;
+    if (startsTurn && threadId && turnId && !turnAlreadyObserved) {
+      operation = 'appendTurn';
+      await persistence.appendTurn?.({
+        thread_id: threadId,
+        turn_id: turnId,
+        turn_index: runningEntry.execution_graph_turn_indices?.[turnId] ?? Math.max(0, runningEntry.turn_count - 1),
+        started_at: at,
+        status: executionGraphStatusForWorkerEvent(workerEvent.event),
+        reason_code: reasonCodeForWorkerEvent(workerEvent.event),
+        reason_detail: workerEvent.detail ?? null
+      });
+      markExecutionGraphWorkerTurnPersisted(runningEntry, turnId);
+    }
+    const bufferedTurn = runningEntry.pending_execution_graph_turn;
+    if (
+      workerEvent.event === CANONICAL_EVENT.agentRunner.sessionStarted &&
+      threadId &&
+      turnId &&
+      bufferedTurn?.turn_id === turnId &&
+      !(runningEntry.persisted_turn_ids ?? []).includes(turnId)
+    ) {
+      operation = 'appendTurn';
+      await persistence.appendTurn?.({
+        thread_id: threadId,
+        turn_id: turnId,
+        turn_index: bufferedTurn.turn_index,
+        started_at: bufferedTurn.started_at,
+        status: 'running',
+        reason_code: reasonCodeForWorkerEvent(CANONICAL_EVENT.agentRunner.turnStarted),
+        reason_detail: null
+      });
+      markExecutionGraphWorkerTurnPersisted(runningEntry, turnId);
+      operation = 'appendStateTransition';
+      await persistence.appendStateTransition?.({
+        issue_run_id: runningEntry.issue_run_id,
+        attempt_id: runningEntry.attempt_id,
+        thread_id: threadId,
+        turn_id: turnId,
+        from_status: null,
+        to_status: 'running',
+        transitioned_at: bufferedTurn.started_at,
+        status: 'running',
+        reason_code: reasonCodeForWorkerEvent(CANONICAL_EVENT.agentRunner.turnStarted),
+        reason_detail: null
+      });
+      runningEntry.pending_execution_graph_turn = null;
+      runningEntry.pending_execution_graph_thread_started_at = null;
+    }
+
+    if (threadId && turnId && runningEntry.persisted_thread_evidence_id !== threadId) {
       await persistTicketEvidenceReferenceForThread({
         persistence,
         logger,
@@ -651,26 +817,13 @@ export async function persistExecutionGraphWorkerEvent(params: {
         threadId,
         recordedAt: at
       });
-    }
-
-    if (threadId && turnId && !turnAlreadyObserved) {
-      operation = 'appendTurn';
-      await persistence.appendTurn?.({
-        thread_id: threadId,
-        turn_id: turnId,
-        turn_index: Math.max(0, runningEntry.turn_count - 1),
-        started_at: at,
-        status: executionGraphStatusForWorkerEvent(workerEvent.event),
-        reason_code: reasonCodeForWorkerEvent(workerEvent.event),
-        reason_detail: workerEvent.detail ?? null
-      });
-      markExecutionGraphWorkerTurnPersisted(runningEntry, turnId);
+      runningEntry.persisted_thread_evidence_id = threadId;
     }
 
     if (turnId) {
       const phase = phaseSpanNameForWorkerEvent(workerEvent.event);
       if (phase) {
-        const phaseSpanKey = `${turnId}\0${phase}\0${at}`;
+        const phaseSpanKey = `${turnId}\0${phase}`;
         const persistedKeys = phaseSpanKeysForRunningEntry(persistedPhaseSpanKeys, runningEntry);
         if (!persistedKeys.has(phaseSpanKey)) {
           operation = 'appendPhaseSpan';
@@ -722,6 +875,10 @@ export async function persistExecutionGraphWorkerEvent(params: {
     if (shouldPersistTokenModelFact(workerEvent)) {
       operation = 'appendTokenModelFact';
       await persistence.appendTokenModelFact?.({
+        token_model_fact_id:
+          workerEvent.agent_runtime === 'claude-cli'
+            ? stableProviderFactId(runningEntry, threadId, turnId, 'invocation')
+            : undefined,
         issue_run_id: runningEntry.issue_run_id,
         attempt_id: runningEntry.attempt_id,
         thread_id: threadId ?? null,
@@ -732,19 +889,82 @@ export async function persistExecutionGraphWorkerEvent(params: {
         input_tokens: workerEvent.usage?.input_tokens ?? workerEvent.provider_usage?.input_tokens ?? null,
         output_tokens: workerEvent.usage?.output_tokens ?? workerEvent.provider_usage?.output_tokens ?? null,
         cached_input_tokens: workerEvent.usage?.cached_input_tokens ?? workerEvent.provider_usage?.cache_read_tokens ?? null,
+        cache_creation_input_tokens: workerEvent.provider_usage?.cache_creation_tokens ?? null,
         reasoning_output_tokens: workerEvent.usage?.reasoning_output_tokens ?? null,
-        total_tokens:
-          workerEvent.usage?.total_tokens ??
-          (workerEvent.provider_usage?.input_tokens !== null && workerEvent.provider_usage?.output_tokens !== null
-            ? (workerEvent.provider_usage?.input_tokens ?? 0) + (workerEvent.provider_usage?.output_tokens ?? 0)
-            : null),
+        total_tokens: workerEvent.usage?.total_tokens ?? null,
         model_context_window: workerEvent.usage?.model_context_window ?? null,
         runtime_provider: workerEvent.agent_runtime ?? null,
         provider_turn_count: workerEvent.provider_usage?.provider_turn_count ?? null,
         estimated_cost_usd: workerEvent.provider_usage?.estimated_cost_usd ?? null,
+        provider_usage_status: workerEvent.provider_usage?.status ?? null,
+        provider_usage_source: workerEvent.provider_usage?.source ?? null,
+        api_retry_count: workerEvent.provider_usage?.api_retry_count ?? null,
+        api_error_status: workerEvent.provider_usage?.api_error_status ?? null,
+        terminal_reason: workerEvent.provider_usage?.terminal_reason ?? null,
+        stop_reason: workerEvent.provider_usage?.stop_reason ?? null,
+        duration_ms: workerEvent.provider_usage?.duration_ms ?? null,
+        duration_api_ms: workerEvent.provider_usage?.duration_api_ms ?? null,
+        time_to_first_token_ms: workerEvent.provider_usage?.time_to_first_token_ms ?? null,
+        permission_denial_count: workerEvent.provider_usage?.permission_denial_count ?? null,
+        unknown_event_count: workerEvent.provider_usage?.unknown_event_count ?? null,
+        auxiliary_result_count: workerEvent.provider_usage?.auxiliary_result_count ?? null,
+        effective_models: workerEvent.provider_usage?.effective_models ?? null,
+        tool_counts: workerEvent.provider_usage?.tool_counts ?? null,
+        mcp_counts: workerEvent.provider_usage?.mcp_counts ?? null,
+        missing_reason: workerEvent.provider_usage?.missing_reason ?? null,
+        reconciliation_delta: workerEvent.provider_usage?.reconciliation_delta ?? null,
+        model_usage: workerEvent.provider_usage?.model_usage ?? null,
+        nested_session_detected: workerEvent.provider_usage?.nested_session_detected ?? null,
+        supervised_session_coverage: workerEvent.provider_usage?.supervised_session_coverage ?? null,
         telemetry_confidence: tokenModelFactConfidence(workerEvent),
         observed_at: workerEvent.token_telemetry_last_at_ms ? asIso(workerEvent.token_telemetry_last_at_ms) : at
       });
+      for (const modelUsage of workerEvent.provider_usage?.model_usage ?? []) {
+        operation = 'appendTokenModelFact';
+        await persistence.appendTokenModelFact?.({
+          token_model_fact_id: stableProviderFactId(runningEntry, threadId, turnId, 'model', modelUsage.model),
+          issue_run_id: runningEntry.issue_run_id,
+          attempt_id: runningEntry.attempt_id,
+          thread_id: threadId ?? null,
+          turn_id: turnId ?? null,
+          requested_model: workerEvent.requested_model ?? runningEntry.requested_model ?? null,
+          effective_model: modelUsage.model,
+          model_source: 'claude_model_usage',
+          input_tokens: modelUsage.input_tokens,
+          output_tokens: modelUsage.output_tokens,
+          cached_input_tokens: modelUsage.cache_read_tokens,
+          cache_creation_input_tokens: modelUsage.cache_creation_tokens,
+          total_tokens: null,
+          runtime_provider: 'claude-cli',
+          provider_turn_count: null,
+          estimated_cost_usd: modelUsage.estimated_cost_usd,
+          provider_usage_status: 'final',
+          provider_usage_source: 'claude_model_usage',
+          api_retry_count: workerEvent.provider_usage?.api_retry_count ?? null,
+          effective_models: [modelUsage.model],
+          telemetry_confidence: 'provider_result',
+          observed_at: workerEvent.provider_usage?.updated_at ?? at
+        });
+      }
+    }
+
+    if (turnId && workerEvent.provider_usage_step_facts?.length) {
+      for (const step of workerEvent.provider_usage_step_facts) {
+        operation = 'appendProviderUsageStepFact';
+        await persistence.appendProviderUsageStepFact?.({
+          issue_run_id: runningEntry.issue_run_id,
+          attempt_id: runningEntry.attempt_id,
+          thread_id: threadId ?? null,
+          turn_id: turnId,
+          message_id_hash: step.message_id_hash,
+          model: step.model,
+          input_tokens: step.input_tokens,
+          output_tokens: step.output_tokens,
+          cache_read_tokens: step.cache_read_tokens,
+          cache_creation_tokens: step.cache_creation_tokens,
+          observed_at: step.observed_at
+        });
+      }
     }
 
     const appServerLiteSummary = appServerLiteSummaryForWorkerEvent(workerEvent);
@@ -787,6 +1007,9 @@ export function queuePersistExecutionGraphWorkerEvent(params: {
   turnAlreadyObserved: boolean;
   persistedPhaseSpanKeys: WeakMap<RunningEntry, Set<string>>;
 } & PersistenceFailureContext): Promise<void> {
+  if (params.runningEntry.history_terminalizing) {
+    return Promise.resolve();
+  }
   const previous = params.queues.get(params.runningEntry) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(() => persistExecutionGraphWorkerEvent(params));
   params.queues.set(params.runningEntry, next);
@@ -817,11 +1040,14 @@ export async function persistTicketEvidenceReferenceForThread(params: {
       attempt_id: runningEntry.attempt_id,
       thread_id: threadId,
       turn_id: workerEvent.turn_id ?? runningEntry.turn_id ?? null,
-      evidence_kind: 'codex_thread',
-      uri: `codex-thread:${threadId}`,
-      title: 'Codex thread observed',
+      evidence_kind: 'agent_thread',
+      uri: `agent-thread:${threadId}`,
+      title: 'Agent thread observed',
       metadata: {
         session_id: workerEvent.session_id ?? runningEntry.session_id ?? null,
+        agent_runtime: workerEvent.agent_runtime ?? runningEntry.agent_runtime ?? null,
+        worker_instance_id: workerEvent.worker_instance_id ?? runningEntry.worker_instance_id ?? null,
+        worker_process_pid: workerEvent.worker_process_pid ?? workerEvent.codex_app_server_pid ?? null,
         event: workerEvent.event
       },
       recorded_at: recordedAt
@@ -856,13 +1082,22 @@ export async function persistExecutionGraphStateTransition(params: {
   if (!persistence || !runningEntry.issue_run_id) {
     return;
   }
+  const persistedThreadId = runningEntry.persisted_thread_id ?? null;
+  const threadId =
+    persistedThreadId && (!runningEntry.thread_id || runningEntry.thread_id === persistedThreadId)
+      ? persistedThreadId
+      : null;
+  const turnId =
+    threadId && runningEntry.turn_id && (runningEntry.persisted_turn_ids ?? []).includes(runningEntry.turn_id)
+      ? runningEntry.turn_id
+      : null;
 
   try {
     await persistence.appendStateTransition?.({
       issue_run_id: runningEntry.issue_run_id,
       attempt_id: runningEntry.attempt_id,
-      thread_id: runningEntry.thread_id,
-      turn_id: runningEntry.turn_id,
+      thread_id: threadId,
+      turn_id: turnId,
       from_status: null,
       to_status: toStatus,
       transitioned_at: asIso(nowMs()),
@@ -905,8 +1140,8 @@ export async function persistExecutionGraphRetryTransition(params: {
     await persistence.appendStateTransition?.({
       issue_run_id: retryEntry.issue_run_id,
       attempt_id: retryEntry.previous_attempt_id,
-      thread_id: retryEntry.previous_thread_id,
-      turn_id: retryEntry.previous_turn_id ?? null,
+      thread_id: null,
+      turn_id: null,
       from_status: null,
       to_status: toStatus,
       transitioned_at: asIso(nowMs()),

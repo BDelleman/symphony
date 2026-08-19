@@ -443,7 +443,7 @@ describe('SqlitePersistenceStore project history', () => {
     ]);
   });
 
-  it('records failed history writes as degraded health across restart', async () => {
+  it('retains failed history writes while clearing active degradation after clean restart reconciliation', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-history-write-failure-'));
     dirs.push(dir);
     const dbPath = path.join(dir, 'runtime.sqlite');
@@ -489,6 +489,10 @@ describe('SqlitePersistenceStore project history', () => {
         recorded_at: '2026-04-11T10:00:00.000Z'
       }
     ]);
+    expect(storeB.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 0, ambiguous: 0 });
+    expect(storeB.historySchemaHealth()).toMatchObject({ status: 'healthy', degraded_reason_code: null });
+    expect(storeB.health().recent_write_failures).toEqual([]);
+    expect(storeB.listHistoryWriteFailures()).toHaveLength(1);
   });
 
   it('restores write-failure diagnostics for already-applied history schemas', async () => {
@@ -502,7 +506,7 @@ describe('SqlitePersistenceStore project history', () => {
       nowMs: () => Date.parse('2026-04-11T10:00:00.000Z')
     });
     stores.push(storeA);
-    expect(storeA.historySchemaHealth()).toMatchObject({ applied_version: 13, status: 'healthy' });
+    expect(storeA.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
     storeA.close();
     stores.pop();
 
@@ -527,7 +531,7 @@ describe('SqlitePersistenceStore project history', () => {
     });
 
     expect(storeB.historySchemaHealth()).toMatchObject({
-      applied_version: 13,
+      applied_version: 14,
       status: 'degraded',
       degraded_reason_code: 'history_write_failed',
       degraded_detail: 'appendTicketTerminalOutcome: history_terminal_outcome_write_failed'
@@ -577,6 +581,46 @@ describe('SqlitePersistenceStore project history', () => {
     expect(reopened.issue_runs.map((run) => run.issue_run_id)).toEqual([started.issue_run_id]);
     expect(reopened.attempts.map((attempt) => attempt.attempt_id)).toEqual([started.attempt_id]);
     expect(store.listRunHistory().filter((run) => run.issue_id === 'run-start-1')).toHaveLength(1);
+  });
+
+  it('projects outcomes only from the latest issue run', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-history-latest-run-'));
+    dirs.push(dir);
+    const store = new SqlitePersistenceStore({ dbPath: path.join(dir, 'runtime.sqlite'), retentionDays: 14 });
+    stores.push(store);
+    const durableIdentity = identity({ issue_id: 'latest-run-1', issue_identifier: 'LATEST-1' });
+    const completed = store.recordRunStarted({
+      issue_id: 'latest-run-1',
+      issue_identifier: 'LATEST-1',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    store.completeRun({
+      run_id: completed.run_id,
+      issue_run_id: completed.issue_run_id,
+      attempt_id: completed.attempt_id,
+      terminal_status: 'succeeded'
+    });
+    const active = store.recordRunStarted({
+      issue_id: 'latest-run-1',
+      issue_identifier: 'LATEST-1',
+      identity: durableIdentity,
+      started_at: '2026-04-11T11:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+
+    expect(store.listProjectTicketSummaries(durableIdentity.project.key).items[0]).toMatchObject({
+      state: 'active',
+      latest_attempt: {
+        attempt_id: active.attempt_id,
+        status: 'running',
+        outcome: null,
+        outcome_reason_code: null
+      }
+    });
   });
 
 

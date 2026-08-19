@@ -522,6 +522,7 @@ describe('dashboard assets', () => {
     const html = renderDashboardHtml();
 
     expect(html).toContain('Turn every run from first signal to confident handoff.');
+    expect(html).toContain('<link rel="icon" href="data:," />');
     expect(html).not.toContain('Live orchestration visibility with retry control, issue drilldown, and desktop/browser parity.');
   });
 
@@ -550,9 +551,9 @@ describe('dashboard assets', () => {
     expect(clientJs).toContain('function formatTokenBreakdown(tokens, telemetrySource)');
     expect(clientJs).toContain('function formatOverviewTokenValue(payload, field, splitUnavailable)');
     expect(clientJs).toContain('Split unavailable');
-    expect(clientJs).toContain('Cached Input Tokens');
-    expect(clientJs).toContain('Reasoning Output Tokens');
-    expect(clientJs).toContain('Max Context Window');
+    expect(clientJs).toContain('Codex Cached Input');
+    expect(clientJs).toContain('Codex Reasoning Output');
+    expect(clientJs).toContain('Codex Max Context');
     expect(clientJs).toContain('Cached ');
     expect(clientJs).toContain('Reasoning ');
     expect(clientJs).toContain('Context ');
@@ -592,8 +593,8 @@ describe('dashboard assets', () => {
     expect(clientJs).toContain('entry.time_since_progress');
     expect(clientJs).toContain('entry.last_successful_step');
     expect(clientJs).toContain('phase unchanged for ');
-    expect(clientJs).toContain('Codex thread active ');
-    expect(clientJs).toContain('Codex thread activity unavailable');
+    expect(clientJs).toContain('Agent session active ');
+    expect(clientJs).toContain('Agent session activity unavailable');
     expect(clientJs).toContain('entry.transcript_tool_call_diagnostic_summary');
     expect(clientJs).toContain('blockerCell.append(blockerValue, diagnosticSummary);');
     expect(clientJs).toContain('payload policy redacted ');
@@ -853,7 +854,7 @@ describe('dashboard assets', () => {
     expect(text).toContain('implementation');
     expect(text).toContain('phase unchanged for 5m');
     expect(text).not.toContain('updated 5m ago');
-    expect(text).toContain('Codex thread active 0m 15s ago');
+    expect(text).toContain('Agent session active 0m 15s ago');
     expect(text).toContain('codex turn waiting: heartbeat');
     expect(text).toContain('5:04:30');
     expect(text).toContain('(UTC 2026-05-08T15:04:30.000Z)');
@@ -894,12 +895,12 @@ describe('dashboard assets', () => {
     await flushPromises();
 
     const overviewText = harness.document.getElementById('kpi-grid').textContent;
-    expect(overviewText).toContain('Total Tokens123,456');
-    expect(overviewText).toContain('Input Tokens100,000');
-    expect(overviewText).toContain('Output Tokens23,456');
-    expect(overviewText).toContain('Cached Input Tokens90,000');
-    expect(overviewText).toContain('Reasoning Output Tokens3,456');
-    expect(overviewText).toContain('Max Context Window200,000');
+    expect(overviewText).toContain('Codex Enforcement Total123,456');
+    expect(overviewText).toContain('Codex Enforcement Input100,000');
+    expect(overviewText).toContain('Codex Enforcement Output23,456');
+    expect(overviewText).toContain('Codex Cached Input90,000');
+    expect(overviewText).toContain('Codex Reasoning Output3,456');
+    expect(overviewText).toContain('Codex Max Context200,000');
 
     const rowText = harness.document.getElementById('running-rows').textContent;
     expect(rowText).toContain('Total: 123,456');
@@ -939,12 +940,12 @@ describe('dashboard assets', () => {
     await flushPromises();
 
     const overviewText = harness.document.getElementById('kpi-grid').textContent;
-    expect(overviewText).toContain('Total Tokens321');
-    expect(overviewText).toContain('Input TokensSplit unavailable');
-    expect(overviewText).toContain('Output TokensSplit unavailable');
-    expect(overviewText).toContain('Cached Input TokensSplit unavailable');
-    expect(overviewText).toContain('Reasoning Output TokensSplit unavailable');
-    expect(overviewText).toContain('Max Context Window0');
+    expect(overviewText).toContain('Codex Enforcement Total321');
+    expect(overviewText).toContain('Codex Enforcement InputSplit unavailable');
+    expect(overviewText).toContain('Codex Enforcement OutputSplit unavailable');
+    expect(overviewText).toContain('Codex Cached InputSplit unavailable');
+    expect(overviewText).toContain('Codex Reasoning OutputSplit unavailable');
+    expect(overviewText).toContain('Codex Max Context0');
 
     const rowText = harness.document.getElementById('running-rows').textContent;
     expect(rowText).toContain('Total: 321');
@@ -975,12 +976,12 @@ describe('dashboard assets', () => {
     await flushPromises();
 
     const overviewText = harness.document.getElementById('kpi-grid').textContent;
-    expect(overviewText).toContain('Total Tokens0');
-    expect(overviewText).toContain('Input Tokens0');
-    expect(overviewText).toContain('Output Tokens0');
-    expect(overviewText).toContain('Cached Input Tokens0');
-    expect(overviewText).toContain('Reasoning Output Tokens0');
-    expect(overviewText).toContain('Max Context Window0');
+    expect(overviewText).toContain('Codex Enforcement Total0');
+    expect(overviewText).toContain('Codex Enforcement Input0');
+    expect(overviewText).toContain('Codex Enforcement Output0');
+    expect(overviewText).toContain('Codex Cached Input0');
+    expect(overviewText).toContain('Codex Reasoning Output0');
+    expect(overviewText).toContain('Codex Max Context0');
   });
 
   it('renders issue console timestamps as local labels with UTC companions', async () => {

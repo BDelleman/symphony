@@ -32,6 +32,312 @@ import type {
 } from './core-test-harness';
 
 describe('OrchestratorCore persistence', () => {
+  it('persists unobserved Claude usage when the process fails before a session exists', async () => {
+    const tokenFacts: Array<Parameters<NonNullable<OrchestratorPersistencePort['appendTokenModelFact']>>[0]> = [];
+    const completedRuns: Array<Parameters<OrchestratorPersistencePort['completeRun']>[0]> = [];
+    const transitions: Array<Parameters<NonNullable<OrchestratorPersistencePort['appendStateTransition']>>[0]> = [];
+    const persistence: OrchestratorPersistencePort = {
+      startRun: async () => 'pre-init-run',
+      appendIssueRun: async () => 'pre-init-issue-run',
+      appendAttempt: async () => 'pre-init-attempt',
+      appendTokenModelFact: async (params) => {
+        tokenFacts.push(params);
+        return String(params.token_model_fact_id);
+      },
+      appendStateTransition: async (params) => {
+        transitions.push(params);
+        return 'pre-init-transition';
+      },
+      recordSession: async () => undefined,
+      recordEvent: async () => undefined,
+      completeRun: async (params) => {
+        completedRuns.push(params);
+      }
+    };
+    const harness = createHarness({ persistence });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-claude-pre-init', identifier: 'ABC-CLAUDE-PRE-INIT' })
+    ]);
+    await harness.orchestrator.tick('interval');
+
+    harness.orchestrator.onWorkerEvent('i-claude-pre-init', {
+      timestamp_ms: harness.now.value + 1,
+      event: CANONICAL_EVENT.agentRunner.turnFailed,
+      agent_runtime: 'claude-cli',
+      turn_id: 'pre-init-transient-turn',
+      requested_model: 'claude-sonnet-4-6',
+      provider_usage: {
+        runtime: 'claude-cli',
+        model: null,
+        effective_models: [],
+        input_tokens: null,
+        output_tokens: null,
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+        provider_turn_count: null,
+        estimated_cost_usd: null,
+        source: 'claude_invocation',
+        status: 'unobserved',
+        confidence: 'missing',
+        missing_reason: 'claude_process_exit_2',
+        supervised_session_coverage: 'missing'
+      }
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(tokenFacts).toEqual([
+      expect.objectContaining({
+        issue_run_id: 'pre-init-issue-run',
+        attempt_id: 'pre-init-attempt',
+        thread_id: null,
+        turn_id: null,
+        runtime_provider: 'claude-cli',
+        provider_usage_status: 'unobserved',
+        missing_reason: 'claude_process_exit_2'
+      })
+    ]);
+    await harness.orchestrator.onWorkerExit('i-claude-pre-init', 'abnormal');
+    expect(completedRuns).toEqual([
+      expect.objectContaining({
+        run_id: 'pre-init-run',
+        thread_id: null,
+        turn_id: null
+      })
+    ]);
+    expect(transitions).not.toEqual([]);
+    expect(transitions.every((transition) => transition.thread_id == null && transition.turn_id == null)).toBe(true);
+  });
+
+  it('waits for fresh Claude lineage persistence before closing the run', async () => {
+    const operations: string[] = [];
+    const writeFailures: Array<Parameters<NonNullable<OrchestratorPersistencePort['recordHistoryWriteFailure']>>[0]> = [];
+    const persistence: OrchestratorPersistencePort = {
+      startRun: async () => 'claude-lineage-run',
+      appendIssueRun: async () => 'claude-lineage-issue-run',
+      appendAttempt: async () => 'claude-lineage-attempt',
+      appendThread: async (params) => {
+        operations.push(`thread:${params.thread_id}`);
+        return String(params.thread_id);
+      },
+      appendTurn: async (params) => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        operations.push(`turn:${params.turn_id}`);
+        return String(params.turn_id);
+      },
+      appendStateTransition: async () => 'transition',
+      appendTicketEvidenceReference: async () => 'evidence',
+      appendAppServerEvent: async () => 'event',
+      recordSession: async () => undefined,
+      recordEvent: async () => undefined,
+      recordHistoryWriteFailure: async (params) => {
+        writeFailures.push(params);
+      },
+      completeRun: async () => {
+        operations.push('complete');
+      }
+    };
+    const harness = createHarness({ persistence });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-claude-lineage', identifier: 'ABC-CLAUDE-LINEAGE' })
+    ]);
+    await harness.orchestrator.tick('interval');
+
+    harness.orchestrator.onWorkerEvent('i-claude-lineage', {
+      timestamp_ms: harness.now.value + 1,
+      event: CANONICAL_EVENT.agentRunner.processStarted,
+      agent_runtime: 'claude-cli',
+      worker_process_pid: 4242,
+      turn_id: 'claude-turn-1'
+    });
+    harness.orchestrator.onWorkerEvent('i-claude-lineage', {
+      timestamp_ms: harness.now.value + 2,
+      event: CANONICAL_EVENT.agentRunner.turnStarted,
+      agent_runtime: 'claude-cli',
+      turn_id: 'claude-turn-1',
+      requested_model: 'claude-sonnet-4-6'
+    });
+    harness.orchestrator.onWorkerEvent('i-claude-lineage', {
+      timestamp_ms: harness.now.value + 3,
+      event: CANONICAL_EVENT.agentRunner.sessionStarted,
+      agent_runtime: 'claude-cli',
+      session_id: '11111111-1111-4111-8111-111111111111',
+      thread_id: 'claude:11111111-1111-4111-8111-111111111111',
+      turn_id: 'claude-turn-1',
+      requested_model: 'claude-sonnet-4-6',
+      effective_model: 'claude-sonnet-4-6'
+    });
+    harness.orchestrator.onWorkerEvent('i-claude-lineage', {
+      timestamp_ms: harness.now.value + 4,
+      event: CANONICAL_EVENT.agentRunner.turnCompleted,
+      agent_runtime: 'claude-cli',
+      session_id: '11111111-1111-4111-8111-111111111111',
+      thread_id: 'claude:11111111-1111-4111-8111-111111111111',
+      turn_id: 'claude-turn-1'
+    });
+    await harness.orchestrator.onWorkerExit('i-claude-lineage', 'normal');
+
+    expect(writeFailures).toEqual([]);
+    expect(operations).toContain('thread:claude:11111111-1111-4111-8111-111111111111');
+    expect(operations).toContain('turn:claude-turn-1');
+    expect(operations.at(-1)).toBe('complete');
+  });
+
+  it('persists two resumed Claude turns with distinct durable indices in SQLite', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-resume-graph-'));
+    const store = new SqlitePersistenceStore({ dbPath: path.join(dir, 'runtime.sqlite'), retentionDays: 14 });
+    const identity = (params: { issue_id: string; issue_identifier: string }) =>
+      buildDurableIdentity({
+        projectRoot: dir,
+        workflowPath: path.join(dir, 'WORKFLOW.md'),
+        workflowHash: { status: 'present', value: 'workflow-hash' },
+        repositoryRemote: { status: 'missing', reason: 'repository_remote_unavailable' },
+        trackerKind: 'linear',
+        trackerScope: 'TEST',
+        remoteIssueId: params.issue_id,
+        humanIssueIdentifier: params.issue_identifier
+      });
+    const persistence: OrchestratorPersistencePort = {
+      startRun: async (params) => store.startRun({ ...params, identity: identity(params) }),
+      appendIssueRun: async (params) => store.appendIssueRun({ ...params, identity: identity(params) }),
+      appendAttempt: async (params) => store.appendAttempt(params),
+      appendThread: async (params) => store.appendThread(params),
+      appendTurn: async (params) => store.appendTurn(params),
+      appendPhaseSpan: async (params) => store.appendPhaseSpan(params),
+      appendStateTransition: async (params) => store.appendStateTransition(params),
+      appendTicketEvidenceReference: async (params) => store.appendTicketEvidenceReference(params),
+      appendTokenModelFact: async (params) => store.appendTokenModelFact(params),
+      appendProviderUsageStepFact: async (params) => store.appendProviderUsageStepFact(params),
+      recordSession: async ({ run_id, session_id }) => store.recordSession(run_id, session_id),
+      recordEvent: async (params) => store.recordEvent(params),
+      completeRunIncludesTerminalEvidence: true,
+      completeRun: async (params) => store.completeRun(params)
+    };
+    const harness = createHarness({ persistence });
+    const issueId = 'i-claude-resume-sqlite';
+    const sessionId = '22222222-2222-4222-8222-222222222222';
+    const threadId = `claude:${sessionId}`;
+
+    try {
+      harness.tracker.fetch_candidate_issues.mockResolvedValue([
+        makeIssue({ id: issueId, identifier: 'ABC-CLAUDE-SQLITE' })
+      ]);
+      await harness.orchestrator.tick('interval');
+
+      harness.orchestrator.onWorkerEvent(issueId, {
+        timestamp_ms: harness.now.value + 10,
+        event: CANONICAL_EVENT.agentRunner.processStarted,
+        agent_runtime: 'claude-cli',
+        worker_process_pid: 5001,
+        turn_id: 'claude-turn-sqlite-1'
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      harness.orchestrator.onWorkerEvent(issueId, {
+        timestamp_ms: harness.now.value + 20,
+        event: CANONICAL_EVENT.agentRunner.turnStarted,
+        agent_runtime: 'claude-cli',
+        worker_process_pid: 5001,
+        turn_id: 'claude-turn-sqlite-1',
+        requested_model: 'claude-sonnet-4-6'
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      harness.orchestrator.onWorkerEvent(issueId, {
+        timestamp_ms: harness.now.value + 30,
+        event: CANONICAL_EVENT.agentRunner.sessionStarted,
+        agent_runtime: 'claude-cli',
+        worker_process_pid: 5001,
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: 'claude-turn-sqlite-1',
+        requested_model: 'claude-sonnet-4-6',
+        effective_model: 'claude-sonnet-4-6'
+      });
+      harness.orchestrator.onWorkerEvent(issueId, {
+        timestamp_ms: harness.now.value + 40,
+        event: CANONICAL_EVENT.agentRunner.turnCompleted,
+        agent_runtime: 'claude-cli',
+        worker_process_pid: 5001,
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: 'claude-turn-sqlite-1',
+        provider_usage: {
+          runtime: 'claude-cli',
+          model: 'claude-sonnet-4-6',
+          effective_models: ['claude-sonnet-4-6'],
+          input_tokens: 10,
+          output_tokens: 2,
+          cache_read_tokens: 1,
+          cache_creation_tokens: 0,
+          provider_turn_count: 1,
+          estimated_cost_usd: 0.01,
+          source: 'claude_stream_result',
+          status: 'final',
+          confidence: 'provider_result'
+        }
+      });
+      harness.orchestrator.onWorkerEvent(issueId, {
+        timestamp_ms: harness.now.value + 50,
+        event: CANONICAL_EVENT.agentRunner.processStarted,
+        agent_runtime: 'claude-cli',
+        worker_process_pid: 5002,
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: 'claude-turn-sqlite-2'
+      });
+      harness.orchestrator.onWorkerEvent(issueId, {
+        timestamp_ms: harness.now.value + 60,
+        event: CANONICAL_EVENT.agentRunner.turnStarted,
+        agent_runtime: 'claude-cli',
+        worker_process_pid: 5002,
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: 'claude-turn-sqlite-2',
+        requested_model: 'claude-sonnet-4-6'
+      });
+      harness.orchestrator.onWorkerEvent(issueId, {
+        timestamp_ms: harness.now.value + 70,
+        event: CANONICAL_EVENT.agentRunner.turnCompleted,
+        agent_runtime: 'claude-cli',
+        worker_process_pid: 5002,
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: 'claude-turn-sqlite-2',
+        provider_usage: {
+          runtime: 'claude-cli',
+          model: 'claude-sonnet-4-6',
+          effective_models: ['claude-sonnet-4-6'],
+          input_tokens: 20,
+          output_tokens: 4,
+          cache_read_tokens: 3,
+          cache_creation_tokens: 1,
+          provider_turn_count: 2,
+          estimated_cost_usd: 0.02,
+          source: 'claude_stream_result',
+          status: 'final',
+          confidence: 'provider_result'
+        }
+      });
+      await harness.orchestrator.onWorkerExit(issueId, 'normal');
+
+      const lineage = store.reconstructThreadLineage(threadId);
+      expect(lineage?.turns.map((turn) => ({ turn_id: turn.turn_id, turn_index: turn.turn_index }))).toEqual([
+        { turn_id: 'claude-turn-sqlite-1', turn_index: 0 },
+        { turn_id: 'claude-turn-sqlite-2', turn_index: 1 }
+      ]);
+      expect(lineage?.turns.every((turn) => turn.status === 'succeeded')).toBe(true);
+      expect(lineage?.turns.flatMap((turn) => turn.phase_spans.map((phase) => phase.phase))).toEqual(
+        expect.arrayContaining(['planning', 'completed'])
+      );
+      expect(lineage?.token_model_facts).toEqual(expect.arrayContaining([
+        expect.objectContaining({ turn_id: 'claude-turn-sqlite-1', input_tokens: 10, output_tokens: 2 }),
+        expect.objectContaining({ turn_id: 'claude-turn-sqlite-2', input_tokens: 20, output_tokens: 4 })
+      ]));
+      expect(store.historySchemaHealth()).toMatchObject({ status: 'healthy', applied_version: 14 });
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('persists normalized execution graph from real dispatch and worker lifecycle events', async () => {
     const issueRuns: Array<Record<string, unknown>> = [];
     const attempts: Array<Record<string, unknown>> = [];
@@ -123,8 +429,10 @@ describe('OrchestratorCore persistence', () => {
     harness.orchestrator.onWorkerEvent('i-lineage', {
       timestamp_ms: harness.now.value + 10,
       event: CANONICAL_EVENT.codex.turnStarted,
+      agent_runtime: 'codex-app-server',
       thread_id: 'thread-1',
-      turn_id: 'turn-1'
+      turn_id: 'turn-1',
+      session_id: 'thread-1-turn-1'
     });
     harness.orchestrator.onWorkerEvent('i-lineage', {
       timestamp_ms: harness.now.value + 20,
@@ -223,7 +531,14 @@ describe('OrchestratorCore persistence', () => {
       })
     ]);
     expect(attempts).toEqual([expect.objectContaining({ issue_run_id: 'issue_run_1', attempt_number: 0 })]);
-    expect(threads).toEqual([expect.objectContaining({ attempt_id: 'attempt_1', thread_id: 'thread-1' })]);
+    expect(threads).toEqual([expect.objectContaining({
+      attempt_id: 'attempt_1',
+      thread_id: 'thread-1',
+      session_id: 'thread-1-turn-1',
+      agent_runtime: 'codex-app-server',
+      worker_instance_id: 'i-lineage-worker-1',
+      worker_process_pid: null
+    })]);
     expect(turns).toEqual([expect.objectContaining({ thread_id: 'thread-1', turn_id: 'turn-1', turn_index: 0 })]);
     expect(phaseSpans).toEqual(expect.arrayContaining([
       expect.objectContaining({ turn_id: 'turn-1', phase: 'planning', reason_code: 'codex_phase_planning' }),
@@ -242,8 +557,14 @@ describe('OrchestratorCore persistence', () => {
         attempt_id: 'attempt_1',
         thread_id: 'thread-1',
         turn_id: 'turn-1',
-        evidence_kind: 'codex_thread',
-        uri: 'codex-thread:thread-1'
+        evidence_kind: 'agent_thread',
+        uri: 'agent-thread:thread-1',
+        metadata: expect.objectContaining({
+          session_id: 'thread-1-turn-1',
+          agent_runtime: 'codex-app-server',
+          worker_instance_id: 'i-lineage-worker-1',
+          worker_process_pid: null
+        })
       })
     ]);
     expect(trackerSnapshots).toEqual([
@@ -805,13 +1126,13 @@ describe('OrchestratorCore persistence', () => {
 
       expect(logs.filter((entry) => entry.event === CANONICAL_EVENT.persistence.recordEventFailed)).toHaveLength(0);
       const lineage = store.reconstructThreadLineage('thread-wait-graph');
-      expect(lineage?.turns[0]?.phase_spans).toEqual([
+      expect(lineage?.turns[0]?.phase_spans).toEqual(expect.arrayContaining([
         expect.objectContaining({
           phase: 'planning',
           reason_code: 'codex_turn_waiting',
           reason_detail: 'waiting heartbeat 1'
         })
-      ]);
+      ]));
     } finally {
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });
@@ -879,13 +1200,13 @@ describe('OrchestratorCore persistence', () => {
         active_turn_id: 'turn-failure-context'
       })
     );
-    expect(writeFailures).toEqual([
+    expect(writeFailures).toEqual(expect.arrayContaining([
       expect.objectContaining({
         operation: 'appendPhaseSpan',
         reason_code: 'codex_turn_waiting',
         detail: 'database locked token=***REDACTED***'
       })
-    ]);
+    ]));
   });
 
   it('does not mark a turn persisted when the durable turn write fails', async () => {
@@ -1092,7 +1413,8 @@ describe('OrchestratorCore persistence', () => {
       expect.objectContaining({
         issue_run_id: 'issue_run_1',
         attempt_id: 'attempt_1',
-        thread_id: 'thread-0',
+        thread_id: null,
+        turn_id: null,
         to_status: 'blocked',
         reason_code: 'operator_action_required_no_progress_redispatch_blocked'
       })

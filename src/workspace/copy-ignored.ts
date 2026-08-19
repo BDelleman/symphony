@@ -11,13 +11,69 @@ const HARD_DENY_PATTERNS = [
   '.hg/**',
   '.svn/**',
   '.ssh/**',
+  '**/.ssh/**',
   '.gnupg/**',
+  '**/.gnupg/**',
   '.aws/**',
+  '**/.aws/**',
+  '.azure/**',
+  '**/.azure/**',
   '.kube/**',
+  '**/.kube/**',
+  '.config/gh/**',
+  '**/.config/gh/**',
+  '.config/gcloud/**',
+  '**/.config/gcloud/**',
+  '.config/containers/**',
+  '**/.config/containers/**',
+  '.config/pip/**',
+  '**/.config/pip/**',
+  '.config/pypoetry/**',
+  '**/.config/pypoetry/**',
+  '.cargo/**',
+  '**/.cargo/**',
+  '.composer/**',
+  '**/.composer/**',
+  '.docker/**',
+  '**/.docker/**',
+  '.terraform.d/**',
+  '**/.terraform.d/**',
+  '.claude.json',
+  '**/.claude.json',
+  '.mcp.json',
+  '**/.mcp.json',
+  '.npmrc',
+  '**/.npmrc',
+  '.pnpmrc',
+  '**/.pnpmrc',
+  '.yarnrc',
+  '**/.yarnrc',
+  '.yarnrc.yml',
+  '**/.yarnrc.yml',
+  '.pypirc',
+  '**/.pypirc',
+  '.netrc',
+  '**/.netrc',
+  '.authinfo',
+  '**/.authinfo',
+  '.git-credentials',
+  '**/.git-credentials',
+  'credentials',
+  '**/credentials',
+  'credentials.json',
+  '**/credentials.json',
+  '*service-account*.json',
+  '**/*service-account*.json',
   '*.pem',
+  '**/*.pem',
   '*.key',
+  '**/*.key',
   '*.p12',
-  '.env*'
+  '**/*.p12',
+  '*.pfx',
+  '**/*.pfx',
+  '.env*',
+  '**/.env*'
 ];
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -33,7 +89,7 @@ function escapeRegex(literal: string): string {
   return literal.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
 }
 
-function globToRegex(pattern: string): RegExp {
+function globToRegex(pattern: string, caseInsensitive = false): RegExp {
   const normalized = toPosix(pattern).replace(/^\/+/, '');
   let out = '^';
   for (let i = 0; i < normalized.length; i += 1) {
@@ -54,7 +110,7 @@ function globToRegex(pattern: string): RegExp {
     out += escapeRegex(c);
   }
   out += '$';
-  return new RegExp(out);
+  return new RegExp(out, caseInsensitive ? 'i' : undefined);
 }
 
 function isUnsafePattern(raw: string): boolean {
@@ -133,7 +189,7 @@ async function isGitIgnored(repoRoot: string, relativePath: string): Promise<boo
   return checked.ok;
 }
 
-function compilePatterns(patterns: string[]): RegExp[] {
+function compilePatterns(patterns: string[], caseInsensitive = false): RegExp[] {
   const compiled: RegExp[] = [];
   for (const raw of patterns) {
     const trimmed = raw.trim();
@@ -141,7 +197,7 @@ function compilePatterns(patterns: string[]): RegExp[] {
       continue;
     }
     const candidate = trimmed.endsWith('/') ? `${trimmed}**` : trimmed;
-    compiled.push(globToRegex(candidate));
+    compiled.push(globToRegex(candidate, caseInsensitive));
   }
   return compiled;
 }
@@ -208,7 +264,7 @@ export async function copyIgnoredArtifacts(params: {
 
   const includePatterns = compilePatterns(includeLines);
   const allowPatterns = compilePatterns(config.allow_patterns);
-  const denyPatterns = compilePatterns([...HARD_DENY_PATTERNS, ...config.deny_patterns]);
+  const denyPatterns = compilePatterns([...HARD_DENY_PATTERNS, ...config.deny_patterns], true);
 
   const repoRoot = params.provisionRepoRoot ? path.resolve(params.provisionRepoRoot) : null;
   if (!repoRoot) {
@@ -225,10 +281,24 @@ export async function copyIgnoredArtifacts(params: {
   if (!isContainedPath(sourcePath, includeFile)) {
     throw new WorkspaceError('workspace_copy_ignored_invalid_config', 'include file must be within the source repository');
   }
+  if (includePatterns.length === 0) {
+    return {
+      status: 'skipped',
+      source_path: sourcePath,
+      include_file: includeFile,
+      conflict_policy: conflictPolicy,
+      copied_files: 0,
+      skipped_existing: 0,
+      blocked_files: 0,
+      bytes_copied: 0,
+      duration_ms: Math.max(0, nowMs() - started),
+      warning: 'include file has no active patterns'
+    };
+  }
 
   const workspaceResolved = path.resolve(params.workspacePath);
   const allFiles = await listFilesRecursive(sourcePath);
-  const candidates = allFiles.filter((rel) => includePatterns.length > 0 && matchesAny(rel, includePatterns));
+  const candidates = allFiles.filter((rel) => matchesAny(rel, includePatterns));
 
   let copiedFiles = 0;
   let skippedExisting = 0;
@@ -268,7 +338,20 @@ export async function copyIgnoredArtifacts(params: {
       throw new WorkspaceError('workspace_copy_ignored_invalid_config', `target path escapes workspace: ${rel}`);
     }
 
-    const targetExists = await fs.stat(targetFile).then(() => true).catch(() => false);
+    const sourceLstat = await fs.lstat(sourceFile);
+    if (sourceLstat.isSymbolicLink()) {
+      blockedFiles += 1;
+      continue;
+    }
+    const targetLstat = await fs.lstat(targetFile).catch(() => null);
+    if (targetLstat?.isSymbolicLink()) {
+      throw new WorkspaceError('workspace_copy_ignored_invalid_config', `destination is a symbolic link: ${rel}`);
+    }
+    const targetParent = await fs.realpath(path.dirname(targetFile));
+    if (!isContainedPath(workspaceResolved, targetParent)) {
+      throw new WorkspaceError('workspace_copy_ignored_invalid_config', `destination parent escapes workspace: ${rel}`);
+    }
+    const targetExists = targetLstat !== null;
     if (targetExists) {
       if (conflictPolicy === 'skip') {
         skippedExisting += 1;
@@ -279,7 +362,7 @@ export async function copyIgnoredArtifacts(params: {
       }
     }
 
-    const sourceStatFile = await fs.stat(sourceFile);
+    const sourceStatFile = sourceLstat;
     if (bytesCopied + sourceStatFile.size > config.max_total_bytes) {
       throw new WorkspaceError('workspace_copy_ignored_limits_exceeded', 'max_total_bytes limit exceeded');
     }
@@ -298,7 +381,6 @@ export async function copyIgnoredArtifacts(params: {
     skipped_existing: skippedExisting,
     blocked_files: blockedFiles,
     bytes_copied: bytesCopied,
-    duration_ms: Math.max(0, nowMs() - started),
-    ...(includePatterns.length === 0 ? { warning: 'include_file_empty' } : {})
+    duration_ms: Math.max(0, nowMs() - started)
   };
 }

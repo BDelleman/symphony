@@ -1697,9 +1697,13 @@ describe('createRuntimeEnvironment', () => {
 
   it('supports runtime workflow path switch and preserves last-known-good config', async () => {
     const workflowPath = await makeWorkflowFile({ pollingIntervalMs: 1000 });
-    const nextWorkflowPath = await makeWorkflowFile({ pollingIntervalMs: 4000 });
+    const generatedNextWorkflowPath = await makeWorkflowFile({ pollingIntervalMs: 4000 });
+    const nextWorkflowPath = path.join(path.dirname(workflowPath), 'WORKFLOW.next.md');
+    await fs.copyFile(generatedNextWorkflowPath, nextWorkflowPath);
+    const crossProjectWorkflowPath = await makeWorkflowFile({ pollingIntervalMs: 6000 });
     dirs.push(path.dirname(workflowPath));
-    dirs.push(path.dirname(nextWorkflowPath));
+    dirs.push(path.dirname(generatedNextWorkflowPath));
+    dirs.push(path.dirname(crossProjectWorkflowPath));
 
     const tracker: TrackerAdapter = {
       fetch_candidate_issues: vi.fn(async () => []),
@@ -1724,6 +1728,34 @@ describe('createRuntimeEnvironment', () => {
       body: JSON.stringify({ workflow_path: nextWorkflowPath })
     });
     expect(switchResponse.status).toBe(202);
+    expect(runtime.orchestrator.getStateSnapshot().poll_interval_ms).toBe(4000);
+
+    const crossProjectResponse = await fetch(`http://127.0.0.1:${address.port}/api/v1/workflow/path`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workflow_path: crossProjectWorkflowPath })
+    });
+    expect(crossProjectResponse.status).toBe(422);
+    expect(runtime.orchestrator.getStateSnapshot().poll_interval_ms).toBe(4000);
+
+    const previousRuntime = process.env.SYMPHONY_AGENT_RUNTIME;
+    const previousModel = process.env.ANTHROPIC_MODEL;
+    process.env.SYMPHONY_AGENT_RUNTIME = 'claude-cli';
+    process.env.ANTHROPIC_MODEL = 'claude-sonnet-4-6';
+    let runtimeSwitchResponse: Response;
+    try {
+      runtimeSwitchResponse = await fetch(`http://127.0.0.1:${address.port}/api/v1/workflow/path`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ workflow_path: nextWorkflowPath })
+      });
+    } finally {
+      if (previousRuntime === undefined) delete process.env.SYMPHONY_AGENT_RUNTIME;
+      else process.env.SYMPHONY_AGENT_RUNTIME = previousRuntime;
+      if (previousModel === undefined) delete process.env.ANTHROPIC_MODEL;
+      else process.env.ANTHROPIC_MODEL = previousModel;
+    }
+    expect(runtimeSwitchResponse.status).toBe(422);
     expect(runtime.orchestrator.getStateSnapshot().poll_interval_ms).toBe(4000);
 
     const invalidResponse = await fetch(`http://127.0.0.1:${address.port}/api/v1/workflow/path`, {

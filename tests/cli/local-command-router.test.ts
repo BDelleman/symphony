@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import net from 'node:net';
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -29,9 +30,17 @@ import { materializeWorkflowPlan, validateWorkflowContent } from '../../src/work
 import { WorkflowLoader } from '../../src/workflow/loader';
 import { ConfigResolver } from '../../src/workflow/resolver';
 import { createWorkspaceProvisioner } from '../../src/workspace/provisioner';
+import { buildDurableIdentity, SqlitePersistenceStore } from '../../src/persistence';
 
 const execFileAsync = promisify(execFile);
 const realCliScript = path.join(process.cwd(), 'scripts', 'symphony.js');
+
+const quarantineBase = (projectRoot: string) => path.join(
+  path.dirname(projectRoot),
+  '.symphony-quarantine',
+  crypto.createHash('sha256').update(path.resolve(projectRoot)).digest('hex').slice(0, 16),
+  'worktree-sensitive'
+);
 
 function createMemoryConsentStore(storePath = path.join(os.tmpdir(), 'symphony-user-state', 'setup-consent.json')) {
   let payload: SetupConsentStorePayload = { version: 1, records: [] };
@@ -1613,9 +1622,22 @@ describe('local symphony command router', () => {
         `#!${process.execPath}`,
         'if (process.argv[2] === "--version") { console.log("2.1.224 (Claude Code)"); process.exit(0); }',
         'if (process.argv[2] === "auth") { console.log(JSON.stringify({ loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", subscriptionType: "team", email: "must-not-leak@example.test" })); process.exit(0); }',
+        'if (process.argv[2] === "--setting-sources" && process.argv[4] === "mcp" && process.argv[5] === "list") { console.log("linear-server: https://mcp.linear.app/mcp - ✔ Connected"); process.exit(0); }',
+        'if (process.argv[2] === "--setting-sources" && process.argv[4] === "mcp" && process.argv[5] === "get" && process.argv[6] === "linear-server") { console.log("linear-server"); process.exit(0); }',
         'process.exit(1);',
         ''
       ].join('\n')
+    );
+    await writeExecutable(path.join(binDir, process.platform === 'darwin' ? 'sandbox-exec' : 'bwrap'), '#!/bin/sh\nexit 0\n');
+    if (process.platform !== 'darwin') await writeExecutable(path.join(binDir, 'socat'), '#!/bin/sh\nexit 0\n');
+    await fs.writeFile(
+      path.join(projectRoot, '.claude.json'),
+      JSON.stringify({
+        mcpServers: {
+          'linear-server': { type: 'http', url: 'https://mcp.linear.app/mcp' }
+        }
+      }),
+      'utf8'
     );
     const harness = createHarness({ repoRoot });
     harness.deps.cwd = projectRoot;
@@ -1640,6 +1662,10 @@ describe('local symphony command router', () => {
     expect(doctorFinding(payload, 'claude.runtime_scope')).toMatchObject({ severity: 'pass' });
     expect(doctorFinding(payload, 'claude.session_persistence')).toMatchObject({ severity: 'pass' });
     expect(doctorFinding(payload, 'claude.credential_boundary')).toMatchObject({ severity: 'pass' });
+    expect(doctorFinding(payload, 'claude.user_settings')).toMatchObject({ severity: 'pass' });
+    expect(doctorFinding(payload, 'claude.sandbox')).toMatchObject({ severity: 'pass' });
+    expect(doctorFinding(payload, 'claude.mcp')).toMatchObject({ severity: 'pass' });
+    expect(doctorFinding(payload, 'claude.network_policy')).toMatchObject({ severity: 'pass' });
     expect(doctorFinding(payload, 'claude.auth')).toMatchObject({
       severity: 'pass',
       details: {
@@ -1650,6 +1676,79 @@ describe('local symphony command router', () => {
       }
     });
     expect(JSON.stringify(doctorFinding(payload, 'claude.auth'))).not.toContain('must-not-leak@example.test');
+  });
+
+  it('reports and explicitly repairs execution history superseded by a later terminal issue run', async () => {
+    const { repoRoot, binDir } = await createDoctorRepo();
+    const projectRoot = await createDoctorProject();
+    const dbPath = path.join(projectRoot, '.symphony', 'system', 'runtime.sqlite');
+    const identity = buildDurableIdentity({
+      projectRoot,
+      workflowPath: path.join(projectRoot, 'WORKFLOW.md'),
+      workflowHash: { status: 'present', value: 'workflow-hash' },
+      repositoryRemote: { status: 'missing', reason: 'repository_remote_unavailable' },
+      trackerKind: 'memory',
+      trackerScope: null,
+      remoteIssueId: 'doctor-history-1',
+      humanIssueIdentifier: 'DOC-HISTORY-1'
+    });
+    const store = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    store.recordRunStarted({
+      issue_id: 'doctor-history-1',
+      issue_identifier: 'DOC-HISTORY-1',
+      identity,
+      started_at: '2026-08-18T10:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    const replacement = store.recordRunStarted({
+      issue_id: 'doctor-history-1',
+      issue_identifier: 'DOC-HISTORY-1',
+      identity,
+      started_at: '2026-08-18T10:10:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    store.completeRun({
+      run_id: replacement.run_id,
+      issue_run_id: replacement.issue_run_id,
+      attempt_id: replacement.attempt_id,
+      terminal_status: 'succeeded',
+      terminal_reason_code: 'completed'
+    });
+    store.close();
+
+    const inspectHarness = createHarness({ repoRoot });
+    inspectHarness.deps.cwd = projectRoot;
+    inspectHarness.deps.env = { PATH: binDir };
+    await runCommandRouter({
+      argv: ['doctor', '--json', '--i-understand-that-this-will-be-running-without-the-usual-guardrails'],
+      deps: inspectHarness.deps
+    });
+    const inspectPayload = JSON.parse(inspectHarness.stdout);
+    expect(doctorFinding(inspectPayload, 'history.execution_graph_reconciliation')).toMatchObject({
+      status: 'failure',
+      reason: 'history_orphan_reconciliation_required',
+      safeFix: { available: true },
+      details: { activeCount: 1, repairableCount: 1, ambiguousCount: 0 }
+    });
+
+    const fixHarness = createHarness({ repoRoot });
+    fixHarness.deps.cwd = projectRoot;
+    fixHarness.deps.env = { PATH: binDir };
+    await runCommandRouter({
+      argv: ['doctor', '--json', '--fix', '--yes', '--i-understand-that-this-will-be-running-without-the-usual-guardrails'],
+      deps: fixHarness.deps
+    });
+    const fixedPayload = JSON.parse(fixHarness.stdout);
+    expect(fixedPayload.fixes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'history-execution-graph-reconciliation', status: 'applied' })
+    ]));
+    expect(doctorFinding(fixedPayload, 'history.execution_graph_reconciliation')).toMatchObject({
+      status: 'ok',
+      reason: 'history_execution_graph_reconciled',
+      details: { activeCount: 0, repairableCount: 0, ambiguousCount: 0 }
+    });
   });
 
   it('reports environment-variable provenance for doctor env overrides', async () => {
@@ -2524,6 +2623,125 @@ describe('local symphony command router', () => {
     expect(harness.linkLocalCalls).toEqual([]);
     expect(harness.stdout).toContain('[applied] setup-consent');
     expect(harness.dashboardCalls).toEqual([]);
+  });
+
+  it('doctor --fix --yes quarantines managed-worktree credentials with metadata-only evidence', async () => {
+    const { repoRoot, binDir } = await createDoctorRepo();
+    const projectRoot = await createDoctorProject();
+    const workspaceRoot = path.join(projectRoot, 'managed-worktrees');
+    const sensitivePath = path.join(workspaceRoot, 'ABC-9', '.env.local');
+    const templatePath = path.join(workspaceRoot, 'ABC-9', '.env.example');
+    await fs.mkdir(path.dirname(sensitivePath), { recursive: true });
+    await fs.writeFile(sensitivePath, 'DO_NOT_EXPOSE=this-secret-value\n', { encoding: 'utf8', mode: 0o600 });
+    await fs.writeFile(templatePath, 'DO_NOT_EXPOSE=replace-me\n', 'utf8');
+    await execFileAsync('git', ['init'], { cwd: path.dirname(templatePath) });
+    await execFileAsync('git', ['config', 'user.email', 'doctor@example.test'], { cwd: path.dirname(templatePath) });
+    await execFileAsync('git', ['config', 'user.name', 'Doctor Test'], { cwd: path.dirname(templatePath) });
+    await execFileAsync('git', ['add', '.env.example'], { cwd: path.dirname(templatePath) });
+    await execFileAsync('git', ['commit', '-m', 'add environment template'], { cwd: path.dirname(templatePath) });
+    await fs.writeFile(
+      path.join(projectRoot, 'WORKFLOW.md'),
+      [
+        '---',
+        'tracker:',
+        '  kind: memory',
+        'workspace:',
+        `  root: ${workspaceRoot}`,
+        'codex:',
+        '  command: codex',
+        '---',
+        'workflow'
+      ].join('\n'),
+      'utf8'
+    );
+    const harness = createHarness({ repoRoot });
+    harness.deps.cwd = projectRoot;
+    harness.deps.env = { PATH: binDir };
+
+    await runCommandRouter({ argv: ['doctor', '--fix', '--yes', '--json'], deps: harness.deps });
+    const payload = JSON.parse(harness.stdout);
+    const quarantineRoot = path.join(quarantineBase(projectRoot), '2026-05-24T20-00-00-000Z');
+    const quarantined = path.join(quarantineRoot, 'ABC-9', '.env.local');
+    const manifest = await fs.readFile(path.join(quarantineRoot, 'manifest.json'), 'utf8');
+
+    await expect(fs.access(sensitivePath)).rejects.toThrow();
+    await expect(fs.access(quarantined)).resolves.toBeUndefined();
+    await expect(fs.readFile(templatePath, 'utf8')).resolves.toBe('DO_NOT_EXPOSE=replace-me\n');
+    expect(manifest).toContain('"category": "dotenv"');
+    expect(manifest).toContain('"mode": "0600"');
+    expect(manifest).not.toContain('this-secret-value');
+    expect(JSON.stringify(payload)).not.toContain('this-secret-value');
+    expect(payload.fixes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'workspace-sensitive-files', status: 'applied' })
+      ])
+    );
+    expect(doctorFinding(payload, 'workspace.sensitive_files')).toMatchObject({
+      status: 'ok',
+      reason: 'workspace_sensitive_files_absent',
+      details: { violations: [] }
+    });
+  });
+
+  it('doctor --fix --yes recovers an interrupted quarantine journal before re-auditing it', async () => {
+    const { repoRoot, binDir } = await createDoctorRepo();
+    const projectRoot = await createDoctorProject();
+    const workspaceRoot = path.join(projectRoot, 'managed-worktrees');
+    const sensitivePath = path.join(workspaceRoot, 'ABC-10', '.env.local');
+    const interruptedRoot = path.join(quarantineBase(projectRoot), '2026-05-23T20-00-00-000Z');
+    const interruptedDestination = path.join(interruptedRoot, 'ABC-10', '.env.local');
+    await fs.mkdir(path.dirname(interruptedDestination), { recursive: true });
+    await fs.writeFile(interruptedDestination, 'RECOVER_ME=secret\n', { encoding: 'utf8', mode: 0o600 });
+    await fs.writeFile(
+      path.join(interruptedRoot, 'manifest.json'),
+      `${JSON.stringify({
+        state: 'moving',
+        entries: [{ source: sensitivePath, destination: interruptedDestination, category: 'dotenv', status: 'moved' }]
+      }, null, 2)}\n`,
+      { encoding: 'utf8', mode: 0o600 }
+    );
+    await fs.writeFile(
+      path.join(projectRoot, 'WORKFLOW.md'),
+      [
+        '---',
+        'tracker:',
+        '  kind: memory',
+        'workspace:',
+        `  root: ${workspaceRoot}`,
+        'codex:',
+        '  command: codex',
+        '---',
+        'workflow'
+      ].join('\n'),
+      'utf8'
+    );
+    const harness = createHarness({ repoRoot });
+    harness.deps.cwd = projectRoot;
+    harness.deps.env = { PATH: binDir };
+
+    await runCommandRouter({ argv: ['doctor', '--fix', '--yes', '--json'], deps: harness.deps });
+    const payload = JSON.parse(harness.stdout);
+    const recoveredManifest = JSON.parse(await fs.readFile(path.join(interruptedRoot, 'manifest.json'), 'utf8'));
+    const replacementDestination = path.join(
+      quarantineBase(projectRoot),
+      '2026-05-24T20-00-00-000Z',
+      'ABC-10',
+      '.env.local'
+    );
+
+    expect(recoveredManifest.state).toBe('recovered_after_restart');
+    await expect(fs.access(sensitivePath)).rejects.toThrow();
+    await expect(fs.readFile(replacementDestination, 'utf8')).resolves.toBe('RECOVER_ME=secret\n');
+    expect(doctorFinding(payload, 'workspace.sensitive_files')).toMatchObject({
+      status: 'ok',
+      details: {
+        journalRecovery: {
+          recovered: [expect.stringContaining('2026-05-23T20-00-00-000Z/manifest.json')],
+          failures: []
+        }
+      }
+    });
+    expect(JSON.stringify(payload)).not.toContain('RECOVER_ME=secret');
   });
 
   it('doctor --fix --yes can append the runtime-state gitignore entry without removing broad ignores', async () => {

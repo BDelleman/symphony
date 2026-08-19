@@ -5,6 +5,7 @@ import path from 'node:path';
 import { WorkspaceError } from './errors';
 import { copyIgnoredArtifacts } from './copy-ignored';
 import { NoopProvisioner } from './provisioner';
+import { auditSensitiveWorkspaceFiles } from './sensitive-files';
 import type {
   CleanupWorkspacesResult,
   HookExecutionResult,
@@ -373,6 +374,7 @@ export class WorkspaceManager {
   async prepareAttempt(workspacePath: string, options: WorkspacePrepareAttemptOptions = {}): Promise<void> {
     const resolved = path.resolve(workspacePath);
     this.assertLaunchSafety({ workspacePath: resolved, cwd: resolved });
+    this.assertNoSensitiveFiles(resolved);
 
     for (const artifact of TEMP_ARTIFACTS) {
       await fs.rm(path.join(resolved, artifact), { recursive: true, force: true });
@@ -380,6 +382,27 @@ export class WorkspaceManager {
     await this.normalizeKnownWorkspaceDrift(resolved, options);
 
     await this.runHookOrThrow('before_run', resolved);
+    this.assertNoSensitiveFiles(resolved);
+  }
+
+  private assertNoSensitiveFiles(workspacePath: string): void {
+    const sensitiveFileAudit = auditSensitiveWorkspaceFiles(workspacePath);
+    if (sensitiveFileAudit.complete && sensitiveFileAudit.violations.length === 0) return;
+    const evidence = sensitiveFileAudit.violations.slice(0, 20).map(({ path: violationPath, category, mode }) => ({
+      path: violationPath,
+      category,
+      mode
+    }));
+    throw new WorkspaceError(
+      'workspace_sensitive_file_detected',
+      JSON.stringify({
+        complete: sensitiveFileAudit.complete,
+        scanned_entries: sensitiveFileAudit.scannedEntries,
+        violations: evidence,
+        omitted_violations: Math.max(0, sensitiveFileAudit.violations.length - evidence.length),
+        error: sensitiveFileAudit.error
+      })
+    );
   }
 
   private async normalizeKnownWorkspaceDrift(workspacePath: string, options: WorkspacePrepareAttemptOptions): Promise<void> {

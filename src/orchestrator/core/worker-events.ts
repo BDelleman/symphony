@@ -23,6 +23,8 @@ export interface WorkerActivityClassification {
 
 type InactiveWorkerPidEntry = {
   pid: string;
+  runtime_pid?: string | null;
+  worker_instance_id?: string | null;
   recorded_at_ms: number;
   reason: string;
   thread_id: string | null;
@@ -114,6 +116,10 @@ export function normalizeCodexAppServerPid(pid: number | string | null | undefin
   return pid === undefined || pid === null ? null : String(pid);
 }
 
+export function normalizeWorkerProcessPid(pid: number | string | null | undefined): string | null {
+  return pid === undefined || pid === null ? null : String(pid);
+}
+
 export function normalizeWorkerInstanceId(workerInstanceId: string | null | undefined): string | null {
   const trimmed = workerInstanceId?.trim();
   return trimmed ? trimmed : null;
@@ -164,6 +170,7 @@ export function staleWorkerEventReasonForRunningEntry(params: {
 }): QuarantinedWorkerEventReason | null {
   const { runningEntry, workerEvent, inactiveWorkerEntries } = params;
   const eventPid = normalizeCodexAppServerPid(workerEvent.codex_app_server_pid);
+  const eventRuntimePid = normalizeWorkerProcessPid(workerEvent.worker_process_pid);
   const eventWorkerInstanceId = normalizeWorkerInstanceId(workerEvent.worker_instance_id);
   if (
     eventWorkerInstanceId &&
@@ -173,7 +180,14 @@ export function staleWorkerEventReasonForRunningEntry(params: {
     return 'worker_identity_mismatch';
   }
 
-  if (eventPid && isInactiveWorkerPid(inactiveWorkerEntries, eventPid)) {
+  if (eventPid && isInactiveWorkerPid(inactiveWorkerEntries, eventPid, eventWorkerInstanceId)) {
+    return 'inactive_worker_pid';
+  }
+
+  if (
+    eventRuntimePid &&
+    isInactiveWorkerRuntimePid(inactiveWorkerEntries, eventRuntimePid, eventWorkerInstanceId)
+  ) {
     return 'inactive_worker_pid';
   }
 
@@ -189,8 +203,20 @@ export function staleWorkerEventReasonForRunningEntry(params: {
     return null;
   }
 
+  if (isSameThreadContinuationProcessStart(runningEntry, workerEvent)) {
+    return null;
+  }
+
   if (isSameThreadRecoveryTurnStart(runningEntry, workerEvent)) {
     return null;
+  }
+
+  if (
+    eventRuntimePid &&
+    runningEntry.worker_process_pid &&
+    eventRuntimePid !== runningEntry.worker_process_pid
+  ) {
+    return 'worker_identity_mismatch';
   }
 
   if (!eventPid && isInactiveWorkerLineage(inactiveWorkerEntries, workerEvent)) {
@@ -280,15 +306,25 @@ export function rememberInactiveWorkerPid(params: {
 }): void {
   const { state, runningEntry, reason, nowMs, ttlMs } = params;
   const pid = runningEntry.codex_app_server_pid;
-  if (!pid && !runningEntry.thread_id && !runningEntry.turn_id && !runningEntry.session_id) {
+  const runtimePid = runningEntry.worker_process_pid ?? null;
+  if (!pid && !runtimePid && !runningEntry.thread_id && !runningEntry.turn_id && !runningEntry.session_id) {
     return;
   }
   const issueId = runningEntry.issue.id;
   const existing = pruneInactiveWorkerPidsForIssue({ state, issueId, nowMs, ttlMs });
   const next = [
-    ...existing.filter((entry) => !(entry.pid === (pid ?? '') && entry.turn_id === (runningEntry.turn_id ?? null))),
+    ...existing.filter(
+      (entry) =>
+        !(
+          entry.pid === (pid ?? '') &&
+          (entry.runtime_pid ?? null) === runtimePid &&
+          entry.turn_id === (runningEntry.turn_id ?? null)
+        )
+    ),
     {
       pid: pid ?? '',
+      runtime_pid: runtimePid,
+      worker_instance_id: runningEntry.worker_instance_id ?? null,
       recorded_at_ms: nowMs,
       reason,
       thread_id: runningEntry.thread_id ?? null,
@@ -327,6 +363,8 @@ export function rememberInactiveWorkerLineage(params: {
     ),
     {
       pid: '',
+      runtime_pid: null,
+      worker_instance_id: null,
       recorded_at_ms: nowMs,
       reason,
       thread_id: threadId,
@@ -358,6 +396,7 @@ export function rememberReleasedWorker(params: {
       cleanup_workspace: cleanupWorkspace,
       worker_instance_id: runningEntry.worker_instance_id ?? null,
       codex_app_server_pid: runningEntry.codex_app_server_pid ?? null,
+      worker_process_pid: runningEntry.worker_process_pid ?? null,
       thread_id: runningEntry.thread_id ?? null,
       turn_id: runningEntry.turn_id ?? null,
       session_id: runningEntry.session_id ?? null
@@ -380,12 +419,16 @@ export function findReleasedWorkerRecord(
   }
   const workerInstanceId = normalizeWorkerInstanceId(details.worker_instance_id);
   const pid = normalizeCodexAppServerPid(details.codex_app_server_pid);
+  const runtimePid = normalizeWorkerProcessPid(details.worker_process_pid);
   return (
     released.find((entry) => {
       if (workerInstanceId && entry.worker_instance_id === workerInstanceId) {
         return true;
       }
       if (pid && entry.codex_app_server_pid === pid) {
+        return true;
+      }
+      if (runtimePid && entry.worker_process_pid === runtimePid) {
         return true;
       }
       if (details.turn_id && entry.turn_id === details.turn_id) {
@@ -525,6 +568,48 @@ export function applyWorkerEvent(context: WorkerEventWorkflowContext): void {
     runningEntry.token_telemetry_warning_emitted = false;
   } else if (workerEvent.event === CANONICAL_EVENT.agentRunner.turnStarted) {
     runningEntry.turn_count += 1;
+    if (workerEvent.agent_runtime === 'claude-cli') {
+      runningEntry.provider_usage = {
+        runtime: 'claude-cli',
+        model: workerEvent.requested_model ?? runningEntry.requested_model ?? null,
+        effective_models: [],
+        input_tokens: null,
+        output_tokens: null,
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+        provider_turn_count: null,
+        estimated_cost_usd: null,
+        source: 'claude_invocation',
+        status: 'awaiting',
+        confidence: 'missing',
+        api_retry_count: 0,
+        tool_counts: {},
+        mcp_counts: {},
+        updated_at: new Date(workerEvent.timestamp_ms).toISOString(),
+        missing_reason: null,
+        reconciliation_delta: null,
+        model_usage: []
+      };
+    }
+  }
+
+  if (workerEvent.provider_usage) {
+    const previous = runningEntry.provider_usage;
+    const next = workerEvent.provider_usage;
+    const tokenProgress =
+      (next.input_tokens ?? 0) > (previous?.input_tokens ?? 0) ||
+      (next.output_tokens ?? 0) > (previous?.output_tokens ?? 0) ||
+      (next.cache_read_tokens ?? 0) > (previous?.cache_read_tokens ?? 0) ||
+      (next.cache_creation_tokens ?? 0) > (previous?.cache_creation_tokens ?? 0);
+    runningEntry.provider_usage = {
+      ...next,
+      effective_models: [...(next.effective_models ?? [])],
+      tool_counts: { ...(next.tool_counts ?? {}) },
+      mcp_counts: { ...(next.mcp_counts ?? {}) },
+      model_usage: (next.model_usage ?? []).map((entry) => ({ ...entry })),
+      reconciliation_delta: next.reconciliation_delta ? { ...next.reconciliation_delta } : null
+    };
+    if (tokenProgress) context.resetRunningWaitEpisode(runningEntry, workerEvent.timestamp_ms);
   }
 
   const usageThreadMatches =
@@ -724,11 +809,13 @@ function recordStaleRunningWorkerEvent(
     event: workerEvent.event,
     message: workerEvent.detail ?? null,
     codex_app_server_pid: normalizeCodexAppServerPid(workerEvent.codex_app_server_pid),
+    worker_process_pid: normalizeWorkerProcessPid(workerEvent.worker_process_pid),
     worker_instance_id: normalizeWorkerInstanceId(workerEvent.worker_instance_id),
     session_id: workerEvent.session_id ?? null,
     thread_id: workerEvent.thread_id ?? null,
     turn_id: workerEvent.turn_id ?? null,
     active_codex_app_server_pid: runningEntry.codex_app_server_pid ?? null,
+    active_worker_process_pid: runningEntry.worker_process_pid ?? null,
     active_worker_instance_id: runningEntry.worker_instance_id ?? null,
     run_id: null,
     issue_run_id: null,
@@ -842,6 +929,11 @@ export function staleWorkerExitReasonForRunningEntry(
     return 'worker_pid_mismatch';
   }
 
+  const exitRuntimePid = normalizeWorkerProcessPid(details.worker_process_pid);
+  if (exitRuntimePid && running.worker_process_pid && exitRuntimePid !== running.worker_process_pid) {
+    return 'worker_pid_mismatch';
+  }
+
   if (details.thread_id && running.thread_id && details.thread_id !== running.thread_id) {
     return 'thread_mismatch';
   }
@@ -883,6 +975,10 @@ export async function applyWorkerExitLineage(params: {
   if (codexAppServerPid && !running.codex_app_server_pid) {
     running.codex_app_server_pid = codexAppServerPid;
   }
+  const workerProcessPid = normalizeWorkerProcessPid(details.worker_process_pid);
+  if (workerProcessPid && !running.worker_process_pid) {
+    running.worker_process_pid = workerProcessPid;
+  }
 }
 
 export function recordTerminationExitObserved(params: {
@@ -905,6 +1001,11 @@ export function recordTerminationExitObserved(params: {
     exit_observed_at_ms: termination.exit_observed_at_ms ?? params.observedAtMs,
     worker_instance_id: normalizeWorkerInstanceId(details.worker_instance_id) ?? termination.worker_instance_id ?? running.worker_instance_id ?? null,
     codex_app_server_pid: normalizeCodexAppServerPid(details.codex_app_server_pid) ?? termination.codex_app_server_pid ?? running.codex_app_server_pid ?? null,
+    worker_process_pid:
+      normalizeWorkerProcessPid(details.worker_process_pid) ??
+      termination.worker_process_pid ??
+      running.worker_process_pid ??
+      null,
     thread_id: details.thread_id ?? termination.thread_id ?? running.thread_id ?? null,
     turn_id: details.turn_id ?? termination.turn_id ?? running.turn_id ?? null,
     session_id: details.session_id ?? termination.session_id ?? running.session_id ?? null
@@ -1008,8 +1109,23 @@ export function workerEventLooksLikeTrackerComment(
   );
 }
 
-function isInactiveWorkerPid(inactiveEntries: InactiveWorkerPidEntry[], pid: string): boolean {
-  return inactiveEntries.some((entry) => entry.pid === pid);
+function isInactiveWorkerPid(inactiveEntries: InactiveWorkerPidEntry[], pid: string, workerInstanceId: string | null): boolean {
+  // Every current local bridge event is enriched with a worker instance ID. If
+  // a legacy/untrusted producer omits it, fail closed on an inactive PID match
+  // rather than letting stale activity acquire the new run's lineage.
+  return inactiveEntries.some(
+    (entry) => entry.pid === pid && (!workerInstanceId || entry.worker_instance_id === workerInstanceId)
+  );
+}
+
+function isInactiveWorkerRuntimePid(
+  inactiveEntries: InactiveWorkerPidEntry[],
+  pid: string,
+  workerInstanceId: string | null
+): boolean {
+  return inactiveEntries.some(
+    (entry) => entry.runtime_pid === pid && (!workerInstanceId || entry.worker_instance_id === workerInstanceId)
+  );
 }
 
 function isInactiveWorkerLineageQuarantineReason(reason: string): boolean {
@@ -1039,9 +1155,14 @@ function isInactiveWorkerLineage(
 
 function isSameThreadContinuationTurnStart(runningEntry: RunningEntry, workerEvent: WorkerObservabilityEvent): boolean {
   const turnId = workerEvent.turn_id;
-  return (
+  const isCodexContinuation =
     workerEvent.event === CANONICAL_EVENT.codex.turnStarted &&
-    runningEntry.last_event === CANONICAL_EVENT.codex.turnCompleted &&
+    runningEntry.last_event === CANONICAL_EVENT.codex.turnCompleted;
+  const isGenericContinuation =
+    workerEvent.event === CANONICAL_EVENT.agentRunner.turnStarted &&
+    runningEntry.last_event === CANONICAL_EVENT.agentRunner.turnCompleted;
+  return (
+    (isCodexContinuation || isGenericContinuation) &&
     Boolean(runningEntry.thread_id) &&
     workerEvent.thread_id === runningEntry.thread_id &&
     typeof turnId === 'string' &&
@@ -1050,11 +1171,27 @@ function isSameThreadContinuationTurnStart(runningEntry: RunningEntry, workerEve
   );
 }
 
+function isSameThreadContinuationProcessStart(runningEntry: RunningEntry, workerEvent: WorkerObservabilityEvent): boolean {
+  return (
+    workerEvent.event === CANONICAL_EVENT.agentRunner.processStarted &&
+    runningEntry.last_event === CANONICAL_EVENT.agentRunner.turnCompleted &&
+    Boolean(runningEntry.thread_id) &&
+    workerEvent.thread_id === runningEntry.thread_id &&
+    Boolean(runningEntry.session_id) &&
+    workerEvent.session_id === runningEntry.session_id &&
+    typeof workerEvent.turn_id === 'string' &&
+    workerEvent.turn_id !== runningEntry.turn_id
+  );
+}
+
 function isTerminalTurnResidue(runningEntry: RunningEntry, workerEvent: WorkerObservabilityEvent): boolean {
   if (!runningEntry.last_event || !isTerminalTurnEvent(runningEntry.last_event)) {
     return false;
   }
-  if (workerEvent.event === CANONICAL_EVENT.codex.turnStarted) {
+  if (
+    workerEvent.event === CANONICAL_EVENT.codex.turnStarted ||
+    workerEvent.event === CANONICAL_EVENT.agentRunner.turnStarted
+  ) {
     return false;
   }
 
@@ -1063,8 +1200,13 @@ function isTerminalTurnResidue(runningEntry: RunningEntry, workerEvent: WorkerOb
   const sameThread =
     !runningEntry.thread_id || !workerEvent.thread_id || workerEvent.thread_id === runningEntry.thread_id;
   const eventPid = normalizeCodexAppServerPid(workerEvent.codex_app_server_pid);
-  const sameWorkerPid = Boolean(runningEntry.codex_app_server_pid) && eventPid === runningEntry.codex_app_server_pid;
-  const hasEventLineage = Boolean(workerEvent.thread_id || workerEvent.turn_id || workerEvent.session_id || eventPid);
+  const eventRuntimePid = normalizeWorkerProcessPid(workerEvent.worker_process_pid);
+  const sameWorkerPid =
+    (Boolean(runningEntry.codex_app_server_pid) && eventPid === runningEntry.codex_app_server_pid) ||
+    (Boolean(runningEntry.worker_process_pid) && eventRuntimePid === runningEntry.worker_process_pid);
+  const hasEventLineage = Boolean(
+    workerEvent.thread_id || workerEvent.turn_id || workerEvent.session_id || eventPid || eventRuntimePid
+  );
   return sameThread && (sameTurn || sameSession || sameWorkerPid || !hasEventLineage);
 }
 

@@ -188,6 +188,7 @@ function makeDashboardElements() {
     drainWaitButton: new FakeElement(),
     drainShutdownButton: new FakeElement(),
     apiDegradedBanner: new FakeElement(),
+    apiDegradedTitle: new FakeElement(),
     apiDegradedSummary: new FakeElement(),
     snapshotErrorPanel: new FakeElement(),
     snapshotErrorMessage: new FakeElement(),
@@ -678,6 +679,14 @@ describe('dashboard browser client modules', () => {
           token_split_status: 'aggregate_only',
           seconds_running: 5
         },
+        provider_totals: [
+          {
+            final_invocation_count: 2,
+            partial_invocation_count: 1,
+            unobserved_invocation_count: 3,
+            missing_invocation_count: 4
+          }
+        ],
         retry_status: {
           entries: [
             {
@@ -693,6 +702,11 @@ describe('dashboard browser client modules', () => {
     );
     expect(collectText(elements.kpiGrid)).toContain('Split unavailable');
     expect(collectText(elements.kpiGrid)).toContain('Runtime Seconds 17');
+    expect(collectText(elements.kpiGrid)).toContain('Provider Final Invocations 2');
+    expect(collectText(elements.kpiGrid)).toContain('Provider Partial Invocations 1');
+    expect(collectText(elements.kpiGrid)).toContain('Provider Unobserved Invocations 3');
+    expect(collectText(elements.kpiGrid)).toContain('Provider Missing Invocations 4');
+    expect(collectText(elements.kpiGrid)).toContain('Provider Coverage Gaps 8');
     expect(collectText(elements.retryStatusSummary)).toContain('1 overdue retry needs attention');
 
     renderActionRequiredBanner({ blocked: [] });
@@ -914,7 +928,7 @@ describe('dashboard browser client modules', () => {
     expect(elements.drainModeBoundary.textContent).toContain('Restart is not safe yet');
     expect(elements.drainModeBoundary.textContent).toContain('ABC-1 and ABC-2 are still running');
     expect(collectText(elements.drainBlockersList)).toContain('Active workers 2');
-    expect(collectText(elements.drainBlockersList)).toContain('Codex app servers 1');
+    expect(collectText(elements.drainBlockersList)).toContain('Agent runner processes 1');
     expect(collectText(elements.drainBlockersList)).toContain('Pending retries 1');
     expect(collectText(elements.drainBlockersList)).toContain('Tracker writes 1');
     expect(collectText(elements.drainBlockersList)).toContain('Current persistence/history writes 1');

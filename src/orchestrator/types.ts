@@ -29,6 +29,7 @@ export interface WorkerExitDetails {
   worker_handle?: unknown;
   worker_instance_id?: string | null;
   codex_app_server_pid?: string | number | null;
+  worker_process_pid?: string | number | null;
   thread_id?: string | null;
   turn_id?: string | null;
   session_id?: string | null;
@@ -44,6 +45,7 @@ export interface RunningEntryTermination {
   worker_handle?: unknown;
   worker_instance_id?: string | null;
   codex_app_server_pid?: string | null;
+  worker_process_pid?: string | null;
   thread_id?: string | null;
   turn_id?: string | null;
   session_id?: string | null;
@@ -54,6 +56,7 @@ export interface ReleasedWorkerRecord {
   cleanup_workspace: boolean;
   worker_instance_id?: string | null;
   codex_app_server_pid?: string | null;
+  worker_process_pid?: string | null;
   thread_id?: string | null;
   turn_id?: string | null;
   session_id?: string | null;
@@ -111,11 +114,21 @@ export interface RunningEntry {
   thread_id: string | null;
   turn_id: string | null;
   persisted_thread_id?: string | null;
+  persisted_thread_evidence_id?: string | null;
   persisted_turn_ids?: string[];
   pending_persisted_turn_ids?: string[];
+  execution_graph_turn_indices?: Record<string, number>;
+  pending_execution_graph_thread_started_at?: string | null;
+  pending_execution_graph_turn?: {
+    turn_id: string;
+    turn_index: number;
+    started_at: string;
+  } | null;
+  history_terminalizing?: boolean;
   codex_app_server_pid: string | null;
   agent_runtime?: 'codex-app-server' | 'claude-cli' | null;
   worker_process_pid?: string | null;
+  provider_usage?: import('../agent').ProviderUsage | null;
   last_process_liveness_at_ms?: number | null;
   turn_count: number;
   last_event: string | null;
@@ -164,10 +177,12 @@ export interface RunningEntry {
     event: string;
     message: string | null;
     codex_app_server_pid: string | null;
+    worker_process_pid?: string | null;
     session_id: string | null;
     thread_id: string | null;
     turn_id: string | null;
     active_codex_app_server_pid: string | null;
+    active_worker_process_pid?: string | null;
     worker_instance_id?: string | null;
     active_worker_instance_id?: string | null;
     run_id?: string | null;
@@ -637,6 +652,7 @@ export interface OrchestratorState {
     string,
     Array<{
       pid: string;
+      runtime_pid?: string | null;
       recorded_at_ms: number;
       reason: string;
       thread_id: string | null;
@@ -909,7 +925,7 @@ export interface PhaseMarkerSettings {
 }
 
 export interface OrchestratorPersistencePort {
-  startRun: (params: { issue_id: string; issue_identifier: string }) => Promise<string>;
+  startRun: (params: { issue_id: string; issue_identifier: string; issue_run_id?: string | null }) => Promise<string>;
   recordRunStarted?: (params: {
     issue_id: string;
     issue_identifier: string;
@@ -941,6 +957,10 @@ export interface OrchestratorPersistencePort {
   }) => Promise<string>;
   appendThread?: (params: {
     attempt_id: string;
+    session_id?: string | null;
+    agent_runtime?: string | null;
+    worker_instance_id?: string | null;
+    worker_process_pid?: number | null;
     started_at: string;
     ended_at?: string | null;
     status: ExecutionGraphEntityStatus;
@@ -1116,9 +1136,49 @@ export interface OrchestratorPersistencePort {
     runtime_provider?: string | null;
     provider_turn_count?: number | null;
     estimated_cost_usd?: number | null;
-    telemetry_confidence: 'observed_live' | 'backfilled' | 'missing';
+    cache_creation_input_tokens?: number | null;
+    provider_usage_status?: string | null;
+    provider_usage_source?: string | null;
+    api_retry_count?: number | null;
+    api_error_status?: number | string | null;
+    terminal_reason?: string | null;
+    stop_reason?: string | null;
+    duration_ms?: number | null;
+    duration_api_ms?: number | null;
+    time_to_first_token_ms?: number | null;
+    permission_denial_count?: number | null;
+    unknown_event_count?: number | null;
+    auxiliary_result_count?: number | null;
+    effective_models?: string[] | null;
+    tool_counts?: Record<string, number> | null;
+    mcp_counts?: Record<string, number> | null;
+    missing_reason?: string | null;
+    reconciliation_delta?: Record<string, number> | null;
+    model_usage?: unknown[] | null;
+    nested_session_detected?: boolean | null;
+    supervised_session_coverage?: string | null;
+    telemetry_confidence:
+      | 'observed_live'
+      | 'backfilled'
+      | 'provider_step'
+      | 'provider_result'
+      | 'legacy_partial'
+      | 'missing';
     observed_at: string;
     token_model_fact_id?: string;
+  }) => Promise<string>;
+  appendProviderUsageStepFact?: (params: {
+    issue_run_id: string;
+    attempt_id?: string | null;
+    thread_id?: string | null;
+    turn_id: string;
+    message_id_hash: string;
+    model?: string | null;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    observed_at: string;
   }) => Promise<string>;
   appendDrainAuditHistory?: (params: {
     issue_run_id?: string | null;
@@ -1175,11 +1235,14 @@ export interface OrchestratorPersistencePort {
     request_method?: string | null;
     request_category?: string | null;
   }) => Promise<void>;
+  completeRunIncludesTerminalEvidence?: boolean;
   completeRun: (params: {
     run_id: string;
     issue_run_id?: string | null;
     attempt_id?: string | null;
     terminal_status: RunTerminalStatus;
+    process_status?: RunTerminalStatus;
+    workflow_outcome?: string;
     error_code?: string | null;
     terminal_reason_code?: string | null;
     terminal_reason_detail?: string | null;
@@ -1225,6 +1288,7 @@ export interface WorkerObservabilityEvent {
   tool_name?: string | null;
   usage?: CodexUsageTotals;
   provider_usage?: import('../agent').ProviderUsage;
+  provider_usage_step_facts?: import('../agent').ProviderUsageStepFact[];
   process_liveness_only?: boolean;
   token_telemetry_status?: TokenTelemetryStatus;
   token_telemetry_last_source?: string | null;

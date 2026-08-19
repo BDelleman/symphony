@@ -8,12 +8,14 @@ import type {
 } from '../orchestrator';
 import type { CodexModelRerouteEvidence, CodexProtocolWarningEvidence } from '../codex';
 import type { CodexAppServerThreadActivitySource } from '../codex/app-server-protocol';
+import type { ProviderUsage } from '../agent';
 import type { OperatorExplainer, OperatorExplainerHint, PhaseMarkerName } from '../observability';
 import { REASON_CODES } from '../observability/reason-codes';
 import type { StructuredLogger } from '../observability';
 import type {
   DurableIdentity,
   DurableRunHistoryRecord,
+  CompletedProviderUsageTotal,
   DrainAuditEventRecord,
   ExecutionGraphThreadLineage,
   PersistenceHealth,
@@ -106,6 +108,7 @@ export interface DiagnosticsSource {
   getActiveProfile(): SecurityProfile;
   getPersistenceHealth(options?: PersistenceHealthOptions): PersistenceHealth;
   listRunHistory(limit?: number): DurableRunHistoryRecord[];
+  listCompletedProviderUsageTotals?: (excludeIssueRunIds?: string[]) => CompletedProviderUsageTotal[];
   reconstructThreadLineage?: (threadId: string) => ExecutionGraphThreadLineage | null;
   reconstructLatestThreadLineageByIssueIdentifier?: (issueIdentifier: string) => ExecutionGraphThreadLineage | null;
   listProjectTicketIdentities?: (
@@ -292,7 +295,7 @@ export interface ApiBudgetProjection {
 export interface ApiPhaseTimingProjection {
   phase_started_at: string | null;
   phase_elapsed_ms: number | null;
-  source: 'symphony_phase_marker' | null;
+  source: typeof import('../observability').REASON_CODES.symphonyPhaseMarker | null;
 }
 
 export interface ApiCodexThreadActivityProjection {
@@ -592,6 +595,9 @@ export interface ApiStateResponse extends SnapshotFreshnessFields, ApiDegradedFi
     thread_id: string | null;
     turn_id: string | null;
     codex_app_server_pid: string | null;
+    agent_runtime: 'codex-app-server' | 'claude-cli' | null;
+    worker_process_pid: string | null;
+    provider_usage: ProviderUsage | null;
     turn_count: number;
     last_event: string | null;
     last_event_summary: string | null;
@@ -898,6 +904,22 @@ export interface ApiStateResponse extends SnapshotFreshnessFields, ApiDegradedFi
     model_context_window?: number;
     seconds_running: number;
   };
+  provider_totals: Array<{
+    runtime: 'claude-cli';
+    effective_model: string | null;
+    invocation_count: number;
+    final_invocation_count: number;
+    partial_invocation_count: number;
+    unobserved_invocation_count: number;
+    missing_invocation_count: number;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    cache_read_tokens: number | null;
+    cache_creation_tokens: number | null;
+    provider_turn_count: number | null;
+    estimated_cost_usd: number | null;
+    updated_at: string | null;
+  }>;
   rate_limits: Record<string, unknown> | null;
   health: {
     dispatch_validation: 'ok' | 'failed';
@@ -1286,6 +1308,9 @@ export interface ApiIssueResponse extends SnapshotFreshnessFields, ApiDegradedFi
     thread_id: string | null;
     turn_id: string | null;
     codex_app_server_pid: string | null;
+    agent_runtime: 'codex-app-server' | 'claude-cli' | null;
+    worker_process_pid: string | null;
+    provider_usage: ProviderUsage | null;
     turn_count: number;
     state: string;
     started_at: string;

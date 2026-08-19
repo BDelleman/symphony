@@ -4,7 +4,7 @@ import { performance } from 'node:perf_hooks';
 import type { StructuredLogger } from '../observability';
 import { REASON_CODES } from '../observability';
 import { CANONICAL_EVENT } from '../observability/events';
-import type { DurableRunHistoryRecord, ProjectHistoryTicketSummaryProjection } from '../persistence';
+import type { CompletedProviderUsageTotal, DurableRunHistoryRecord, ProjectHistoryTicketSummaryProjection } from '../persistence';
 import { ControlPlaneHealthRecorder, type ControlPlaneHealthState, type ControlPlaneObservation } from './control-plane-health';
 import { NodeEventLoopHealthMonitor, type EventLoopHealthMonitor, type EventLoopHealthSummary } from './event-loop-health';
 import { renderDashboardClientJs, renderDashboardHtml, renderDashboardStylesCss, renderLensClientJs, renderLensHtml, renderLensStylesCss } from './dashboard-assets';
@@ -115,6 +115,55 @@ function snapshotGeneratedAtMs(payload: ApiStateSnapshotResponse): number | null
   return typeof payload.snapshot_generated_at_ms === 'number' && Number.isFinite(payload.snapshot_generated_at_ms)
     ? payload.snapshot_generated_at_ms
     : Date.parse(payload.generated_at);
+}
+
+function mergeProviderUsageTotals(
+  live: ApiStateResponse['provider_totals'],
+  completed: CompletedProviderUsageTotal[]
+): ApiStateResponse['provider_totals'] {
+  const groups = new Map<string, ApiStateResponse['provider_totals'][number]>();
+  const addNullable = (left: number | null, right: number | null) =>
+    right === null ? left : (left ?? 0) + right;
+  for (const row of [
+    ...completed.map((entry) => ({ ...entry, runtime: entry.runtime_provider })),
+    ...live
+  ]) {
+    const key = `${row.runtime}\0${row.effective_model ?? ''}`;
+    const current = groups.get(key) ?? {
+      runtime: 'claude-cli' as const,
+      effective_model: row.effective_model,
+      invocation_count: 0,
+      final_invocation_count: 0,
+      partial_invocation_count: 0,
+      unobserved_invocation_count: 0,
+      missing_invocation_count: 0,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      provider_turn_count: null,
+      estimated_cost_usd: null,
+      updated_at: null
+    };
+    current.invocation_count += row.invocation_count;
+    current.final_invocation_count += row.final_invocation_count;
+    current.partial_invocation_count += row.partial_invocation_count;
+    current.unobserved_invocation_count += row.unobserved_invocation_count;
+    current.missing_invocation_count += row.missing_invocation_count;
+    current.input_tokens = addNullable(current.input_tokens, row.input_tokens);
+    current.output_tokens = addNullable(current.output_tokens, row.output_tokens);
+    current.cache_read_tokens = addNullable(current.cache_read_tokens, row.cache_read_tokens);
+    current.cache_creation_tokens = addNullable(current.cache_creation_tokens, row.cache_creation_tokens);
+    current.provider_turn_count = addNullable(current.provider_turn_count, row.provider_turn_count);
+    current.estimated_cost_usd = addNullable(current.estimated_cost_usd, row.estimated_cost_usd);
+    current.updated_at = !current.updated_at || (row.updated_at && row.updated_at > current.updated_at)
+      ? row.updated_at
+      : current.updated_at;
+    groups.set(key, current);
+  }
+  return [...groups.values()].sort((left, right) =>
+    (left.effective_model ?? '').localeCompare(right.effective_model ?? '')
+  );
 }
 
 function isRuntimeUpdateActionable(readiness: ApiRuntimeUpdateReadiness | null): boolean {
@@ -492,6 +541,23 @@ export class LocalApiServer {
     try {
       const state = this.snapshotSource.getStateSnapshot({ includeTranscriptToolCallDiagnostics: false });
       const payload = this.snapshotService.projectState(state);
+      if (this.diagnosticsSource?.listCompletedProviderUsageTotals) {
+        try {
+          payload.provider_totals = mergeProviderUsageTotals(
+            payload.provider_totals,
+            this.diagnosticsSource.listCompletedProviderUsageTotals(
+              [...state.running.values()].flatMap((entry) => entry.issue_run_id ? [entry.issue_run_id] : [])
+            )
+          );
+        } catch {
+          this.logger?.log({
+            level: 'warn',
+            event: CANONICAL_EVENT.persistence.recordEventFailed,
+            message: 'failed to project completed provider usage totals',
+            context: { operation: 'listCompletedProviderUsageTotals' }
+          });
+        }
+      }
       payload.dashboard_asset_revision = this.dashboardAssetRevision;
       payload.runtime_update = this.runtimeUpdateSource?.readUpdateReadiness() ?? null;
       payload.runtime_restart = this.runtimeUpdateSource?.readRestartStatus?.() ?? manualRestartStatus();

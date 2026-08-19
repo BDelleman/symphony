@@ -97,6 +97,50 @@ describe('LocalApiServer state API', () => {
     expect(snapshotReads).toBe(0);
   });
 
+  it('keeps completed provider usage in the overview after the worker leaves running state', async () => {
+    server = new LocalApiServer({
+      snapshotSource: {
+        getStateSnapshot: () => makeState()
+      },
+      refreshSource: {
+        tick: vi.fn(async () => undefined)
+      },
+      diagnosticsSource: makeDiagnosticsSource({
+        listCompletedProviderUsageTotals: () => [{
+          runtime_provider: 'claude-cli',
+          effective_model: 'claude-sonnet-4-6',
+          invocation_count: 1,
+          final_invocation_count: 1,
+          partial_invocation_count: 0,
+          input_tokens: 120,
+          output_tokens: 30,
+          cache_read_tokens: 50,
+          cache_creation_tokens: 10,
+          provider_turn_count: 3,
+          estimated_cost_usd: 0.12,
+          updated_at: '2026-05-21T10:00:00.000Z'
+        }]
+      })
+    });
+
+    await server.listen();
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/state`);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.counts.running).toBe(0);
+    expect(payload.provider_totals).toEqual([
+      expect.objectContaining({
+        runtime: 'claude-cli',
+        effective_model: 'claude-sonnet-4-6',
+        invocation_count: 1,
+        input_tokens: 120,
+        output_tokens: 30,
+        provider_turn_count: 3
+      })
+    ]);
+  });
+
   it('serves a marked last-good state snapshot when projection fails', async () => {
     let snapshotReads = 0;
     server = new LocalApiServer({

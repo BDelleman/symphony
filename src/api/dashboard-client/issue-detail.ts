@@ -1,6 +1,6 @@
 import { elements } from './dom';
 import { state } from './state';
-import { formatBudgetSummary, formatDate, formatElapsedMs, formatNumber, getActionRequiredLabel, getProgressSignalLabel, getTokenConfidenceLabel, getTurnControlLabel } from './formatting';
+import { formatBudgetSummary, formatDate, formatElapsedMs, formatNumber, formatProviderUsage, getActionRequiredLabel, getProgressSignalLabel, getTokenConfidenceLabel, getTurnControlLabel } from './formatting';
 import { fetchJson, loadStateViaPoll, scheduleStateSave, setRefreshStatus } from './connection';
 import { renderRunning } from './issues';
 import { deriveOperatorTransitionRows } from './overview';
@@ -458,6 +458,22 @@ export async function loadIssue(identifier: any, options?: any) {
       }
       if (payload.running && payload.running.token_telemetry_confidence) {
         summaryParts.push('Token quality: ' + getTokenConfidenceLabel(payload.running.token_telemetry_confidence));
+      }
+      if (payload.running && payload.running.agent_runtime) {
+        summaryParts.push('Agent runtime: ' + payload.running.agent_runtime);
+        summaryParts.push('Requested model: ' + (payload.running.requested_model || 'n/a'));
+        summaryParts.push('Effective model: ' + (payload.running.effective_model || 'n/a'));
+        summaryParts.push('Process PID: ' + (payload.running.worker_process_pid || 'n/a'));
+        summaryParts.push('Session: ' + (payload.running.session_id || 'n/a'));
+        summaryParts.push('Thread: ' + (payload.running.thread_id || 'n/a'));
+        summaryParts.push('Turn: ' + (payload.running.turn_id || 'n/a'));
+      }
+      if (payload.running && payload.running.provider_usage) {
+        summaryParts.push('Provider usage: ' + formatProviderUsage(payload.running.provider_usage));
+        summaryParts.push('Provider telemetry updated: ' + (payload.running.provider_usage.updated_at || 'n/a'));
+        if (payload.running.provider_usage.supervised_session_coverage !== 'complete') {
+          summaryParts.push('Provider coverage warning: ' + (payload.running.provider_usage.supervised_session_coverage || 'missing'));
+        }
       }
       if (payload.running && payload.running.not_blocked_explainer_text) {
         summaryParts.push('Why not blocked: ' + payload.running.not_blocked_explainer_text);

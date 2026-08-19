@@ -5,7 +5,7 @@ Default behavior is intentionally small:
 - source defaults to the current repository
 - policy comes from <source>/.worktreeinclude
 - only Git-ignored/untracked files are eligible
-- sensitive-looking files require --allow-sensitive for real copies
+- credential and authentication material is always hard-denied
 """
 
 from __future__ import annotations
@@ -41,10 +41,31 @@ SENSITIVE_NAMES = (
     "id_rsa",
     "id_ed25519",
     ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmrc",
     ".pypirc",
     ".netrc",
+    ".authinfo",
+    ".git-credentials",
+    ".claude.json",
+    ".mcp.json",
+    "credentials",
+    "credentials.json",
+    "*service-account*.json",
+    "known_hosts",
 )
-SENSITIVE_WORDS = ("secret", "credential", "token", "private_key", "api_key", "apikey")
+SENSITIVE_DIRECTORIES = {
+    ".ssh",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".gnupg",
+    ".docker",
+    ".terraform.d",
+    ".cargo",
+    ".composer",
+}
 
 
 @dataclass(frozen=True)
@@ -244,10 +265,21 @@ def expand_files(source: Path, candidates: Iterable[Candidate]) -> list[Candidat
 
 
 def sensitive(rel: str) -> bool:
-    lower = rel.lower()
-    name = PurePosixPath(rel).name.lower()
-    return any(fnmatch.fnmatchcase(name, pat) for pat in SENSITIVE_NAMES) or any(
-        word in lower for word in SENSITIVE_WORDS
+    parts = tuple(part.lower() for part in PurePosixPath(rel).parts)
+    name = parts[-1]
+    if any(fnmatch.fnmatchcase(name, pat) for pat in SENSITIVE_NAMES):
+        return True
+    if any(part in SENSITIVE_DIRECTORIES for part in parts):
+        return True
+    return any(
+        parts[index : index + 2] in (
+            (".config", "gh"),
+            (".config", "gcloud"),
+            (".config", "containers"),
+            (".config", "pip"),
+            (".config", "pypoetry"),
+        )
+        for index in range(max(0, len(parts) - 1))
     )
 
 
@@ -263,12 +295,7 @@ def validate_copy(source: Path, target: Path, rel: str) -> tuple[Path, Path]:
         fail(f"destination escapes target: {rel}")
 
     if src.is_symlink():
-        try:
-            resolved = src.resolve(strict=True)
-        except FileNotFoundError:
-            fail(f"refusing dangling symlink: {rel}")
-        if not inside(resolved, source):
-            fail(f"refusing symlink escaping repository: {rel}")
+        fail(f"refusing to copy symlink: {rel}")
 
     return src, dst
 
@@ -294,10 +321,7 @@ def copy_one(
         return "copied"
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if src.is_symlink():
-        os.symlink(os.readlink(src), dst)
-    else:
-        shutil.copy2(src, dst, follow_symlinks=False)
+    shutil.copy2(src, dst, follow_symlinks=False)
     log("copy", "copied", path=rel, sensitive=sensitive(rel))
     return "copied"
 
@@ -324,17 +348,25 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--force", action="store_true", help="overwrite existing target files"
     )
-    parser.add_argument(
-        "--allow-sensitive",
-        action="store_true",
-        help="allow real copies of sensitive-looking files",
-    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     args = parse_args(argv)
     target = repo_root(args.target)
+    if args.source.strip().lower() == "auto":
+        # A standalone clone has no sibling entry in `git worktree list`. Its
+        # tracked include policy is nevertheless enough to prove a no-op, so
+        # avoid failing clone-provisioned workspaces when no artifacts are
+        # requested.
+        target_include_file = target / ".worktreeinclude"
+        target_rules = parse_worktreeinclude(target_include_file)
+        if not target_include_file.exists():
+            log("summary", "include file missing; copied nothing", copied=0, skipped="all")
+            return 0
+        if not target_rules:
+            log("summary", "include file has no active patterns; copied nothing", copied=0)
+            return 0
     source = (
         resolve_auto_source_root(target)
         if args.source.strip().lower() == "auto"
@@ -370,15 +402,8 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
         is_sensitive = sensitive(rel)
         if is_sensitive:
             log(
-                "warn",
-                "sensitive-looking path matched include file",
-                path=rel,
-                sensitive=True,
-            )
-        if is_sensitive and not args.dry_run and not args.allow_sensitive:
-            log(
                 "skip",
-                "sensitive path requires --allow-sensitive",
+                "sensitive path is hard-denied",
                 path=rel,
                 sensitive=True,
             )

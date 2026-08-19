@@ -504,6 +504,7 @@ export function toWorkerEvent(event: AgentRunnerEvent, nowMs: number): WorkerObs
     request_category: event.request_category,
     usage: event.usage,
     provider_usage: event.provider_usage,
+    provider_usage_step_facts: event.provider_usage_step_facts,
     process_liveness_only: event.process_liveness_only,
     rate_limits: event.rate_limits,
     codex_thread_activity_at_ms: event.codex_thread_activity_at_ms,
@@ -535,6 +536,7 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
   let promptFallbackActive = workflowDefinition.prompt_template === DEFAULT_PROMPT_TEMPLATE;
   let effectiveConfig = configResolver.resolve(workflowDefinition, { workflowPath: currentWorkflowPath });
   let workflowDir = path.dirname(currentWorkflowPath);
+  const startupProjectRoot = fs.realpathSync(effectiveConfig.workspace.provisioner.repo_root ?? workflowDir);
   const processStartedAtMs = nowMs();
   const runtimeIdentityRepoRoot =
     effectiveConfig.workspace.provisioner.repo_root ?? resolveGitRoot(workflowDir) ?? resolveGitRoot(process.cwd());
@@ -1094,7 +1096,11 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
       ? new ClaudeCliRunner({
           command: agentRuntimeConfig.claude_command,
           model: agentRuntimeConfig.claude_model ?? '',
+          projectRoot: startupProjectRoot,
           allowNonSubscriptionAuth: agentRuntimeConfig.claude_allow_non_subscription_auth,
+          networkAllowedDomains: agentRuntimeConfig.claude_network_allowed_domains,
+          allowedMcpServers: agentRuntimeConfig.claude_allowed_mcp_servers,
+          requiredMcpServers: ['linear-server'],
           supportedVersion: agentRuntimeConfig.claude_supported_version
         })
       : new CodexAgentRunner(codexRunner);
@@ -1199,6 +1205,13 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
       const validation = validator.validate(nextConfig);
       if (!validation.ok) {
         throw new WorkflowConfigError(validation.error_code, validation.message);
+      }
+      const nextProjectRoot = fs.realpathSync(nextConfig.workspace.provisioner.repo_root ?? path.dirname(nextPath));
+      if (nextProjectRoot !== startupProjectRoot) {
+        throw new Error('workflow_restart_required:project_root_changed');
+      }
+      if (JSON.stringify(nextConfig.agent_runtime) !== JSON.stringify(agentRuntimeConfig)) {
+        throw new Error('workflow_restart_required:agent_runtime_changed');
       }
 
       applyRuntimeConfig(nextConfig, nextPath, nextDefinition);
@@ -1364,6 +1377,7 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
           appendOperatorActionHistory: async (params) => persistenceStore.appendOperatorActionHistory(params),
           appendBlockedInputEvent: async (params) => persistenceStore.appendBlockedInputEvent(params),
           appendTokenModelFact: async (params) => persistenceStore.appendTokenModelFact(params),
+          appendProviderUsageStepFact: async (params) => persistenceStore.appendProviderUsageStepFact(params),
           appendDrainAuditHistory: async (params) =>
             persistenceStore.appendDrainAuditHistory({ ...params, project_identity: runtimeProjectIdentity }),
           appendAppServerEvent: async (params) => persistenceStore.appendAppServerEvent(params),
@@ -1374,6 +1388,7 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
           recordEvent: async (params) => {
             persistenceStore.recordEvent(params);
           },
+          completeRunIncludesTerminalEvidence: persistenceStore.completeRunIncludesTerminalEvidence,
           completeRun: async (params) => {
             persistenceStore.completeRun(params);
           },
@@ -1526,6 +1541,8 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
                     integrity_ok: true
                   },
             listRunHistory: (limit) => (persistenceStore ? persistenceStore.listRunHistory(limit) : []),
+            listCompletedProviderUsageTotals: (excludeIssueRunIds) =>
+              persistenceStore ? persistenceStore.listCompletedProviderUsageTotals(excludeIssueRunIds) : [],
             reconstructThreadLineage: (threadId) => (persistenceStore ? persistenceStore.reconstructThreadLineage(threadId) : null),
             reconstructLatestThreadLineageByIssueIdentifier: (issueIdentifier) =>
               persistenceStore ? persistenceStore.reconstructLatestThreadLineageByIssueIdentifier(issueIdentifier) : null,
@@ -1759,6 +1776,21 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
 
   const start = async (): Promise<void> => {
     if (persistenceStore) {
+      const reconciliation = persistenceStore.reconcileExecutionGraphAfterRestart();
+      if (reconciliation.recovered > 0 || reconciliation.ambiguous > 0) {
+        logger.log({
+          level: reconciliation.ambiguous > 0 ? 'error' : 'info',
+          event:
+            reconciliation.ambiguous > 0
+              ? CANONICAL_EVENT.persistence.startupReconciliationAmbiguous
+              : CANONICAL_EVENT.persistence.startupReconciled,
+          message:
+            reconciliation.ambiguous > 0
+              ? 'startup history reconciliation found ambiguous active records'
+              : 'startup history reconciliation closed provably orphaned records',
+          context: reconciliation
+        });
+      }
       const blockedEntries = persistenceStore
         .listBlockedInputs()
         .map((record) => {

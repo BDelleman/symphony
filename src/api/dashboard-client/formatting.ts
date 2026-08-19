@@ -301,6 +301,37 @@ export function formatTokenBreakdown(tokens: any, telemetrySource: any) {
     return parts.join(' / ') + (telemetrySource ? ' • ' + telemetrySource : '');
   }
 
+export function formatProviderUsage(usage: any) {
+    if (!usage || usage.status === 'unobserved') {
+      return 'Provider usage missing' + (usage && usage.missing_reason ? ' • ' + usage.missing_reason : '');
+    }
+    if (usage.status === 'awaiting') {
+      return 'Awaiting first provider usage payload';
+    }
+    const value = function (field: string) {
+      return typeof usage[field] === 'number' ? formatNumber(usage[field]) : 'n/a';
+    };
+    const parts = [
+      'In ' + value('input_tokens'),
+      'Out ' + value('output_tokens'),
+      'Cache read ' + value('cache_read_tokens'),
+      'Cache create ' + value('cache_creation_tokens'),
+      'Provider turns ' + value('provider_turn_count')
+    ];
+    if (usage.status === 'final' && typeof usage.estimated_cost_usd === 'number') {
+      parts.push('Estimated $' + Number(usage.estimated_cost_usd).toFixed(4));
+    }
+    parts.push((usage.status === 'partial' ? 'live lower bound' : usage.status) + ' • ' + usage.confidence);
+    if (usage.supervised_session_coverage) parts.push('coverage ' + usage.supervised_session_coverage);
+    if (typeof usage.api_retry_count === 'number') parts.push('API retries ' + formatNumber(usage.api_retry_count));
+    const tools = Object.entries(usage.tool_counts || {});
+    if (tools.length) parts.push('tools ' + tools.map(function (entry: any) { return entry[0] + ':' + entry[1]; }).join(', '));
+    const mcp = Object.entries(usage.mcp_counts || {});
+    if (mcp.length) parts.push('MCP ' + mcp.map(function (entry: any) { return entry[0] + ':' + entry[1]; }).join(', '));
+    if (usage.updated_at) parts.push('updated ' + formatDate(usage.updated_at));
+    return parts.join(' / ');
+  }
+
 export function formatApiError(payload: any, fallbackMessage: any) {
     if (!payload || !payload.error) {
       return fallbackMessage;

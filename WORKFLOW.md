@@ -28,17 +28,24 @@ polling:
 workspace:
   root: ./.symphony/system/workspaces
   provisioner:
-    type: worktree
+    type: clone
     repo_root: .
     base_ref: origin/main
     branch_template: feature/{{ issue.identifier }}
     teardown_mode: keep
     allow_dirty_repo: false
-    fallback_to_clone_on_worktree_failure: false
+  copy_ignored:
+    enabled: true
+    include_file: .worktreeinclude
+    from: repo_root
+    conflict_policy: skip
+    require_gitignored: true
+    max_files: 10000
+    max_total_bytes: 5368709120
+    allow_patterns: []
+    deny_patterns: []
 
 hooks:
-  after_create: |
-    uv run --python 3.14 python scripts/worktree_bootstrap.py
   before_remove: |
     node scripts/workspace-before-remove.js
   timeout_ms: 60000
@@ -106,10 +113,12 @@ Work only in the provided repository copy. Do not touch any other path.
 ## Prerequisite: Linear MCP is available
 
 The agent should be able to talk to Linear through the configured Linear MCP
-server. If Linear MCP is missing, only fall back to the injected
-`linear_graphql` tool for a documented GraphQL-only operation that MCP cannot
-express. If neither a required Linear MCP path nor an appropriate GraphQL-only
-fallback is present, stop and ask the user to configure Linear.
+server at the active agent runtime's user scope. If Linear MCP is missing or disconnected, stop
+with a typed readiness failure and leave the issue unchanged. Do not use
+`LINEAR_API_KEY`, curl, raw HTTP, or another inherited secret as a fallback.
+The injected `linear_graphql` tool remains an exceptional provider-neutral
+capability only when Symphony actually supplies it and MCP cannot express the
+required operation.
 
 ## Linear operation path
 
@@ -136,6 +145,9 @@ its purpose obvious in logs and diagnostics.
 ## Default posture
 
 - Start by determining the ticket's current status, then follow the matching flow for that status.
+- Before editing, read every applicable `AGENTS.md` from the repository root to
+  the target file. Before using a repository skill, open its referenced
+  `.codex/skills/<name>/SKILL.md` and follow it.
 - Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
@@ -157,9 +169,9 @@ its purpose obvious in logs and diagnostics.
 ## Related skills
 
 - `linear`: interact with Linear.
-- `commit`: produce clean, logical commits during implementation.
-- `push`: keep remote branch current and publish updates.
-- `pull`: sync with latest `origin/main` when starting work, when mergeability
+- `commit`: open and follow `.codex/skills/commit/SKILL.md` before committing.
+- `push`: open and follow `.codex/skills/push/SKILL.md` before publishing updates.
+- `pull`: open and follow `.codex/skills/pull/SKILL.md` when syncing with latest `origin/main`, when mergeability
   requires it, or during landing; do not run late branch-sync merges merely as a
   handoff ritual.
 - `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the `land` loop.
@@ -346,6 +358,7 @@ Use this only when completion is blocked by missing required tools or missing au
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
     - Also run `git ls-files -u`; pushing is forbidden if any unmerged index
       entry remains.
+    - Fetch `origin` and inspect `git diff --stat origin/main...HEAD`; pushing is forbidden when the branch contains changes outside the ticket's intended scope.
 8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
     - Prefer Linear MCP link support through `save_issue` links for ordinary PR
       attachments; use raw GraphQL only when richer Linear-specific attachment
@@ -418,6 +431,9 @@ Use this only when completion is blocked by missing required tools or missing au
    - Implementation agents may self-check before handoff, but they must not perform the formal Agent Review for their own run.
    - If this run authored the implementation being reviewed, stop and leave the issue in `Agent Review` for another automation run.
 3. Read the issue, workpad, PR, diff, validation evidence, PR checks, and recent Linear comments.
+   - Refresh the issue immediately before review starts and record the observed
+     issue version, labels, PR head SHA, checks, and review decision in the
+     Agent Review artifact.
 4. Validate the implementation agent's routing claim against the actual diff:
    - UI review is required when the change affects user-visible UI behavior, layout, styling, visual hierarchy, navigation, interactions, loading/error/empty states, or meaningful user-facing copy.
    - UI review is not required for frontend-internal refactors, tests-only changes, dependency/build mechanics, or typo-only copy fixes that do not change product meaning.
@@ -561,8 +577,14 @@ Use this only when completion is blocked by missing required tools or missing au
 3. Poll for updates as needed, including GitHub PR review comments from humans and bots.
 4. If human feedback requires normal implementation changes, move the issue to `In Progress`.
 5. If human feedback requires a fresh approach, move the issue to `Rework` and follow the rework flow.
-6. If approved, human moves the issue to `Merging`.
+6. If approved, human moves the issue to `Merging`. Entering `Merging` is the
+   authoritative human approval; the `Human Review` label may remain attached.
 7. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
+   - At landing start and again immediately before merge, refresh Linear with
+     MCP and record the issue version, state, and labels plus the current PR head
+     SHA, checks, review decision, and exact-head approval.
+   - If the issue is no longer in `Merging` at either preflight, stop without
+     merging or changing the issue state.
 8. After merge is complete, move the issue to `Done`.
 9. If merge is not complete, do not move to `Done`; keep state at `Merging`, move back to `In Progress` for normal fixable failures, or move back to `Rework` when a reset is required.
 

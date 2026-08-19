@@ -29,7 +29,53 @@ interface RootCauseDiagnostic {
   turn_id: string | null;
 }
 
+interface PersistedCompletionLineage {
+  thread_id: string | null;
+  turn_id: string | null;
+}
+
+interface CompletionProjection {
+  process_status: TerminalStatus;
+  workflow_outcome: string;
+}
+
+export function successfulWorkflowTerminationProjection(reason: string): CompletionProjection | null {
+  if (reason === REASON_CODES.handoffStateReached || reason === REASON_CODES.handoffRelease) {
+    return { process_status: 'cancelled', workflow_outcome: 'handoff_reached' };
+  }
+  if (reason === REASON_CODES.terminalStateReached) {
+    return { process_status: 'cancelled', workflow_outcome: 'succeeded' };
+  }
+  return null;
+}
+
+function persistedCompletionLineage(
+  runningEntry: RunningEntry,
+  preferredThreadId: string | null,
+  preferredTurnId: string | null
+): PersistedCompletionLineage {
+  if (!runningEntry.issue_run_id) {
+    return {
+      thread_id: preferredThreadId ?? runningEntry.thread_id ?? null,
+      turn_id: preferredTurnId ?? runningEntry.turn_id ?? null
+    };
+  }
+  const persistedThreadId = runningEntry.persisted_thread_id ?? null;
+  const observedThreadId = preferredThreadId ?? runningEntry.thread_id;
+  const threadId =
+    persistedThreadId && (!observedThreadId || observedThreadId === persistedThreadId) ? persistedThreadId : null;
+  if (!threadId) {
+    return { thread_id: null, turn_id: null };
+  }
+  const persistedTurnIds = runningEntry.persisted_turn_ids ?? [];
+  const turnId = [preferredTurnId, runningEntry.turn_id].find(
+    (candidate): candidate is string => Boolean(candidate && persistedTurnIds.includes(candidate))
+  );
+  return { thread_id: threadId, turn_id: turnId ?? null };
+}
+
 export interface RunCompletionCoordinatorHooks {
+  drainExecutionGraphPersistence: (runningEntry: RunningEntry) => Promise<void>;
   recordHistoryWriteFailure: (operation: string, reasonCode: string, error: unknown) => Promise<void>;
   persistExecutionGraphStateTransition: (
     runningEntry: RunningEntry,
@@ -102,6 +148,7 @@ export async function terminateRunningIssue(
     worker_handle: runningEntry.worker_handle,
     worker_instance_id: runningEntry.worker_instance_id ?? null,
     codex_app_server_pid: runningEntry.codex_app_server_pid ?? null,
+    worker_process_pid: runningEntry.worker_process_pid ?? null,
     thread_id: runningEntry.thread_id ?? null,
     turn_id: runningEntry.turn_id ?? null,
     session_id: runningEntry.session_id ?? null
@@ -119,7 +166,8 @@ export async function terminateRunningIssue(
       reason,
       termination_state: 'requested',
       worker_instance_id: runningEntry.worker_instance_id ?? null,
-      worker_process_identity_known: Boolean(runningEntry.codex_app_server_pid),
+      worker_process_identity_known: Boolean(runningEntry.worker_process_pid ?? runningEntry.codex_app_server_pid),
+      worker_process_pid: runningEntry.worker_process_pid ?? null,
       codex_app_server_pid: runningEntry.codex_app_server_pid,
       thread_id: runningEntry.thread_id,
       turn_id: runningEntry.turn_id
@@ -158,7 +206,8 @@ export async function terminateRunningIssue(
         termination_state: 'failed',
         error: failureDetail,
         worker_instance_id: runningEntry.worker_instance_id ?? null,
-        worker_process_identity_known: Boolean(runningEntry.codex_app_server_pid),
+        worker_process_identity_known: Boolean(runningEntry.worker_process_pid ?? runningEntry.codex_app_server_pid),
+        worker_process_pid: runningEntry.worker_process_pid ?? null,
         codex_app_server_pid: runningEntry.codex_app_server_pid,
         thread_id: runningEntry.thread_id,
         turn_id: runningEntry.turn_id
@@ -193,9 +242,25 @@ export async function terminateRunningIssue(
   };
 
   const finalizationDetail = workerTerminationResultDetail(`worker termination finalized: ${reason}`, terminationResult);
+  const successfulWorkflowProjection = successfulWorkflowTerminationProjection(reason);
+  const terminalStatus: TerminalStatus = successfulWorkflowProjection ? 'succeeded' : 'cancelled';
   addRuntimeSecondsFromEntry(context, runningEntry);
-  await completeRunRecord(context, runningEntry, 'cancelled', reason, null, finalizationDetail);
-  await context.hooks.persistExecutionGraphStateTransition(runningEntry, 'cancelled', 'cancelled', reason, finalizationDetail);
+  await completeRunRecord(
+    context,
+    runningEntry,
+    terminalStatus,
+    reason,
+    null,
+    finalizationDetail,
+    successfulWorkflowProjection ?? undefined
+  );
+  await context.hooks.persistExecutionGraphStateTransition(
+    runningEntry,
+    successfulWorkflowProjection?.workflow_outcome ?? 'cancelled',
+    terminalStatus,
+    reason,
+    finalizationDetail
+  );
   rememberInactiveWorkerPid({
     state: context.state,
     runningEntry,
@@ -206,6 +271,9 @@ export async function terminateRunningIssue(
   rememberReleasedWorker({ state: context.state, runningEntry, reason, cleanupWorkspace: cleanup_workspace, nowMs: context.nowMs() });
   context.state.running.delete(issue_id);
   context.state.claimed.delete(issue_id);
+  if (successfulWorkflowProjection) {
+    context.state.completed.add(issue_id);
+  }
   context.logger?.log({
     level: 'info',
     event: CANONICAL_EVENT.orchestration.workerTerminated,
@@ -220,7 +288,8 @@ export async function terminateRunningIssue(
       termination_exit_observed: Boolean(runningEntry.termination.exit_observed_at_ms),
       ...workerTerminationResultContext(terminationResult),
       worker_termination_requested: true,
-      worker_process_identity_known: Boolean(runningEntry.codex_app_server_pid),
+      worker_process_identity_known: Boolean(runningEntry.worker_process_pid ?? runningEntry.codex_app_server_pid),
+      worker_process_pid: runningEntry.worker_process_pid ?? null,
       codex_app_server_pid: runningEntry.codex_app_server_pid,
       same_issue_process_cleanup_verified: false
     }
@@ -239,19 +308,36 @@ export async function completeRunRecord(
   terminal_status: TerminalStatus,
   error_code: string | null,
   recoveryOverride: MissingToolOutputRecoveryState | null = null,
-  terminalReasonDetail: string | null = null
+  terminalReasonDetail: string | null = null,
+  completionProjection?: CompletionProjection
 ): Promise<void> {
   if (!runningEntry.run_id || !context.persistence) {
     return;
   }
 
+  runningEntry.history_terminalizing = true;
+  await context.hooks.drainExecutionGraphPersistence(runningEntry);
   const rootCause = extractRootCauseDiagnostic(runningEntry, error_code);
+  const persistedLineage = persistedCompletionLineage(runningEntry, rootCause.thread_id, rootCause.turn_id);
+  if (!context.persistence.completeRunIncludesTerminalEvidence) {
+    await persistTicketTerminalOutcome(
+      context,
+      runningEntry,
+      terminal_status,
+      error_code,
+      terminalReasonDetail,
+      rootCause,
+      persistedLineage
+    );
+  }
   try {
     await context.persistence.completeRun({
       run_id: runningEntry.run_id,
       issue_run_id: runningEntry.issue_run_id,
       attempt_id: runningEntry.attempt_id,
       terminal_status,
+      process_status: completionProjection?.process_status,
+      workflow_outcome: completionProjection?.workflow_outcome,
       error_code,
       terminal_reason_code: error_code,
       terminal_reason_detail: terminalReasonDetail,
@@ -260,8 +346,8 @@ export async function completeRunRecord(
       root_cause_reason_detail: rootCause.reason_detail,
       root_cause_at: rootCause.at,
       session_id: rootCause.session_id ?? runningEntry.session_id,
-      thread_id: rootCause.thread_id ?? runningEntry.thread_id ?? runningEntry.persisted_thread_id ?? null,
-      turn_id: rootCause.turn_id ?? runningEntry.turn_id ?? null,
+      thread_id: persistedLineage.thread_id,
+      turn_id: persistedLineage.turn_id,
       missing_tool_output_recovery: buildDurableMissingToolOutputRecoveryContext(runningEntry, recoveryOverride)
     });
   } catch (error) {
@@ -278,7 +364,6 @@ export async function completeRunRecord(
     });
   }
 
-  await persistTicketTerminalOutcome(context, runningEntry, terminal_status, error_code, terminalReasonDetail, rootCause);
 }
 
 export async function persistTicketTerminalOutcome(
@@ -291,7 +376,8 @@ export async function persistTicketTerminalOutcome(
     at: string | null;
     thread_id: string | null;
     turn_id: string | null;
-  }
+  },
+  persistedLineage = persistedCompletionLineage(runningEntry, rootCause.thread_id, rootCause.turn_id)
 ): Promise<void> {
   if (!context.persistence?.appendTicketTerminalOutcome || !runningEntry.issue_run_id) {
     return;
@@ -301,8 +387,8 @@ export async function persistTicketTerminalOutcome(
     await context.persistence.appendTicketTerminalOutcome({
       issue_run_id: runningEntry.issue_run_id,
       attempt_id: runningEntry.attempt_id ?? null,
-      thread_id: rootCause.thread_id ?? runningEntry.thread_id ?? runningEntry.persisted_thread_id ?? null,
-      turn_id: rootCause.turn_id ?? runningEntry.turn_id ?? null,
+      thread_id: persistedLineage.thread_id,
+      turn_id: persistedLineage.turn_id,
       outcome: terminalStatus,
       reason_code: reasonCode,
       reason_detail: reasonDetail,

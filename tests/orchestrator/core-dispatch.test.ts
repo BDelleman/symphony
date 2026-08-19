@@ -423,8 +423,10 @@ describe('OrchestratorCore dispatch and backpressure', () => {
     const runningBeforeDrain = harness.orchestrator.getStateSnapshot().running.get(firstIssue.id);
     expect(runningBeforeDrain).toBeDefined();
 
-    ((harness.orchestrator as unknown as { state: OrchestratorState }).state.running.get(firstIssue.id) as any).codex_app_server_pid =
-      '4242';
+    const activeEntry = (harness.orchestrator as unknown as { state: OrchestratorState }).state.running.get(firstIssue.id) as any;
+    activeEntry.agent_runtime = 'claude-cli';
+    activeEntry.codex_app_server_pid = null;
+    activeEntry.worker_process_pid = '4242';
     (harness.orchestrator as any).enterDrainMode({ reason: 'safe runtime restart' });
 
     harness.tracker.fetch_candidate_issues.mockResolvedValue([startupIssue]);

@@ -159,6 +159,67 @@ describe('WorkspaceManager', () => {
     expect(await exists(path.join(workspace.path, '.elixir_ls'))).toBe(false);
   });
 
+  it('fails closed before hooks when a managed workspace contains credential material', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const runShell = vi.fn(async () => ({ timedOut: false }));
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { before_run: 'echo unsafe', timeout_ms: 1000 },
+      runShell
+    });
+    const workspace = await manager.ensureWorkspace('ABC-SENSITIVE');
+    await fs.writeFile(path.join(workspace.path, '.env.local'), 'TOKEN=must-not-leak\n', 'utf8');
+
+    await expect(manager.prepareAttempt(workspace.path)).rejects.toMatchObject({
+      code: 'workspace_sensitive_file_detected',
+      message: expect.stringContaining('"category":"dotenv"')
+    });
+    expect(runShell).not.toHaveBeenCalled();
+  });
+
+  it('rejects untracked dotenv templates and real dotenv files', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { timeout_ms: 1000 }
+    });
+    const workspace = await manager.ensureWorkspace('ABC-ENV-TEMPLATE');
+    await fs.writeFile(path.join(workspace.path, '.env.example'), 'TOKEN=replace-me\n', 'utf8');
+
+    await expect(manager.prepareAttempt(workspace.path)).rejects.toMatchObject({
+      code: 'workspace_sensitive_file_detected',
+      message: expect.stringContaining('"category":"dotenv"')
+    });
+
+    await fs.rm(path.join(workspace.path, '.env.example'));
+    await fs.writeFile(path.join(workspace.path, '.env'), 'TOKEN=must-not-leak\n', 'utf8');
+    await expect(manager.prepareAttempt(workspace.path)).rejects.toMatchObject({
+      code: 'workspace_sensitive_file_detected',
+      message: expect.stringContaining('"category":"dotenv"')
+    });
+  });
+
+  it('fails closed when a trusted before-run hook creates credential material', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { before_run: 'prepare', timeout_ms: 1000 },
+      runShell: async ({ cwd }) => {
+        await fs.writeFile(path.join(cwd, '.npmrc'), '//registry.npmjs.org/:_authToken=must-not-leak\n', 'utf8');
+        return { timedOut: false };
+      }
+    });
+    const workspace = await manager.ensureWorkspace('ABC-HOOK-SENSITIVE');
+
+    await expect(manager.prepareAttempt(workspace.path)).rejects.toMatchObject({
+      code: 'workspace_sensitive_file_detected',
+      message: expect.stringContaining('"category":"package_manager_auth"')
+    });
+  });
+
   it('preflight removes staged ignored artifacts and sentinel-only MM drift', async () => {
     const root = await makeTempRoot();
     cleanupPaths.push(root);

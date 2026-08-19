@@ -201,8 +201,11 @@ describe('WorkspaceProvisioner', () => {
     const workspacePath = path.join(workspaceRoot, 'ABC-1');
     await fs.mkdir(path.join(repoRoot, '.git'));
     const runGit = vi.fn(async ({ args }: { args: string[] }) => {
+      if (args[0] === 'config' && args[1] === '--get') {
+        return { ok: true, stdout: 'ssh://git@github.com/example/repo.git\n', stderr: '' };
+      }
       if (args[0] === 'clone') {
-        const cloneWorkspacePath = args[5];
+        const cloneWorkspacePath = args[6];
         await fs.mkdir(path.join(cloneWorkspacePath, '.git'), { recursive: true });
       }
       return { ok: true, stdout: '', stderr: '' };
@@ -211,6 +214,7 @@ describe('WorkspaceProvisioner', () => {
     const provisioner = new CloneProvisioner({
       repoRoot,
       baseRef: 'origin/main',
+      branchTemplate: 'feature/{{ issue.identifier }}',
       teardownMode: 'keep',
       runGit,
       fsOps: {
@@ -225,8 +229,25 @@ describe('WorkspaceProvisioner', () => {
     expect(result.status).toBe('provisioned');
     expect(runGit).toHaveBeenCalledWith({
       cwd: process.cwd(),
-      args: ['clone', '--branch', 'origin/main', '--single-branch', repoRoot, workspacePath]
+      args: [
+        'clone',
+        '--no-hardlinks',
+        '--branch',
+        'main',
+        '--single-branch',
+        'ssh://git@github.com/example/repo.git',
+        workspacePath
+      ]
     });
+    expect(runGit).toHaveBeenCalledWith({
+      cwd: workspacePath,
+      args: ['remote', 'set-url', 'origin', 'ssh://git@github.com/example/repo.git']
+    });
+    expect(runGit).toHaveBeenCalledWith({
+      cwd: workspacePath,
+      args: ['checkout', '-b', 'feature/ABC-1']
+    });
+    expect(result.branch_name).toBe('feature/ABC-1');
 
     await expect(
       provisioner.teardown({
@@ -237,6 +258,36 @@ describe('WorkspaceProvisioner', () => {
       status: 'kept',
       provisioner_type: 'clone'
     });
+
+    await fs.rm(repoRoot, { recursive: true, force: true });
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it('clone provisioner rejects credential-bearing HTTPS origins before cloning', async () => {
+    const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-provisioner-clone-credential-repo-'));
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-provisioner-clone-credential-ws-'));
+    const workspacePath = path.join(workspaceRoot, 'ABC-SECRET');
+    await fs.mkdir(path.join(repoRoot, '.git'));
+    const runGit = vi.fn(async ({ args }: { args: string[] }) => {
+      if (args[0] === 'config' && args[1] === '--get') {
+        return { ok: true, stdout: 'https://token@example.test/org/repo.git\n', stderr: '' };
+      }
+      return { ok: true, stdout: '', stderr: '' };
+    });
+    const provisioner = new CloneProvisioner({
+      repoRoot,
+      baseRef: 'origin/main',
+      branchTemplate: 'feature/{{ issue.identifier }}',
+      teardownMode: 'keep',
+      runGit,
+      fsOps: { rm: fs.rm }
+    });
+
+    await expect(provisioner.provision({ identifier: 'ABC-SECRET', workspacePath })).rejects.toMatchObject({
+      code: 'workspace_provision_failed',
+      message: 'workspace_remote_contains_credentials'
+    });
+    expect(runGit).toHaveBeenCalledTimes(1);
 
     await fs.rm(repoRoot, { recursive: true, force: true });
     await fs.rm(workspaceRoot, { recursive: true, force: true });

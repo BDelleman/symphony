@@ -1,6 +1,6 @@
 import { DYNAMIC_TOOL_CONSOLE_RECOVERY_ACTION, UNSUPPORTED_DYNAMIC_TOOL_CONSOLE_RESUME_REASON_CODE } from './dynamic-tool-capability';
 
-export const REASON_CODE_REGISTRY_VERSION = '2026-05-11.v1';
+export const REASON_CODE_REGISTRY_VERSION = '2026-08-18.v1';
 
 export type ReasonCodeClassification =
   | 'healthy'
@@ -90,6 +90,10 @@ export const REASON_CODES = {
   codexProtocolDeprecationNotice: 'codex_protocol_deprecation_notice',
   codexProtocolConfigWarning: 'codex_protocol_config_warning',
   codexModelRerouted: 'codex_model_rerouted',
+  claudeModelObserved: 'claude_model_observed',
+  claudePermissionDenied: 'claude_permission_denied',
+  symphonyPhaseMarker: 'symphony_phase_marker',
+  recoveredAfterRestart: 'recovered_after_restart',
   projectHistorySchemaHealthUnavailable: 'project_history_schema_health_unavailable',
   projectHistoryTrackerSnapshotMissing: 'project_history_tracker_snapshot_missing',
   projectHistoryTerminalOutcomeMissing: 'project_history_terminal_outcome_missing',
@@ -158,6 +162,26 @@ export const CANONICAL_REASON_CODE_REGISTRY = {
     headline: 'Run stopped at handoff',
     detail: 'The worker completed normally and stopped because the refreshed issue state is configured as a handoff point.',
     expected_transition: 'Separate handoff automation may dispatch the next workflow'
+  },
+  [REASON_CODES.recoveredAfterRestart]: {
+    reason_code: REASON_CODES.recoveredAfterRestart,
+    classification: 'healthy',
+    actionability: 'none',
+    recommended_actions: [],
+    label: 'Recovered After Restart',
+    headline: 'Orphaned history graph recovered',
+    detail: 'Startup reconciliation closed execution records whose parent run had a provable terminal outcome.',
+    expected_transition: 'No automatic transition; the repaired history graph remains terminal'
+  },
+  [REASON_CODES.symphonyPhaseMarker]: {
+    reason_code: REASON_CODES.symphonyPhaseMarker,
+    classification: 'healthy',
+    actionability: 'none',
+    recommended_actions: [],
+    label: 'Symphony Phase Marker',
+    headline: 'Workflow phase observed',
+    detail: 'Symphony projected a provider-neutral workflow phase from supervised runner activity.',
+    expected_transition: 'The phase advances when the next supervised runner activity is observed'
   },
   [REASON_CODES.handoffRelease]: {
     reason_code: REASON_CODES.handoffRelease,
@@ -797,6 +821,26 @@ export const CANONICAL_REASON_CODE_REGISTRY = {
     headline: 'Codex selected a different effective model',
     detail: 'The Codex app-server reported a model reroute and the runner preserved requested and effective model evidence.',
     expected_transition: 'Run continues with effective model evidence available for diagnostics'
+  },
+  [REASON_CODES.claudeModelObserved]: {
+    reason_code: REASON_CODES.claudeModelObserved,
+    classification: 'healthy',
+    actionability: 'recommended',
+    recommended_actions: ['Confirm the observed Claude model is acceptable for the configured runtime policy'],
+    label: 'Claude Model Observed',
+    headline: 'Claude reported an additional effective model',
+    detail: 'Terminal provider usage reported positive usage for a Claude model other than the primary effective model.',
+    expected_transition: 'The invocation remains terminal while model rerouting is visible in provider telemetry'
+  },
+  [REASON_CODES.claudePermissionDenied]: {
+    reason_code: REASON_CODES.claudePermissionDenied,
+    classification: 'failed',
+    actionability: 'required',
+    recommended_actions: ['Inspect the Claude sandbox policy and requested operation before retrying'],
+    label: 'Claude Permission Denied',
+    headline: 'Claude reported a denied operation',
+    detail: 'The Claude runtime permission layer denied an operation during unattended execution.',
+    expected_transition: null
   },
   [REASON_CODES.projectHistorySchemaHealthUnavailable]: {
     reason_code: REASON_CODES.projectHistorySchemaHealthUnavailable,

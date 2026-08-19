@@ -51,17 +51,25 @@ export interface IssueRunRecord extends ExecutionGraphTimestampFields {
   issue_id: string;
   issue_identifier: string;
   identity?: DurableIdentity | null;
+  process_status?: RunTerminalStatus | null;
+  workflow_outcome?: string | null;
 }
 
 export interface AttemptRecord extends ExecutionGraphTimestampFields {
   attempt_id: string;
   issue_run_id: string;
   attempt_number: number;
+  process_status?: RunTerminalStatus | null;
+  workflow_outcome?: string | null;
 }
 
 export interface ThreadRecord extends ExecutionGraphTimestampFields {
   thread_id: string;
   attempt_id: string;
+  session_id?: string | null;
+  agent_runtime?: string | null;
+  worker_instance_id?: string | null;
+  worker_process_pid?: number | null;
 }
 
 export interface TurnRecord extends ExecutionGraphTimestampFields {
@@ -310,7 +318,13 @@ export interface BlockedInputEventRecord {
   last_observed_at: string;
 }
 
-export type TokenModelTelemetryConfidence = 'observed_live' | 'backfilled' | 'missing';
+export type TokenModelTelemetryConfidence =
+  | 'observed_live'
+  | 'backfilled'
+  | 'provider_step'
+  | 'provider_result'
+  | 'legacy_partial'
+  | 'missing';
 
 export interface TokenModelFactRecord {
   token_model_fact_id: string;
@@ -330,8 +344,80 @@ export interface TokenModelFactRecord {
   runtime_provider?: string | null;
   provider_turn_count?: number | null;
   estimated_cost_usd?: number | null;
+  cache_creation_input_tokens?: number | null;
+  provider_usage_status?: string | null;
+  provider_usage_source?: string | null;
+  api_retry_count?: number | null;
+  api_error_status?: string | null;
+  terminal_reason?: string | null;
+  stop_reason?: string | null;
+  duration_ms?: number | null;
+  duration_api_ms?: number | null;
+  time_to_first_token_ms?: number | null;
+  permission_denial_count?: number | null;
+  unknown_event_count?: number | null;
+  auxiliary_result_count?: number | null;
+  effective_models?: string[] | null;
+  tool_counts?: Record<string, number> | null;
+  mcp_counts?: Record<string, number> | null;
+  missing_reason?: string | null;
+  reconciliation_delta?: Record<string, number> | null;
+  model_usage?: Array<Record<string, unknown>> | null;
+  nested_session_detected?: number | boolean | null;
+  supervised_session_coverage?: string | null;
   telemetry_confidence: TokenModelTelemetryConfidence;
   observed_at: string;
+}
+
+export type TokenModelFactDatabaseRecord = Omit<
+  TokenModelFactRecord,
+  'effective_models' | 'tool_counts' | 'mcp_counts' | 'reconciliation_delta' | 'model_usage'
+> & {
+  effective_models?: string | null;
+  tool_counts?: string | null;
+  mcp_counts?: string | null;
+  reconciliation_delta?: string | null;
+  model_usage?: string | null;
+};
+
+function parseOptionalFactJson(value: string | null | undefined): unknown {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+export function hydrateTokenModelFact(row: TokenModelFactDatabaseRecord): TokenModelFactRecord {
+  const effectiveModels = parseOptionalFactJson(row.effective_models);
+  const toolCounts = parseOptionalFactJson(row.tool_counts);
+  const mcpCounts = parseOptionalFactJson(row.mcp_counts);
+  const reconciliationDelta = parseOptionalFactJson(row.reconciliation_delta);
+  const modelUsage = parseOptionalFactJson(row.model_usage);
+  return {
+    ...row,
+    nested_session_detected:
+      row.nested_session_detected === null || row.nested_session_detected === undefined
+        ? null
+        : row.nested_session_detected === true || row.nested_session_detected === 1,
+    effective_models: Array.isArray(effectiveModels)
+      ? effectiveModels.filter((value): value is string => typeof value === 'string')
+      : null,
+    tool_counts: toolCounts && typeof toolCounts === 'object' && !Array.isArray(toolCounts)
+      ? (toolCounts as Record<string, number>)
+      : null,
+    mcp_counts: mcpCounts && typeof mcpCounts === 'object' && !Array.isArray(mcpCounts)
+      ? (mcpCounts as Record<string, number>)
+      : null,
+    reconciliation_delta:
+      reconciliationDelta && typeof reconciliationDelta === 'object' && !Array.isArray(reconciliationDelta)
+        ? (reconciliationDelta as Record<string, number>)
+        : null,
+    model_usage: Array.isArray(modelUsage)
+      ? modelUsage.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value))
+      : null
+  };
 }
 
 export interface ExecutionGraphThreadLineage {
@@ -494,6 +580,8 @@ export interface DurableRunHistoryRecord {
   ended_at: string | null;
   completed_at: string | null;
   terminal_status: RunTerminalStatus | null;
+  process_status?: RunTerminalStatus | null;
+  workflow_outcome?: string | null;
   error_code: string | null;
   terminal_reason_code: string | null;
   terminal_reason_detail: string | null;
@@ -508,6 +596,23 @@ export interface DurableRunHistoryRecord {
   app_server_events?: AppServerEventLedgerExcerpt[];
   missing_tool_output_recovery?: Record<string, unknown> | null;
   token_model_facts?: TokenModelFactRecord[];
+}
+
+export interface CompletedProviderUsageTotal {
+  runtime_provider: 'claude-cli';
+  effective_model: string | null;
+  invocation_count: number;
+  final_invocation_count: number;
+  partial_invocation_count: number;
+  unobserved_invocation_count: number;
+  missing_invocation_count: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+  provider_turn_count: number | null;
+  estimated_cost_usd: number | null;
+  updated_at: string | null;
 }
 
 export interface HistoryIdentityProjectionRecord {

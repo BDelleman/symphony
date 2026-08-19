@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -43,7 +44,19 @@ import {
   type PortableSkillId,
   type PortableSkillPrerequisiteKind
 } from '../workflow/portable-skill-catalog';
-import { CLAUDE_SUPPORTED_VERSION } from '../agent';
+import {
+  CLAUDE_SUPPORTED_VERSION,
+  ClaudeCliRunner,
+  inspectClaudeUserMcpConfiguration,
+  resolveTrustedExecutable
+} from '../agent';
+import { auditSensitiveWorkspaceFiles, type SensitiveWorkspaceFileViolation } from '../workspace';
+import {
+  classifyPersistedWorkerOwnership,
+  findLatestTerminalRunEventEvidence,
+  SqlitePersistenceStore
+} from '../persistence';
+import { REASON_CODES } from '../observability';
 
 const CLAUDE_NON_SUBSCRIPTION_ENV_NAMES = [
   'ANTHROPIC_API_KEY',
@@ -97,7 +110,13 @@ export type DoctorFindingSafeFixMutationScope = 'project_file' | 'user_local_sta
 export interface DoctorFindingSafeFixMutation {
   scope: DoctorFindingSafeFixMutationScope;
   path: string;
-  operation: 'append_gitignore_entry' | 'record_setup_consent' | 'refresh_local_shim' | 'chmod_env_file';
+  operation:
+    | 'append_gitignore_entry'
+    | 'record_setup_consent'
+    | 'refresh_local_shim'
+    | 'chmod_env_file'
+    | 'quarantine_sensitive_file'
+    | 'repair_history_orphans';
 }
 
 export interface DoctorFindingSafeFix {
@@ -226,6 +245,8 @@ interface DoctorArgs {
   ci: boolean;
   fix: boolean;
   yes: boolean;
+  claudeSmoke: boolean;
+  linearIssue: string | null;
   resolverArgv: string[];
 }
 
@@ -272,7 +293,9 @@ export function summarizePortableSkillCatalogForDoctor(): DoctorPortableSkillCat
   };
 }
 
-const DOCTOR_FLAGS = new Set(['--json', '--ci', '--fix', '--yes', '--accept-high-trust-local-run']);
+const DOCTOR_FLAGS = new Set([
+  '--json', '--ci', '--fix', '--yes', '--accept-high-trust-local-run', '--claude-smoke', '--linear-issue'
+]);
 
 function disabledSafeFix(): DoctorFindingSafeFix {
   return { available: false, fixId: null, command: null, requiresYes: false, mutates: [] };
@@ -284,8 +307,11 @@ function parseDoctorArgs(argv: readonly string[]): DoctorArgs | { error: string 
   let ci = false;
   let fix = false;
   let yes = false;
+  let claudeSmoke = false;
+  let linearIssue: string | null = null;
 
-  for (const arg of argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!;
     if (arg === '--json') {
       json = true;
       continue;
@@ -302,6 +328,17 @@ function parseDoctorArgs(argv: readonly string[]): DoctorArgs | { error: string 
       yes = true;
       continue;
     }
+    if (arg === '--claude-smoke') {
+      claudeSmoke = true;
+      continue;
+    }
+    if (arg === '--linear-issue') {
+      const value = argv[index + 1]?.trim();
+      if (!value || value.startsWith('--')) return { error: '--linear-issue requires an issue identifier' };
+      linearIssue = value;
+      index += 1;
+      continue;
+    }
     if (arg.startsWith('--doctor-')) {
       return { error: `Unsupported doctor option: ${arg}` };
     }
@@ -311,7 +348,12 @@ function parseDoctorArgs(argv: readonly string[]): DoctorArgs | { error: string 
     resolverArgv.push(arg);
   }
 
-  return { json, ci, fix, yes, resolverArgv };
+  if (claudeSmoke && !linearIssue) return { error: '--claude-smoke requires --linear-issue <id>' };
+  if (claudeSmoke && ci) return { error: '--claude-smoke cannot run with --ci because the smoke is explicitly mutating' };
+  if (linearIssue && !/^[A-Za-z][A-Za-z0-9_-]{0,31}-\d{1,12}$/.test(linearIssue)) {
+    return { error: '--linear-issue must be a bounded tracker identifier such as NIE-303' };
+  }
+  return { json, ci, fix, yes, claudeSmoke, linearIssue, resolverArgv };
 }
 
 function findExecutableOnPath(env: NodeJS.ProcessEnv): string | null {
@@ -360,7 +402,7 @@ function severityForStatus(status: DoctorCheckStatus): DoctorFindingSeverity {
 
 function safeFixForFinding(
   check: Pick<DoctorFindingInput, 'id' | 'status'>,
-  context: { projectRoot?: string; setupConsentStorePath?: string } = {}
+  context: { projectRoot?: string; setupConsentStorePath?: string; persistencePath?: string } = {}
 ): DoctorFindingSafeFix {
   if (check.id.startsWith('executable.') || check.id.startsWith('shim_checkout.')) {
     return {
@@ -418,6 +460,40 @@ function safeFixForFinding(
           scope: 'project_file',
           path: context.projectRoot ? path.join(context.projectRoot, '.env') : '.env',
           operation: 'chmod_env_file'
+        }
+      ]
+    };
+  }
+  if (check.id === 'workspace.sensitive_files') {
+    return {
+      available: check.status !== 'ok',
+      fixId: 'workspace-sensitive-files',
+      command: 'symphony doctor --fix --yes',
+      requiresYes: true,
+      mutates: [
+        {
+          scope: 'project_file',
+          path: context.projectRoot
+            ? sensitiveQuarantineBase(context.projectRoot)
+            : '.symphony-quarantine',
+          operation: 'quarantine_sensitive_file'
+        }
+      ]
+    };
+  }
+  if (check.id === 'history.execution_graph_reconciliation') {
+    return {
+      available: check.status !== 'ok',
+      fixId: 'history-execution-graph-reconciliation',
+      command: 'symphony doctor --fix --yes',
+      requiresYes: true,
+      mutates: [
+        {
+          scope: 'project_file',
+          path: context.persistencePath ?? (context.projectRoot
+            ? path.join(context.projectRoot, '.symphony', 'system', 'runtime.sqlite')
+            : '.symphony/system/runtime.sqlite'),
+          operation: 'repair_history_orphans'
         }
       ]
     };
@@ -573,7 +649,6 @@ function addCustomizationChecks(
       runtimeLoadingBehavior: 'observable_only'
     }
   });
-
   for (const reference of metadata?.references ?? []) {
     const fullPath = resolveProjectReference(resolved.currentProjectRoot, reference.path);
     const exists = fullPath ? fs.existsSync(fullPath) : false;
@@ -1084,6 +1159,7 @@ function normalizeFixAction(fix: DoctorFixActionInput): DoctorFixAction {
     ],
     'layout.gitignore-system': ['layout.gitignore_system'],
     'env-permissions': ['env.permissions'],
+    'workspace-sensitive-files': ['workspace.sensitive_files'],
     'setup-consent': ['setup.consent']
   };
   return {
@@ -1544,7 +1620,8 @@ function checkBaseRef(repoRoot: string, baseRef: string): DoctorFindingInput {
 }
 
 function checkCloneBaseRef(repoRoot: string, baseRef: string): DoctorFindingInput {
-  const branchRef = `refs/heads/${baseRef}`;
+  const cloneRef = baseRef.replace(/^origin\//, '');
+  const branchRef = `refs/heads/${cloneRef}`;
   const branch = runGit(repoRoot, ['rev-parse', '--verify', '--quiet', `${branchRef}^{commit}`]);
   if (branch.ok) {
     return {
@@ -1557,7 +1634,7 @@ function checkCloneBaseRef(repoRoot: string, baseRef: string): DoctorFindingInpu
     };
   }
 
-  const tagRef = `refs/tags/${baseRef}`;
+  const tagRef = `refs/tags/${cloneRef}`;
   const tag = runGit(repoRoot, ['rev-parse', '--verify', '--quiet', `${tagRef}^{commit}`]);
   if (tag.ok) {
     return {
@@ -1692,6 +1769,446 @@ function addWorkspaceChecks(checks: DoctorFinding[], resolved: LocalCommandResol
   });
 }
 
+function publicSensitiveViolations(violations: SensitiveWorkspaceFileViolation[]): Array<{
+  path: string;
+  category: string;
+  mode: string;
+}> {
+  return violations.map(({ path: violationPath, category, mode }) => ({ path: violationPath, category, mode }));
+}
+
+type SensitiveQuarantineRecovery = {
+  incomplete: string[];
+  recovered: string[];
+  failures: string[];
+};
+
+function sensitiveQuarantineBase(projectRoot: string): string {
+  const projectKey = crypto.createHash('sha256').update(path.resolve(projectRoot)).digest('hex').slice(0, 16);
+  return path.join(path.dirname(path.resolve(projectRoot)), '.symphony-quarantine', projectKey, 'worktree-sensitive');
+}
+
+function reconcileSensitiveQuarantineJournals(params: {
+  projectRoot: string;
+  workspaceRoot: string;
+  apply: boolean;
+}): SensitiveQuarantineRecovery {
+  const quarantineBase = sensitiveQuarantineBase(params.projectRoot);
+  const result: SensitiveQuarantineRecovery = { incomplete: [], recovered: [], failures: [] };
+  if (!fs.existsSync(quarantineBase)) return result;
+  for (const directory of fs.readdirSync(quarantineBase, { withFileTypes: true })) {
+    if (!directory.isDirectory()) continue;
+    const journalPath = path.join(quarantineBase, directory.name, 'manifest.json');
+    if (!fs.existsSync(journalPath)) continue;
+    let journal: any;
+    try {
+      journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    } catch {
+      result.failures.push(path.relative(quarantineBase, journalPath));
+      continue;
+    }
+    if (journal.state === 'complete' || journal.state === 'rolled_back' || journal.state === REASON_CODES.recoveredAfterRestart) {
+      continue;
+    }
+    result.incomplete.push(path.relative(quarantineBase, journalPath));
+    if (!params.apply || !Array.isArray(journal.entries)) continue;
+    let failed = false;
+    for (const entry of [...journal.entries].reverse()) {
+      const source = typeof entry.source === 'string' ? path.resolve(entry.source) : '';
+      const destination = typeof entry.destination === 'string' ? path.resolve(entry.destination) : '';
+      const journalRoot = path.dirname(journalPath);
+      if (!source || !destination || !isWithinPath(params.workspaceRoot, source) || !isWithinPath(journalRoot, destination)) {
+        entry.status = 'recovery_refused';
+        failed = true;
+        continue;
+      }
+      const sourceExists = fs.existsSync(source);
+      const destinationExists = fs.existsSync(destination);
+      if (sourceExists && !destinationExists) {
+        entry.status = 'restored';
+      } else if (!sourceExists && destinationExists) {
+        try {
+          fs.mkdirSync(path.dirname(source), { recursive: true, mode: 0o700 });
+          fs.renameSync(destination, source);
+          entry.status = 'restored';
+        } catch {
+          entry.status = 'recovery_failed';
+          failed = true;
+        }
+      } else if (!sourceExists && !destinationExists) {
+        entry.status = 'recovery_missing_both';
+        failed = true;
+      } else {
+        entry.status = 'recovery_ambiguous_both_exist';
+        failed = true;
+      }
+    }
+    journal.state = failed ? 'partial_failure' : REASON_CODES.recoveredAfterRestart;
+    const temporary = `${journalPath}.recovery.tmp`;
+    const descriptor = fs.openSync(temporary, 'w', 0o600);
+    try {
+      fs.writeFileSync(descriptor, `${JSON.stringify(journal, null, 2)}\n`, 'utf8');
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    fs.renameSync(temporary, journalPath);
+    if (failed) result.failures.push(path.relative(params.projectRoot, journalPath));
+    else result.recovered.push(path.relative(params.projectRoot, journalPath));
+  }
+  return result;
+}
+
+function addManagedWorkspaceSensitiveFileCheck(params: {
+  checks: DoctorFinding[];
+  fixes: DoctorFixAction[];
+  effectiveConfig: EffectiveConfig;
+  projectRoot: string;
+  fix: boolean;
+  yes: boolean;
+  ci: boolean;
+  now: Date;
+}): void {
+  const workspaceRoot = path.resolve(params.effectiveConfig.workspace.root);
+  const journalRecovery = reconcileSensitiveQuarantineJournals({
+    projectRoot: params.projectRoot,
+    workspaceRoot,
+    apply: params.fix && params.yes && !params.ci
+  });
+  let audit = auditSensitiveWorkspaceFiles(workspaceRoot);
+
+  if (params.fix && audit.complete && audit.violations.length > 0) {
+    if (params.ci) {
+      addFix(params.fixes, {
+        id: 'workspace-sensitive-files',
+        status: 'skipped',
+        summary: 'Sensitive worktree files were not quarantined because `--ci` forbids doctor fix mutations.'
+      });
+    } else if (!params.yes) {
+      addFix(params.fixes, {
+        id: 'workspace-sensitive-files',
+        status: 'skipped',
+        summary: 'Sensitive worktree files were not quarantined because `--yes` was not provided.'
+      });
+    } else {
+      const stamp = params.now.toISOString().replace(/[:.]/g, '-');
+      const quarantineRoot = path.join(sensitiveQuarantineBase(params.projectRoot), stamp);
+      if (isWithinPath(workspaceRoot, quarantineRoot)) {
+        addFix(params.fixes, {
+          id: 'workspace-sensitive-files',
+          status: 'failed',
+          summary: 'Refused to quarantine sensitive files inside the managed workspace root.'
+        });
+      } else {
+        const moved: Array<{ path: string; category: string; mode: string }> = [];
+        let failure: string | null = null;
+        const journal = {
+          quarantined_at: params.now.toISOString(),
+          state: 'planned',
+          entries: audit.violations.map((violation) => ({
+            path: violation.path,
+            category: violation.category,
+            mode: violation.mode,
+            source: violation.absolutePath,
+            destination: path.join(quarantineRoot, violation.path),
+            status: 'pending'
+          }))
+        };
+        const manifestPath = path.join(quarantineRoot, 'manifest.json');
+        const persistJournal = () => {
+          fs.mkdirSync(quarantineRoot, { recursive: true, mode: 0o700 });
+          const temporary = `${manifestPath}.tmp`;
+          const descriptor = fs.openSync(temporary, 'w', 0o600);
+          try {
+            fs.writeFileSync(descriptor, `${JSON.stringify(journal, null, 2)}\n`, 'utf8');
+            fs.fsyncSync(descriptor);
+          } finally {
+            fs.closeSync(descriptor);
+          }
+          fs.renameSync(temporary, manifestPath);
+        };
+        try {
+          persistJournal();
+          for (const [index, violation] of audit.violations.entries()) {
+            const destination = journal.entries[index]!.destination;
+            fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+            fs.renameSync(violation.absolutePath, destination);
+            moved.push({ path: violation.path, category: violation.category, mode: violation.mode });
+            journal.entries[index]!.status = 'moved';
+            journal.state = 'moving';
+            persistJournal();
+          }
+          journal.state = 'complete';
+          persistJournal();
+        } catch (error) {
+          failure = error instanceof Error ? error.message : String(error);
+          journal.state = 'rollback';
+          for (const entry of [...journal.entries].reverse()) {
+            if (entry.status !== 'moved') continue;
+            try {
+              fs.mkdirSync(path.dirname(entry.source), { recursive: true, mode: 0o700 });
+              fs.renameSync(entry.destination, entry.source);
+              entry.status = 'restored';
+            } catch {
+              entry.status = 'rollback_failed';
+            }
+          }
+          journal.state = journal.entries.some((entry) => entry.status === 'rollback_failed')
+            ? 'partial_failure'
+            : 'rolled_back';
+          try {
+            persistJournal();
+          } catch {
+            // The pre-mutation journal remains the recovery source when the update itself fails.
+          }
+        }
+        addFix(params.fixes, {
+          id: 'workspace-sensitive-files',
+          status: failure ? 'failed' : 'applied',
+          summary: failure
+            ? `Sensitive worktree quarantine stopped after ${moved.length} move(s): ${failure}`
+            : `Moved ${moved.length} sensitive worktree path(s) into recoverable quarantine.`,
+          details: { entries: moved, quarantine: path.relative(sensitiveQuarantineBase(params.projectRoot), quarantineRoot) }
+        });
+        audit = auditSensitiveWorkspaceFiles(workspaceRoot);
+      }
+    }
+  }
+
+  const unresolvedJournalCount = journalRecovery.incomplete.length - journalRecovery.recovered.length;
+  const ready = audit.complete && audit.violations.length === 0 && unresolvedJournalCount === 0 && journalRecovery.failures.length === 0;
+  addCheck(params.checks, {
+    id: 'workspace.sensitive_files',
+    title: 'Managed worktrees contain no credential files',
+    status: ready ? 'ok' : 'failure',
+    reason: !audit.complete
+      ? 'workspace_sensitive_file_audit_incomplete'
+      : journalRecovery.failures.length > 0 || unresolvedJournalCount > 0
+        ? 'workspace_sensitive_file_quarantine_recovery_required'
+      : audit.violations.length > 0
+        ? 'workspace_sensitive_files_detected'
+        : 'workspace_sensitive_files_absent',
+    summary: !audit.complete
+      ? `Managed worktree audit was incomplete after ${audit.scannedEntries} entries.`
+      : journalRecovery.failures.length > 0 || unresolvedJournalCount > 0
+        ? `Detected ${unresolvedJournalCount} incomplete sensitive-file quarantine journal(s).`
+      : audit.violations.length > 0
+        ? `Detected ${audit.violations.length} sensitive path(s) in managed worktrees.`
+        : `Managed worktree audit completed without sensitive paths (${audit.scannedEntries} entries).`,
+    remediation: ready ? undefined : 'Remove the reported files or run `symphony doctor --fix --yes` to quarantine them recoverably.',
+    safeFix: safeFixForFinding(
+      { id: 'workspace.sensitive_files', status: ready ? 'ok' : 'failure' },
+      { projectRoot: params.projectRoot }
+    ),
+    details: {
+      workspaceRoot,
+      scannedEntries: audit.scannedEntries,
+      complete: audit.complete,
+      violations: publicSensitiveViolations(audit.violations),
+      error: audit.error,
+      journalRecovery
+    }
+  });
+}
+
+interface HistoryReconciliationAudit {
+  databaseExists: boolean;
+  active: number;
+  repairable: number;
+  ambiguous: number;
+  error: string | null;
+}
+
+function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit {
+  if (!fs.existsSync(dbPath)) {
+    return { databaseExists: false, active: 0, repairable: 0, ambiguous: 0, error: null };
+  }
+  let db: {
+    prepare: (sql: string) => { get: (...params: unknown[]) => unknown; all: (...params: unknown[]) => unknown[] };
+    close: () => void;
+  } | null = null;
+  try {
+    const sqlite = require('node:sqlite') as {
+      DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => typeof db;
+    };
+    db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+    const issueRunTable = db!.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'issue_run'").get();
+    if (!issueRunTable) return { databaseExists: true, active: 0, repairable: 0, ambiguous: 0, error: null };
+    const rows = db!.prepare(
+      `SELECT issue_run.issue_run_id, issue_run.issue_id, issue_run.started_at,
+        runs.completed_at, runs.terminal_status
+       FROM issue_run
+       LEFT JOIN runs ON runs.run_id = (
+         SELECT projected_run.run_id
+         FROM history_identity_projection
+         JOIN runs AS projected_run ON projected_run.run_id = history_identity_projection.source_id
+         WHERE history_identity_projection.source_table = 'runs'
+           AND history_identity_projection.issue_run_id = issue_run.issue_run_id
+         ORDER BY projected_run.started_at DESC, projected_run.run_id DESC
+         LIMIT 1
+       )
+       WHERE issue_run.ended_at IS NULL`
+    ).all() as Array<{
+      issue_run_id: string;
+      issue_id: string;
+      started_at: string;
+      completed_at: string | null;
+      terminal_status: string | null;
+    }>;
+    const threadColumns = new Set(
+      (db!.prepare('PRAGMA table_info(thread)').all() as Array<{ name: string }>).map((column) => column.name)
+    );
+    const workerInstanceProjection = threadColumns.has('worker_instance_id')
+      ? 'thread.worker_instance_id'
+      : 'NULL AS worker_instance_id';
+    const workerPidProjection = threadColumns.has('worker_process_pid')
+      ? 'thread.worker_process_pid'
+      : 'NULL AS worker_process_pid';
+    let repairable = 0;
+    let ambiguous = 0;
+    for (const row of rows) {
+      let terminalEvidence = Boolean(row.completed_at && row.terminal_status);
+      if (!row.completed_at || !row.terminal_status) {
+        const terminalEvent = findLatestTerminalRunEventEvidence(db!, row.issue_run_id, row.issue_id, row.started_at);
+        terminalEvidence = terminalEvent !== null;
+        if (!terminalEvidence) {
+          const supersedingRun = db!.prepare(
+            `SELECT issue_run_id
+             FROM issue_run
+             WHERE issue_id = ?
+               AND issue_run_id <> ?
+               AND started_at > ?
+               AND ended_at IS NOT NULL
+               AND status <> 'running'
+             ORDER BY started_at ASC
+             LIMIT 1`
+          ).get(row.issue_id, row.issue_run_id, row.started_at);
+          terminalEvidence = Boolean(supersedingRun);
+        }
+      }
+      const owners = db!.prepare(
+        `SELECT ${workerInstanceProjection}, ${workerPidProjection}
+         FROM thread
+         JOIN attempt ON attempt.attempt_id = thread.attempt_id
+         WHERE attempt.issue_run_id = ? AND thread.ended_at IS NULL`
+      ).all(row.issue_run_id) as Array<{ worker_instance_id: string | null; worker_process_pid: number | null }>;
+      const workerOwnership = classifyPersistedWorkerOwnership(owners);
+      if (workerOwnership === 'active_or_unknown' || (!terminalEvidence && workerOwnership !== 'inactive')) {
+        ambiguous += 1;
+      } else {
+        repairable += 1;
+      }
+    }
+    return { databaseExists: true, active: rows.length, repairable, ambiguous, error: null };
+  } catch (error) {
+    return {
+      databaseExists: true,
+      active: 0,
+      repairable: 0,
+      ambiguous: 0,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    db?.close();
+  }
+}
+
+function addHistoryReconciliationCheck(params: {
+  checks: DoctorFinding[];
+  fixes: DoctorFixAction[];
+  effectiveConfig: EffectiveConfig;
+  projectRoot: string;
+  fix: boolean;
+  yes: boolean;
+  ci: boolean;
+}): void {
+  if (!params.effectiveConfig.persistence.enabled) {
+    addCheck(params.checks, {
+      id: 'history.execution_graph_reconciliation',
+      title: 'Execution graph history is reconciled',
+      status: 'ok',
+      reason: 'history_persistence_disabled',
+      summary: 'Persistent execution history is disabled.',
+      details: { enabled: false }
+    });
+    return;
+  }
+  const dbPath = params.effectiveConfig.persistence.db_path;
+  let audit = auditHistoryReconciliation(dbPath);
+  if (params.fix && audit.repairable > 0) {
+    if (params.ci || !params.yes) {
+      addFix(params.fixes, {
+        id: 'history-execution-graph-reconciliation',
+        status: 'skipped',
+        summary: params.ci
+          ? 'History reconciliation was not run because `--ci` forbids doctor fix mutations.'
+          : 'History reconciliation was not run because `--yes` was not provided.'
+      });
+    } else {
+      let failure: string | null = null;
+      let result: { recovered: number; ambiguous: number } | null = null;
+      try {
+        const store = new SqlitePersistenceStore({
+          dbPath,
+          retentionDays: params.effectiveConfig.persistence.retention_days
+        });
+        try {
+          result = store.reconcileExecutionGraphAfterRestart();
+        } finally {
+          store.close();
+        }
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+      }
+      addFix(params.fixes, {
+        id: 'history-execution-graph-reconciliation',
+        status: failure ? 'failed' : 'applied',
+        summary: failure
+          ? `History reconciliation failed: ${failure}`
+          : `Closed ${result?.recovered ?? 0} provably orphaned execution graph record(s); ${result?.ambiguous ?? 0} remain ambiguous.`,
+        details: result ?? undefined
+      });
+      audit = auditHistoryReconciliation(dbPath);
+    }
+  }
+  const ready = audit.error === null && audit.active === 0;
+  const baseSafeFix = safeFixForFinding(
+    { id: 'history.execution_graph_reconciliation', status: ready ? 'ok' : 'failure' },
+    { projectRoot: params.projectRoot, persistencePath: dbPath }
+  );
+  addCheck(params.checks, {
+    id: 'history.execution_graph_reconciliation',
+    title: 'Execution graph history is reconciled',
+    status: ready ? 'ok' : 'failure',
+    reason: audit.error
+      ? 'history_reconciliation_audit_failed'
+      : audit.ambiguous > 0
+        ? 'history_orphan_reconciliation_ambiguous'
+        : audit.repairable > 0
+          ? 'history_orphan_reconciliation_required'
+          : 'history_execution_graph_reconciled',
+    summary: audit.error
+      ? 'Execution history could not be audited safely.'
+      : audit.active === 0
+        ? 'No active persisted execution graph records require restart reconciliation.'
+        : `${audit.repairable} provably orphaned record(s) are repairable; ${audit.ambiguous} record(s) remain ambiguous.`,
+    remediation: ready
+      ? undefined
+      : audit.repairable > 0
+        ? 'Stop the runtime, then run `symphony doctor --fix --yes`; ambiguous records are never changed automatically.'
+        : 'Inspect the owning runtime or parent run; doctor refuses to change ambiguous records.',
+    safeFix: { ...baseSafeFix, available: audit.repairable > 0 },
+    details: {
+      databasePath: dbPath,
+      databaseExists: audit.databaseExists,
+      activeCount: audit.active,
+      repairableCount: audit.repairable,
+      ambiguousCount: audit.ambiguous,
+      auditError: audit.error
+    }
+  });
+}
+
 function addCodexCommandCheck(checks: DoctorFinding[], effectiveConfig: EffectiveConfig, env: NodeJS.ProcessEnv): void {
   const command = effectiveConfig.codex.command;
   const executablePath = findCommandOnPath(command, env);
@@ -1706,27 +2223,159 @@ function addCodexCommandCheck(checks: DoctorFinding[], effectiveConfig: Effectiv
   });
 }
 
-function readClaudeUserSettingSelectors(env: NodeJS.ProcessEnv): string[] {
+function inspectClaudeUserSettings(
+  env: NodeJS.ProcessEnv,
+  allowNonSubscriptionAuth: boolean
+): { selectors: string[]; unsafe: string[]; hash: string } {
   const home = env.HOME?.trim() || os.homedir();
   const settingsPath = path.join(home, '.claude', 'settings.json');
-  if (!fs.existsSync(settingsPath)) return [];
+  if (!fs.existsSync(settingsPath)) {
+    return { selectors: [], unsafe: [], hash: crypto.createHash('sha256').update('missing').digest('hex') };
+  }
   try {
-    const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as unknown;
+    const raw = fs.readFileSync(settingsPath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
     const record = workflowRecord(parsed);
     const settingsEnv = workflowRecord(record.env);
-    return [
+    const sandbox = workflowRecord(record.sandbox);
+    const filesystem = workflowRecord(sandbox.filesystem);
+    const network = workflowRecord(sandbox.network);
+    const permissions = workflowRecord(record.permissions);
+    const enabledPlugins = workflowRecord(record.enabledPlugins);
+    const plugins = workflowRecord(record.plugins);
+    const environmentNames = Object.entries(settingsEnv)
+      .filter(([, value]) => (typeof value === 'string' ? value.trim().length > 0 : value !== null && value !== undefined))
+      .map(([name]) => name);
+    const unsafe = [
+      ...(Object.keys(workflowRecord(record.hooks)).length > 0 ? ['hooks'] : []),
+      ...(Object.values(enabledPlugins).some((value) => value === true) ? ['enabledPlugins'] : []),
+      ...(Object.keys(plugins).length > 0 ? ['plugins'] : []),
+      ...(record.agents !== undefined ? ['agents'] : []),
+      ...(Array.isArray(sandbox.excludedCommands) && sandbox.excludedCommands.length > 0 ? ['sandbox.excludedCommands'] : []),
+      ...(sandbox.allowUnsandboxedCommands === true ? ['sandbox.allowUnsandboxedCommands'] : []),
+      ...(sandbox.failIfUnavailable === false ? ['sandbox.failIfUnavailable'] : []),
+      ...(sandbox.allowAppleEvents === true ? ['sandbox.allowAppleEvents'] : []),
+      ...(filesystem.disabled === true ? ['sandbox.filesystem.disabled'] : []),
+      ...(network.allowAllUnixSockets === true ? ['sandbox.network.allowAllUnixSockets'] : []),
+      ...(network.enableWeakerNetworkIsolation === true ? ['sandbox.network.enableWeakerNetworkIsolation'] : []),
+      ...(permissions.defaultMode === 'bypassPermissions' ? ['permissions.defaultMode'] : []),
+      ...(Array.isArray(permissions.allow) && permissions.allow.length > 0 ? ['permissions.allow'] : []),
+      ...(Array.isArray(permissions.additionalDirectories) && permissions.additionalDirectories.length > 0
+        ? ['permissions.additionalDirectories']
+        : []),
+      ...(Array.isArray(filesystem.allowWrite) && filesystem.allowWrite.length > 0 ? ['sandbox.filesystem.allowWrite'] : []),
+      ...(Array.isArray(filesystem.allowRead) && filesystem.allowRead.length > 0 ? ['sandbox.filesystem.allowRead'] : []),
+      ...(Array.isArray(network.allowedDomains) && network.allowedDomains.length > 0 ? ['sandbox.network.allowedDomains'] : []),
+      ...(Array.isArray(network.allowUnixSockets) && network.allowUnixSockets.length > 0
+        ? ['sandbox.network.allowUnixSockets']
+        : []),
+      ...(network.allowLocalBinding === true ? ['sandbox.network.allowLocalBinding'] : []),
+      ...(Array.isArray(network.allowMachLookup) && network.allowMachLookup.length > 0
+        ? ['sandbox.network.allowMachLookup']
+        : []),
+      ...(network.httpProxyPort !== undefined ? ['sandbox.network.httpProxyPort'] : []),
+      ...(network.socksProxyPort !== undefined ? ['sandbox.network.socksProxyPort'] : []),
+      ...(network.tlsTerminate !== undefined ? ['sandbox.network.tlsTerminate'] : []),
+      ...(sandbox.enableWeakerNestedSandbox === true ? ['sandbox.enableWeakerNestedSandbox'] : []),
+      ...(sandbox.enableWeakerNetworkIsolation === true ? ['sandbox.enableWeakerNetworkIsolation'] : []),
+      ...(sandbox.ignoreViolations !== undefined ? ['sandbox.ignoreViolations'] : []),
+      ...(sandbox.ripgrep !== undefined ? ['sandbox.ripgrep'] : []),
+      ...(record.processWrapper !== undefined ? ['processWrapper'] : []),
+      ...(record.statusLine !== undefined ? ['statusLine'] : []),
+      ...(record.fileSuggestion !== undefined ? ['fileSuggestion'] : []),
+      ...(record.apiKeyHelper !== undefined ? ['apiKeyHelper'] : []),
+      ...environmentNames.map((name) => `env.${name}`)
+    ];
+    const selectors = [
       ...(record.apiKeyHelper ? ['apiKeyHelper'] : []),
       ...CLAUDE_NON_SUBSCRIPTION_ENV_NAMES.filter((name) => {
         const value = settingsEnv[name];
         return typeof value === 'string' ? value.trim().length > 0 : value !== null && value !== undefined;
       })
     ];
+    return {
+      selectors: [...new Set(selectors)],
+      unsafe: [...new Set(unsafe)],
+      hash: crypto.createHash('sha256').update(raw).digest('hex')
+    };
   } catch {
-    return ['invalid_user_settings'];
+    return { selectors: ['invalid_user_settings'], unsafe: ['invalid_user_settings'], hash: 'invalid' };
   }
 }
 
-function addClaudeRuntimeChecks(checks: DoctorFinding[], effectiveConfig: EffectiveConfig, env: NodeJS.ProcessEnv): void {
+function inspectClaudeGitRemote(projectRoot: string, gitExecutable: string | null): {
+  scheme: 'ssh' | 'https' | 'http' | 'other' | 'missing';
+  host: string | null;
+  hasCredentials: boolean;
+} {
+  if (!gitExecutable) return { scheme: 'other', host: null, hasCredentials: false };
+  const remote = spawnSync(gitExecutable, ['config', '--file', path.join(projectRoot, '.git', 'config'), '--get', 'remote.origin.url'], {
+    cwd: projectRoot,
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+    encoding: 'utf8',
+    shell: false,
+    timeout: 10_000,
+    maxBuffer: 64 * 1024
+  });
+  const value = remote.status === 0 ? remote.stdout.trim() : '';
+  if (!value) return { scheme: 'missing', host: null, hasCredentials: false };
+  if (value.includes('://')) {
+    try {
+      const parsed = new URL(value);
+      const hasCredentials = Boolean(
+        parsed.password || ((parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.username)
+      );
+      if (parsed.protocol === 'ssh:') return { scheme: 'ssh', host: parsed.hostname.toLowerCase(), hasCredentials };
+      if (parsed.protocol === 'https:') {
+        return { scheme: 'https', host: parsed.hostname.toLowerCase(), hasCredentials };
+      }
+      if (parsed.protocol === 'http:') return { scheme: 'http', host: parsed.hostname.toLowerCase(), hasCredentials };
+      return { scheme: 'other', host: parsed.hostname.toLowerCase() || null, hasCredentials };
+    } catch {
+      return { scheme: 'other', host: null, hasCredentials: false };
+    }
+  }
+  const scp = /^(?:[^@\s]+@)?([^:/\s]+):/.exec(value);
+  return scp
+    ? { scheme: 'ssh', host: scp[1]!.toLowerCase(), hasCredentials: false }
+    : { scheme: 'other', host: null, hasCredentials: false };
+}
+
+function inspectClaudeSshAgent(
+  env: NodeJS.ProcessEnv,
+  forbiddenRoots: string[]
+): { ready: boolean; socketPath: string | null; reason: string } {
+  const candidate = env.SSH_AUTH_SOCK?.trim();
+  if (!candidate) return { ready: false, socketPath: null, reason: 'missing' };
+  try {
+    const socketPath = fs.realpathSync(candidate);
+    const stat = fs.statSync(socketPath);
+    if (!stat.isSocket()) return { ready: false, socketPath, reason: 'not_socket' };
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+      return { ready: false, socketPath, reason: 'owner_mismatch' };
+    }
+    const sshAddExecutable = resolveTrustedExecutable('ssh-add', env, forbiddenRoots);
+    const probe = spawnSync(sshAddExecutable, ['-l'], {
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', SSH_AUTH_SOCK: socketPath },
+      encoding: 'utf8',
+      shell: false,
+      timeout: 10_000,
+      maxBuffer: 64 * 1024
+    });
+    if (probe.status === 1) return { ready: false, socketPath, reason: 'no_identities' };
+    if (probe.status !== 0) return { ready: false, socketPath, reason: 'probe_failed' };
+    return { ready: true, socketPath, reason: 'ready' };
+  } catch {
+    return { ready: false, socketPath: null, reason: 'invalid' };
+  }
+}
+
+function addClaudeRuntimeChecks(
+  checks: DoctorFinding[],
+  effectiveConfig: EffectiveConfig,
+  env: NodeJS.ProcessEnv,
+  projectRoot: string
+): void {
   const runtime = effectiveConfig.agent_runtime;
   if (!runtime || runtime.selected !== 'claude-cli') return;
 
@@ -1750,6 +2399,28 @@ function addClaudeRuntimeChecks(checks: DoctorFinding[], effectiveConfig: Effect
         : 'Use a local macOS/Linux worker or select the Codex runtime for remote workers.',
     details: { platform: process.platform, configuredRemoteHostCount: remoteHosts.length }
   });
+  const isolatedGitDirectory = effectiveConfig.workspace.provisioner.type === 'clone';
+  addCheck(checks, {
+    id: 'claude.workspace_git_boundary',
+    title: 'Claude workspace owns its Git metadata',
+    status: isolatedGitDirectory ? 'ok' : 'failure',
+    reason: isolatedGitDirectory ? 'claude_clone_workspace_ready' : 'claude_linked_worktree_metadata_unsupported',
+    summary: isolatedGitDirectory
+      ? 'Clone provisioning keeps writable Git metadata inside the sandboxed workspace.'
+      : `Provisioner ${effectiveConfig.workspace.provisioner.type} stores writable Git metadata outside the worktree boundary.`,
+    remediation: isolatedGitDirectory
+      ? undefined
+      : 'Use workspace.provisioner.type=clone for claude-cli so commit and push remain inside the strict filesystem boundary.',
+    details: { provisionerType: effectiveConfig.workspace.provisioner.type }
+  });
+  addCheck(checks, {
+    id: 'claude.process_containment',
+    title: 'Claude child processes use supervised process ownership',
+    status: 'ok',
+    reason: 'claude_process_group_supervision_ready',
+    summary: 'Symphony uses a dedicated process group, descendant monitoring, and TERM/KILL cleanup for each Claude invocation.',
+    details: { platform: process.platform, enforcement: 'process_group_and_descendant_monitoring' }
+  });
   const persistenceDisabled = Boolean(env.CLAUDE_CODE_SKIP_PROMPT_HISTORY?.trim());
   addCheck(checks, {
     id: 'claude.session_persistence',
@@ -1771,7 +2442,16 @@ function addClaudeRuntimeChecks(checks: DoctorFinding[], effectiveConfig: Effect
     details: { requestedModel: runtime.claude_model }
   });
 
-  const executablePath = findCommandOnPath(runtime.claude_command, env);
+  let executablePath: string | null = null;
+  try {
+    executablePath = resolveTrustedExecutable(
+      runtime.claude_command,
+      env,
+      path.isAbsolute(runtime.claude_command) ? [] : [projectRoot]
+    );
+  } catch {
+    // The command readiness finding below reports the unavailable trusted path.
+  }
   addCheck(checks, {
     id: 'claude.command',
     title: 'Claude command is available',
@@ -1783,11 +2463,301 @@ function addClaudeRuntimeChecks(checks: DoctorFinding[], effectiveConfig: Effect
   });
   if (!executablePath) return;
 
+  const userSettings = inspectClaudeUserSettings(env, runtime.claude_allow_non_subscription_auth);
+  addCheck(checks, {
+    id: 'claude.user_settings',
+    title: 'Claude user settings preserve the supervised sandbox boundary',
+    status: userSettings.unsafe.length === 0 ? 'ok' : 'failure',
+    reason: userSettings.unsafe.length === 0 ? 'claude_user_settings_safe' : 'claude_user_settings_unsafe',
+    summary:
+      userSettings.unsafe.length === 0
+        ? 'No executable customization, credential environment, broad permission, or sandbox weakening was detected.'
+        : `Unsafe Claude user setting(s): ${userSettings.unsafe.join(', ')}.`,
+    remediation:
+      userSettings.unsafe.length === 0
+        ? undefined
+        : 'Remove the unsafe user-scoped Claude customization before running Symphony with claude-cli.',
+    details: { unsafe: userSettings.unsafe, settingsHash: userSettings.hash }
+  });
+  const managedPolicyBaseCandidates = process.platform === 'darwin'
+    ? [
+        '/Library/Application Support/ClaudeCode/managed-settings.json',
+        '/Library/Application Support/ClaudeCode/managed-mcp.json',
+        '/Library/Managed Preferences/com.anthropic.claudecode.plist',
+        '/Library/Managed Preferences/com.anthropic.ClaudeCode.plist'
+      ]
+    : ['/etc/claude-code/managed-settings.json', '/etc/claude-code/managed-mcp.json'];
+  const managedDropInDirectories = process.platform === 'darwin'
+    ? ['/Library/Application Support/ClaudeCode/managed-settings.d']
+    : ['/etc/claude-code/managed-settings.d'];
+  const managedPolicyCandidates = [
+    ...managedPolicyBaseCandidates,
+    ...managedDropInDirectories.flatMap((directory) => {
+      try {
+        return fs.readdirSync(directory)
+          .filter((entry) => entry.endsWith('.json'))
+          .map((entry) => path.join(directory, entry));
+      } catch {
+        return [];
+      }
+    }),
+    path.join(os.homedir(), '.claude', 'managed-settings.json'),
+    path.join(os.homedir(), '.claude', 'managed-mcp.json')
+  ];
+  const remoteSettingsPath = path.join(os.homedir(), '.claude', 'remote-settings.json');
+  if (fs.existsSync(remoteSettingsPath)) {
+    try {
+      const remoteSettings = JSON.parse(fs.readFileSync(remoteSettingsPath, 'utf8')) as unknown;
+      const hasRemoteSettings = Array.isArray(remoteSettings)
+        ? remoteSettings.length > 0
+        : Boolean(remoteSettings && typeof remoteSettings === 'object' && Object.keys(remoteSettings).length > 0);
+      if (hasRemoteSettings) managedPolicyCandidates.push(remoteSettingsPath);
+    } catch {
+      managedPolicyCandidates.push(remoteSettingsPath);
+    }
+  }
+  const managedPolicyPresent = managedPolicyCandidates.filter((candidate) => fs.existsSync(candidate));
+  addCheck(checks, {
+    id: 'claude.managed_policy',
+    title: 'Claude managed policy cannot override the supervised sandbox',
+    status: managedPolicyPresent.length === 0 ? 'ok' : 'failure',
+    reason: managedPolicyPresent.length === 0 ? 'claude_managed_policy_absent' : 'claude_managed_policy_unsupported',
+    summary: managedPolicyPresent.length === 0
+      ? 'No host-managed Claude settings source was detected.'
+      : 'Managed Claude policy is present and cannot be safely composed with the MVP sandbox contract.',
+    remediation: managedPolicyPresent.length === 0
+      ? undefined
+      : 'Use a worker without managed Claude policy until effective-policy attestation is implemented.',
+    details: { present: managedPolicyPresent.map((candidate) => path.basename(candidate)) }
+  });
+  const customAgentsDirectory = path.join(os.homedir(), '.claude', 'agents');
+  const customAgents = (() => {
+    try {
+      return fs.readdirSync(customAgentsDirectory).filter((entry) => entry.toLowerCase().endsWith('.md'));
+    } catch {
+      return [];
+    }
+  })();
+  addCheck(checks, {
+    id: 'claude.custom_agents',
+    title: 'Claude user custom agents are disabled',
+    status: customAgents.length === 0 ? 'ok' : 'failure',
+    reason: customAgents.length === 0 ? 'claude_user_custom_agents_absent' : 'claude_user_custom_agents_unsupported',
+    summary: customAgents.length === 0
+      ? 'No user-scoped custom agent definitions were found.'
+      : 'User-scoped custom agent definitions are not supported by the supervised runtime.',
+    remediation: customAgents.length === 0 ? undefined : 'Remove user custom-agent files before using claude-cli with Symphony.',
+    details: { count: customAgents.length }
+  });
+
+  const sandboxDependencyNames = process.platform === 'darwin' ? ['sandbox-exec'] : ['bwrap', 'socat'];
+  const sandboxDependencies = sandboxDependencyNames.map((name) => ({ name, executablePath: findCommandOnPath(name, env) }));
+  const missingSandboxDependencies = sandboxDependencies.filter((entry) => !entry.executablePath).map((entry) => entry.name);
+  const sandboxReady = missingSandboxDependencies.length === 0;
+  addCheck(checks, {
+    id: 'claude.sandbox',
+    title: 'Claude fail-closed sandbox prerequisites are available',
+    status: sandboxReady ? 'ok' : 'failure',
+    reason: sandboxReady ? 'claude_sandbox_ready' : 'claude_sandbox_unavailable',
+    summary: sandboxReady
+      ? `Sandbox dependencies are available (${sandboxDependencyNames.join(', ')}); Symphony will require failIfUnavailable.`
+      : `Required sandbox dependency or dependencies were not found: ${missingSandboxDependencies.join(', ')}.`,
+    remediation: sandboxReady ? undefined : 'Install every platform sandbox dependency before starting claude-cli workers.',
+    details: {
+      dependencies: sandboxDependencies,
+      missing: missingSandboxDependencies,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      deniedDomains: ['localhost', '127.0.0.1', '::1'],
+      allowLocalBinding: false
+    }
+  });
+
+  addCheck(checks, {
+    id: 'claude.network_policy',
+    title: 'Claude network policy uses exact approved hosts',
+    status: 'ok',
+    reason: 'claude_network_policy_ready',
+    summary: `Claude network access is restricted to ${runtime.claude_network_allowed_domains.length} exact host(s).`,
+    details: { allowedDomains: runtime.claude_network_allowed_domains }
+  });
+
+  const requiredMcpServers = ['linear-server'];
+  const userMcpConfiguration = inspectClaudeUserMcpConfiguration({
+    home: env.HOME?.trim() || os.homedir(),
+    workspace: projectRoot,
+    allowedServers: runtime.claude_allowed_mcp_servers,
+    requiredServers: requiredMcpServers
+  });
+  const mayProbeMcp = userMcpConfiguration.unsafe.length === 0;
+  const requiredMcpResults = mayProbeMcp ? requiredMcpServers.map((name) => {
+    const probe = spawnSync(executablePath, ['--setting-sources', 'user', 'mcp', 'get', name], {
+      cwd: projectRoot,
+      env,
+      encoding: 'utf8',
+      shell: false,
+      maxBuffer: 1024 * 1024,
+      timeout: 10_000
+    });
+    return { name, ready: probe.status === 0 };
+  }) : [];
+  const missingMcp = requiredMcpResults.filter((entry) => !entry.ready).map((entry) => entry.name);
+  const mcpReady =
+    mayProbeMcp &&
+    missingMcp.length === 0 &&
+    userMcpConfiguration.unsafe.length === 0;
+  addCheck(checks, {
+    id: 'claude.mcp',
+    title: 'Claude user-scoped MCP inventory is approved and isolated',
+    status: mcpReady ? 'ok' : 'failure',
+    reason: mcpReady
+      ? 'claude_mcp_ready'
+      : userMcpConfiguration.unsafe.length > 0
+        ? 'claude_user_mcp_configuration_unsafe'
+        : missingMcp.length > 0
+        ? 'claude_required_mcp_missing_user_scope'
+        : 'claude_required_mcp_missing_user_scope',
+    summary: mcpReady
+      ? `Required user-scoped MCP configuration is present; connection is verified only by the explicit live smoke.`
+      : userMcpConfiguration.unsafe.length > 0
+        ? `User-scoped MCP configuration is unsafe or incomplete: ${userMcpConfiguration.unsafe.join(', ')}.`
+        : missingMcp.length > 0
+        ? `Required user-scoped MCP server(s) are missing: ${missingMcp.join(', ')}.`
+        : 'Required user-scoped MCP configuration is unavailable.',
+    remediation: mcpReady
+      ? undefined
+      : 'Configure required servers with `claude mcp add --scope user ...` and disconnect unapproved user-scoped servers.',
+    details: {
+      allowed: runtime.claude_allowed_mcp_servers,
+      connected: [],
+      connectionStatus: 'verified_by_explicit_smoke_only',
+      configuredUserServers: userMcpConfiguration.configuredUserServers,
+      configurationHash: userMcpConfiguration.hash,
+      configurationUnsafe: userMcpConfiguration.unsafe,
+      missing: missingMcp,
+      disconnectedRequired: [],
+      unapprovedConnected: []
+    }
+  });
+
+  const inheritedCredentialNames = Object.keys(env)
+    .filter((name) => /(?:TOKEN|SECRET|PASSWORD|API_KEY|AUTH|CREDENTIAL)/i.test(name) && Boolean(env[name]?.trim()))
+    .sort();
+  addCheck(checks, {
+    id: 'claude.inherited_credentials',
+    title: 'Inherited credential names are inventoried',
+    status: inheritedCredentialNames.length > 0 ? 'warning' : 'ok',
+    reason: inheritedCredentialNames.length > 0 ? 'claude_inherited_credentials_present' : 'claude_inherited_credentials_absent',
+    summary: inheritedCredentialNames.length > 0
+      ? `${inheritedCredentialNames.length} credential-like environment variable name(s) are present; the runner strips unrelated values and LINEAR_API_KEY.`
+      : 'No credential-like environment variable names were detected.',
+    details: { names: inheritedCredentialNames }
+  });
+
+  let gitExecutable: string | null = null;
+  try {
+    gitExecutable = resolveTrustedExecutable('git', env, [projectRoot]);
+  } catch {
+    // The readiness finding below reports the missing trusted executable.
+  }
+  const gitRemote = inspectClaudeGitRemote(projectRoot, gitExecutable);
+  const sshAgent = gitRemote.scheme === 'ssh' ? inspectClaudeSshAgent(env, [projectRoot]) : null;
+  const sshCompatible =
+    Boolean(gitExecutable) &&
+    !gitRemote.hasCredentials &&
+    gitRemote.scheme !== 'http' &&
+    (gitRemote.scheme !== 'ssh' ||
+      (process.platform !== 'linux' &&
+        Boolean(gitRemote.host) &&
+        runtime.claude_network_allowed_domains.includes(gitRemote.host!) &&
+        sshAgent?.ready === true));
+  let gitSummary = `SSH remote ${gitRemote.host ?? 'unknown'} requires an owned agent socket with at least one identity and a matching allowed network host.`;
+  if (sshCompatible) {
+    gitSummary = gitRemote.scheme === 'ssh'
+      ? `SSH agent forwarding is available for approved host ${gitRemote.host}.`
+      : 'The Git remote does not require SSH agent forwarding.';
+  } else if (gitRemote.hasCredentials) {
+    gitSummary = 'The Git origin embeds credentials; use a credential helper or SSH agent instead.';
+  } else if (!gitExecutable) {
+    gitSummary = 'No trusted Git executable is available outside the project root.';
+  } else if (gitRemote.scheme === 'http') {
+    gitSummary = 'The Git origin uses unencrypted HTTP; use HTTPS or an approved SSH route.';
+  } else if (process.platform === 'linux' && gitRemote.scheme === 'ssh') {
+    gitSummary = 'Linux Claude sandboxing cannot safely expose a single SSH agent socket; use an HTTPS origin.';
+  }
+  addCheck(checks, {
+    id: 'claude.git_ssh',
+    title: 'Git remote authentication is compatible with the sandbox',
+    status: sshCompatible ? 'ok' : 'failure',
+    reason: sshCompatible ? 'claude_git_auth_ready' : 'claude_git_ssh_unavailable',
+    summary: gitSummary,
+    details: {
+      remoteScheme: gitRemote.scheme,
+      remoteContainsUserInfo: gitRemote.hasCredentials,
+      sshHost: gitRemote.scheme === 'ssh' ? gitRemote.host : null,
+      sshAgentPresent: Boolean(env.SSH_AUTH_SOCK?.trim()),
+      sshAgentReady: sshAgent?.ready ?? false,
+      sshAgentReason: sshAgent?.reason ?? 'not_required'
+    }
+  });
+  const githubHost = gitRemote.host && (gitRemote.host === 'github.com' || gitRemote.host.endsWith('.github.com'))
+    ? gitRemote.host
+    : null;
+  let githubExecutable: string | null = null;
+  if (githubHost) {
+    try {
+      githubExecutable = resolveTrustedExecutable('gh', env, [projectRoot]);
+    } catch {
+      // The readiness finding below reports the missing trusted executable.
+    }
+  }
+  const githubAuth = githubHost && githubExecutable
+    ? spawnSync(githubExecutable, ['auth', 'token', '--hostname', githubHost], {
+        cwd: projectRoot,
+        env: {
+          PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+          HOME: env.HOME ?? os.homedir(),
+          USER: env.USER,
+          LOGNAME: env.LOGNAME
+        },
+        encoding: 'utf8',
+        shell: false,
+        timeout: 10_000,
+        maxBuffer: 64 * 1024
+      })
+    : null;
+  const githubAuthReady = !githubHost || (githubAuth?.status === 0 && Boolean(githubAuth.stdout.trim()));
+  const githubAuthStatus = githubAuthReady ? 'ok' : 'failure';
+  addCheck(checks, {
+    id: 'claude.github_auth',
+    title: 'GitHub CLI route is ready for the configured remote',
+    status: githubAuthStatus,
+    reason: !githubHost
+      ? 'claude_github_auth_not_required'
+      : githubAuthReady
+        ? 'claude_github_auth_ready'
+        : 'claude_github_auth_unavailable',
+    summary: githubHost
+      ? githubAuthReady
+        ? `GitHub CLI can supply a scoped child capability for ${githubHost}.`
+        : `GitHub CLI authentication is unavailable for ${githubHost}.`
+      : 'The configured remote does not require a GitHub CLI authentication check.',
+    remediation: githubAuthReady ? undefined : `Run \`gh auth login --hostname ${githubHost}\`, then rerun doctor and the explicit Claude smoke.`,
+    details: {
+      githubHost,
+      gitExecutable,
+      githubExecutable,
+      exitStatus: githubAuth?.status ?? null,
+      sandboxVerified: false
+    }
+  });
+
   const versionResult = spawnSync(executablePath, ['--version'], {
     env,
     encoding: 'utf8',
     shell: false,
-    maxBuffer: 1024 * 1024
+    maxBuffer: 1024 * 1024,
+    timeout: 10_000
   });
   const version = `${versionResult.stdout ?? ''}\n${versionResult.stderr ?? ''}`.match(/\b\d+\.\d+\.\d+\b/)?.[0] ?? null;
   const versionReady = versionResult.status === 0 && version === CLAUDE_SUPPORTED_VERSION;
@@ -1805,7 +2775,7 @@ function addClaudeRuntimeChecks(checks: DoctorFinding[], effectiveConfig: Effect
 
   const selectors = [
     ...CLAUDE_NON_SUBSCRIPTION_ENV_NAMES.filter((name) => Boolean(env[name]?.trim())),
-    ...readClaudeUserSettingSelectors(env)
+    ...userSettings.selectors
   ];
   const routingReady =
     !selectors.includes('invalid_user_settings') &&
@@ -1828,7 +2798,8 @@ function addClaudeRuntimeChecks(checks: DoctorFinding[], effectiveConfig: Effect
     env,
     encoding: 'utf8',
     shell: false,
-    maxBuffer: 1024 * 1024
+    maxBuffer: 1024 * 1024,
+    timeout: 10_000
   });
   let auth: { loggedIn: boolean; authMethod: string | null; apiProvider: string | null; subscriptionType: string | null } = {
     loggedIn: false,
@@ -1864,6 +2835,350 @@ function addClaudeRuntimeChecks(checks: DoctorFinding[], effectiveConfig: Effect
       : 'Claude authentication is missing or does not match the required Team/Enterprise subscription route.',
     remediation: subscriptionReady ? undefined : 'Run `claude auth login`, then verify Team/Enterprise first-party authentication with `symphony doctor`.',
     details: auth
+  });
+}
+
+async function linearSmokeMarkerControl(params: {
+  effectiveConfig: EffectiveConfig;
+  issueIdentifier: string;
+  marker: string;
+  remove: boolean;
+}): Promise<{ before: number; after: number; removed: number; error: string | null }> {
+  if (params.effectiveConfig.tracker.kind !== 'linear') {
+    return { before: 0, after: 0, removed: 0, error: 'claude_smoke_requires_linear_tracker_control_plane' };
+  }
+  const request = async (query: string, variables: Record<string, unknown>) => {
+    const response = await fetch(params.effectiveConfig.tracker.endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: params.effectiveConfig.tracker.api_key
+      },
+      body: JSON.stringify({ query, variables })
+    });
+    if (!response.ok) throw new Error(`linear_http_${response.status}`);
+    const payload = workflowRecord(await response.json());
+    if (Array.isArray(payload.errors) && payload.errors.length > 0) throw new Error('linear_graphql_error');
+    return workflowRecord(payload.data);
+  };
+  const list = async () => {
+    const data = await request(
+      'query SymphonyClaudeSmokeIssue($id: String!) { issue(id: $id) { comments { nodes { id body } } } }',
+      { id: params.issueIdentifier }
+    );
+    const issue = workflowRecord(data.issue);
+    const comments = workflowRecord(issue.comments);
+    return (Array.isArray(comments.nodes) ? comments.nodes : [])
+      .map((value) => workflowRecord(value))
+      .filter((comment) => typeof comment.id === 'string' && comment.body === params.marker)
+      .map((comment) => String(comment.id));
+  };
+  try {
+    const beforeIds = await list();
+    let removed = 0;
+    if (params.remove) {
+      for (const id of beforeIds) {
+        const data = await request(
+          'mutation SymphonyClaudeSmokeCommentDelete($id: String!) { commentDelete(id: $id) { success } }',
+          { id }
+        );
+        if (workflowRecord(data.commentDelete).success === true) removed += 1;
+      }
+    }
+    const afterIds = await list();
+    return { before: beforeIds.length, after: afterIds.length, removed, error: null };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { before: 0, after: 0, removed: 0, error: detail.replace(/[^a-zA-Z0-9_.:-]+/g, '_').slice(0, 160) };
+  }
+}
+
+async function addClaudeSmokeCheck(params: {
+  checks: DoctorFinding[];
+  effectiveConfig: EffectiveConfig;
+  env: NodeJS.ProcessEnv;
+  projectRoot: string;
+  linearIssue: string;
+}): Promise<void> {
+  const blockingReadiness = params.checks.filter(
+    (check) => check.id.startsWith('claude.') && check.status === 'failure'
+  );
+  if (blockingReadiness.length > 0) {
+    addCheck(params.checks, {
+      id: 'claude.smoke',
+      title: 'Claude sandbox, GitHub, and Linear MCP live smoke',
+      status: 'failure',
+      reason: 'claude_smoke_readiness_blocked',
+      summary: `Live smoke was not started because ${blockingReadiness.length} Claude readiness check(s) failed.`,
+      remediation: 'Resolve every Claude readiness blocker, then rerun the explicit smoke command.',
+      details: { blockingChecks: blockingReadiness.map((check) => check.id), modelQuotaConsumed: false }
+    });
+    return;
+  }
+
+  const runtime = params.effectiveConfig.agent_runtime;
+  if (!runtime || runtime.selected !== 'claude-cli' || !runtime.claude_model) {
+    addCheck(params.checks, {
+      id: 'claude.smoke',
+      title: 'Claude sandbox, GitHub, and Linear MCP live smoke',
+      status: 'failure',
+      reason: 'claude_smoke_runtime_not_selected',
+      summary: 'Live smoke requires a resolved claude-cli runtime and pinned model.',
+      details: { modelQuotaConsumed: false }
+    });
+    return;
+  }
+  let gitExecutable: string;
+  try {
+    gitExecutable = resolveTrustedExecutable('git', params.env, [params.projectRoot]);
+  } catch {
+    addCheck(params.checks, {
+      id: 'claude.smoke',
+      title: 'Claude sandbox, GitHub, and Linear MCP live smoke',
+      status: 'failure',
+      reason: 'claude_smoke_git_unavailable',
+      summary: 'Live smoke requires a trusted Git executable outside the project root.',
+      details: { modelQuotaConsumed: false }
+    });
+    return;
+  }
+  const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-smoke-'));
+  const smokeWorkspace = path.join(smokeRoot, 'workspace');
+  const worktree = spawnSync(gitExecutable, ['clone', '--no-hardlinks', params.projectRoot, smokeWorkspace], {
+    cwd: params.projectRoot,
+    encoding: 'utf8',
+    shell: false,
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024
+  });
+  if (worktree.status !== 0) {
+    fs.rmSync(smokeRoot, { recursive: true, force: true });
+    addCheck(params.checks, {
+      id: 'claude.smoke',
+      title: 'Claude sandbox and Linear MCP live smoke',
+      status: 'failure',
+      reason: 'claude_smoke_disposable_worktree_failed',
+      summary: 'Live smoke could not create its disposable detached worktree.',
+      details: { modelQuotaConsumed: false }
+    });
+    return;
+  }
+  const parentOrigin = spawnSync(gitExecutable, ['config', '--file', path.join(params.projectRoot, '.git', 'config'), '--get', 'remote.origin.url'], {
+    cwd: params.projectRoot,
+    encoding: 'utf8',
+    shell: false,
+    timeout: 10_000,
+    maxBuffer: 64 * 1024
+  });
+  const setSmokeOrigin = parentOrigin.status === 0
+    ? spawnSync(gitExecutable, ['remote', 'set-url', 'origin', parentOrigin.stdout.trim()], {
+        cwd: smokeWorkspace,
+        encoding: 'utf8',
+        shell: false,
+        timeout: 10_000,
+        maxBuffer: 64 * 1024
+      })
+    : null;
+  if (!setSmokeOrigin || setSmokeOrigin.status !== 0) {
+    fs.rmSync(smokeRoot, { recursive: true, force: true });
+    addCheck(params.checks, {
+      id: 'claude.smoke',
+      title: 'Claude sandbox, GitHub, and Linear MCP live smoke',
+      status: 'failure',
+      reason: 'claude_smoke_origin_setup_failed',
+      summary: 'Live smoke could not bind its disposable clone to the canonical origin.',
+      details: { modelQuotaConsumed: false }
+    });
+    return;
+  }
+  const smokeEnv = { ...params.env, PWD: smokeRoot };
+  const runner = new ClaudeCliRunner({
+    command: runtime.claude_command,
+    model: runtime.claude_model,
+    projectRoot: smokeRoot,
+    allowNonSubscriptionAuth: runtime.claude_allow_non_subscription_auth,
+    networkAllowedDomains: runtime.claude_network_allowed_domains,
+    allowedMcpServers: runtime.claude_allowed_mcp_servers,
+    requiredMcpServers: ['linear-server'],
+    supportedVersion: runtime.claude_supported_version,
+    gitCommand: gitExecutable,
+    env: smokeEnv
+  });
+  const marker = `symphony-claude-smoke-${crypto.randomUUID()}`;
+  const gitMarkerFile = `.symphony-smoke-${crypto.randomUUID()}.txt`;
+  const gitMarkerContent = `SYMPHONY_GIT_SMOKE:${marker}`;
+  const gitMarkerSubject = `test: ${marker}`;
+  let result: Awaited<ReturnType<ClaudeCliRunner['startSessionAndRunTurn']>> | null = null;
+  let cleanupResult: Awaited<ReturnType<ClaudeCliRunner['startSessionAndRunTurn']>> | null = null;
+  let markerControl = { before: 0, after: 0, removed: 0, error: null as string | null };
+  let cleanupMarkerReadback = { before: 0, after: 0, removed: 0, error: null as string | null };
+  let finalMarkerCleanup = { before: 0, after: 0, removed: 0, error: null as string | null };
+  let invocationError: string | null = null;
+  let worktreeRemovalStatus: number | null = null;
+  let gitSmokeVerified = false;
+  try {
+    result = await runner.startSessionAndRunTurn({
+      command: 'unused',
+      commandArgs: [],
+      workspaceCwd: smokeWorkspace,
+      prompt: [
+        `Use only the user-scoped Linear MCP tools to read issue ${params.linearIssue}.`,
+        `Add a temporary comment whose complete body is exactly ${marker}, read the issue again to verify it exists, and leave it for the supervising smoke to remove.`,
+        'Run `git remote get-url origin` and `gh repo view --json nameWithOwner`; both commands must succeed without revealing credentials.',
+        `Create ${gitMarkerFile} containing exactly ${gitMarkerContent}, commit it with subject ${JSON.stringify(gitMarkerSubject)}, and run a dry-run push of HEAD to origin branch refs/heads/${marker}.`,
+        'Run `npm --version` and `npm view npm version` to verify the package-manager executable and approved registry route.',
+        'If comment creation, Git remote access, or GitHub CLI authentication cannot be verified, return an error.',
+        'Do not use curl, raw Linear HTTP, environment credentials, or another Claude process.',
+        `Only after all checks succeed, end with the exact marker SYMPHONY_SMOKE_OK:${marker}.`
+      ].join(' '),
+      title: `Claude readiness smoke ${params.linearIssue}`,
+      maxTurns: 1,
+      approvalPolicy: 'never',
+      threadSandbox: 'workspace-write',
+      readTimeoutMs: params.effectiveConfig.codex.read_timeout_ms,
+      turnTimeoutMs: params.effectiveConfig.codex.turn_timeout_ms,
+      runBinding: {
+        project_identity: smokeWorkspace,
+        issue_id: params.linearIssue,
+        issue_identifier: params.linearIssue,
+        attempt: 0
+      }
+    });
+    const committedSubject = spawnSync(gitExecutable, ['log', '-1', '--pretty=%s'], {
+      cwd: smokeWorkspace, encoding: 'utf8', shell: false, timeout: 10_000, maxBuffer: 64 * 1024
+    });
+    gitSmokeVerified =
+      committedSubject.status === 0 &&
+      committedSubject.stdout.trim() === gitMarkerSubject &&
+      fs.existsSync(path.join(smokeWorkspace, gitMarkerFile)) &&
+      fs.readFileSync(path.join(smokeWorkspace, gitMarkerFile), 'utf8').trim() === gitMarkerContent;
+    markerControl = await linearSmokeMarkerControl({
+      effectiveConfig: params.effectiveConfig,
+      issueIdentifier: params.linearIssue,
+      marker,
+      remove: true
+    });
+    if (!result.session_id) throw new Error('claude_smoke_session_missing');
+    cleanupResult = await runner.resumeSessionAndRunTurn({
+      command: 'unused',
+      commandArgs: [],
+      workspaceCwd: smokeWorkspace,
+      prompt: [
+        `Recall the exact temporary marker from the previous turn, then use the user-scoped Linear MCP to read issue ${params.linearIssue} and verify no comment contains it.`,
+        `Do not write anything. If the marker is absent, end with the exact marker SYMPHONY_SMOKE_CLEAN:${marker}.`
+      ].join(' '),
+      title: `Claude readiness cleanup verification ${params.linearIssue}`,
+      maxTurns: 1,
+      approvalPolicy: 'never',
+      threadSandbox: 'workspace-write',
+      readTimeoutMs: params.effectiveConfig.codex.read_timeout_ms,
+      turnTimeoutMs: params.effectiveConfig.codex.turn_timeout_ms,
+      runBinding: {
+        project_identity: smokeWorkspace,
+        issue_id: params.linearIssue,
+        issue_identifier: params.linearIssue,
+        attempt: 0
+      },
+      previousSessionId: result.session_id
+    });
+    cleanupMarkerReadback = await linearSmokeMarkerControl({
+      effectiveConfig: params.effectiveConfig,
+      issueIdentifier: params.linearIssue,
+      marker,
+      remove: false
+    });
+  } catch (error) {
+    invocationError = (error instanceof Error ? error.message : String(error))
+      .replace(/[^a-zA-Z0-9_.:-]+/g, '_')
+      .slice(0, 160);
+  } finally {
+    finalMarkerCleanup = await linearSmokeMarkerControl({
+      effectiveConfig: params.effectiveConfig,
+      issueIdentifier: params.linearIssue,
+      marker,
+      remove: true
+    });
+    try {
+      fs.rmSync(smokeRoot, { recursive: true, force: true });
+      worktreeRemovalStatus = fs.existsSync(smokeRoot) ? 1 : 0;
+    } catch {
+      worktreeRemovalStatus = 1;
+    }
+  }
+  if (!result) {
+    addCheck(params.checks, {
+      id: 'claude.smoke',
+      title: 'Claude sandbox, GitHub, and Linear MCP live smoke',
+      status: 'failure',
+      reason: 'claude_smoke_runner_failed',
+      summary: 'Claude smoke could not complete its supervised runtime invocation.',
+      remediation: 'Inspect the sanitized runner failure and readiness checks, then rerun against the dedicated test issue.',
+      details: {
+        issueIdentifier: params.linearIssue,
+        invocationError,
+        markerControl,
+        worktreeRemovalStatus,
+        modelQuotaConsumed: true
+      }
+    });
+    return;
+  }
+  const linearToolCalls = result.provider_usage?.mcp_counts?.['linear-server'] ?? 0;
+  const cleanupLinearToolCalls = cleanupResult?.provider_usage?.mcp_counts?.['linear-server'] ?? 0;
+  const bashToolCalls = result.provider_usage?.tool_counts?.Bash ?? 0;
+  const observedToolNames = Object.keys(result.provider_usage?.tool_counts ?? {});
+  const linearCreateObserved = observedToolNames.some((name) => /linear-server.*(?:create|comment)/i.test(name));
+  const linearReadObserved = observedToolNames.some((name) => /linear-server.*(?:get|read|issue|comment)/i.test(name));
+  const ready =
+    result.status === 'completed' &&
+    cleanupResult?.status === 'completed' &&
+    cleanupResult.session_id === result.session_id &&
+    gitSmokeVerified &&
+    linearCreateObserved &&
+    linearReadObserved &&
+    markerControl.before === 1 &&
+    markerControl.removed === 1 &&
+    markerControl.after === 0 &&
+    markerControl.error === null &&
+    cleanupMarkerReadback.before === 0 &&
+    cleanupMarkerReadback.after === 0 &&
+    cleanupMarkerReadback.error === null &&
+    finalMarkerCleanup.after === 0 &&
+    finalMarkerCleanup.error === null &&
+    worktreeRemovalStatus === 0 &&
+    result.last_agent_message?.includes(`SYMPHONY_SMOKE_OK:${marker}`) === true &&
+    cleanupResult.last_agent_message?.includes(`SYMPHONY_SMOKE_CLEAN:${marker}`) === true;
+  addCheck(params.checks, {
+    id: 'claude.smoke',
+    title: 'Claude sandbox, GitHub, and Linear MCP live smoke',
+    status: ready ? 'ok' : 'failure',
+    reason: ready ? 'claude_smoke_ready' : 'claude_smoke_failed',
+    summary: ready
+      ? `Claude completed the supervised sandbox, GitHub, and Linear read/write/cleanup smoke for ${params.linearIssue}.`
+      : `Claude smoke failed with ${result.error_code ?? result.status}; observed ${linearToolCalls} Linear MCP tool call(s).`,
+    remediation: ready ? undefined : 'Inspect the Claude runner result and MCP scope, then rerun against the dedicated test issue.',
+    details: {
+      issueIdentifier: params.linearIssue,
+      runtime: result.runtime,
+      status: result.status,
+      errorCode: result.error_code ?? null,
+      sessionId: result.session_id,
+      linearToolCalls,
+      cleanupLinearToolCalls,
+      bashToolCalls,
+      gitSmokeVerified,
+      observedToolNames,
+      linearCreateObserved,
+      linearReadObserved,
+      markerControl,
+      cleanupMarkerReadback,
+      finalMarkerCleanup,
+      worktreeRemovalStatus,
+      cleanupStatus: cleanupResult?.status ?? 'not_run',
+      invocationError,
+      providerUsageStatus: result.provider_usage?.status ?? 'unobserved',
+      modelQuotaConsumed: true
+    }
   });
 }
 
@@ -2012,7 +3327,9 @@ export async function runLocalDoctor(options: RunLocalDoctorOptions): Promise<{
     });
   }
 
-  const args = 'error' in parsed ? { json: false, ci: false, fix: false, yes: false, resolverArgv: [] } : parsed;
+  const args = 'error' in parsed
+    ? { json: false, ci: false, fix: false, yes: false, claudeSmoke: false, linearIssue: null, resolverArgv: [] }
+    : parsed;
   const executablePath = findExecutableOnPath(deps.env);
   let shim: ShimMetadata | null = null;
 
@@ -2124,11 +3441,39 @@ export async function runLocalDoctor(options: RunLocalDoctorOptions): Promise<{
       addHookCommandReadinessCheck(checks, workflowValidation.effectiveConfig, dashboardEnv);
       if (workflowValidation.configValid) {
         if (workflowValidation.effectiveConfig.agent_runtime?.selected === 'claude-cli') {
-          addClaudeRuntimeChecks(checks, workflowValidation.effectiveConfig, dashboardEnv);
+          addClaudeRuntimeChecks(checks, workflowValidation.effectiveConfig, dashboardEnv, resolved.currentProjectRoot);
+          if (args.claudeSmoke && args.linearIssue) {
+            await addClaudeSmokeCheck({
+              checks,
+              effectiveConfig: workflowValidation.effectiveConfig,
+              env: dashboardEnv,
+              projectRoot: resolved.currentProjectRoot,
+              linearIssue: args.linearIssue
+            });
+          }
         } else {
           addCodexCommandCheck(checks, workflowValidation.effectiveConfig, dashboardEnv);
         }
         addWorkspaceChecks(checks, resolved, workflowValidation.effectiveConfig);
+        addManagedWorkspaceSensitiveFileCheck({
+          checks,
+          fixes,
+          effectiveConfig: workflowValidation.effectiveConfig,
+          projectRoot: resolved.currentProjectRoot,
+          fix: args.fix,
+          yes: args.yes,
+          ci: args.ci,
+          now: deps.clock()
+        });
+        addHistoryReconciliationCheck({
+          checks,
+          fixes,
+          effectiveConfig: workflowValidation.effectiveConfig,
+          projectRoot: resolved.currentProjectRoot,
+          fix: args.fix,
+          yes: args.yes,
+          ci: args.ci
+        });
       }
     }
     addCheck(checks, {

@@ -49,6 +49,7 @@ import {
 import {
   addRuntimeSecondsFromEntry as coordinateAddRuntimeSecondsFromEntry,
   completeRunRecord as coordinateCompleteRunRecord,
+  successfulWorkflowTerminationProjection,
   terminateRunningIssue as coordinateTerminateRunningIssue,
   type RunCompletionCoordinatorContext,
   workerTerminationAllowsRecovery as coordinateWorkerTerminationAllowsRecovery,
@@ -499,21 +500,23 @@ export class OrchestratorCore {
       });
     }
 
-    const liveCodexEntries = runningEntries.filter((entry) => Boolean(entry.codex_app_server_pid));
-    if (liveCodexEntries.length > 0) {
-      counts.live_codex_app_server_process = liveCodexEntries.length;
+    const liveAgentEntries = runningEntries.filter((entry) =>
+      Boolean(entry.worker_process_pid ?? entry.codex_app_server_pid)
+    );
+    if (liveAgentEntries.length > 0) {
+      counts.live_codex_app_server_process = liveAgentEntries.length;
       blockers.push({
         category: 'live_codex_app_server_process',
-        count: liveCodexEntries.length,
+        count: liveAgentEntries.length,
         detail:
-          liveCodexEntries.length === 1
-            ? `${liveCodexEntries[0].identifier} has a live Codex app-server process`
-            : `${liveCodexEntries.length} live Codex app-server processes are attached to active workers`,
-        issue_identifiers: liveCodexEntries.map((entry) => entry.identifier),
-        run_identifiers: liveCodexEntries.flatMap((entry) =>
+          liveAgentEntries.length === 1
+            ? `${liveAgentEntries[0].identifier} has a live agent runner process`
+            : `${liveAgentEntries.length} live agent runner processes are attached to active workers`,
+        issue_identifiers: liveAgentEntries.map((entry) => entry.identifier),
+        run_identifiers: liveAgentEntries.flatMap((entry) =>
           [entry.run_id, entry.issue_run_id, entry.attempt_id].filter((id): id is string => Boolean(id))
         ),
-        thread_identifiers: liveCodexEntries.map((entry) => entry.thread_id).filter((id): id is string => Boolean(id))
+        thread_identifiers: liveAgentEntries.map((entry) => entry.thread_id).filter((id): id is string => Boolean(id))
       });
     }
 
@@ -1118,6 +1121,9 @@ export class OrchestratorCore {
       logger: this.logger,
       nowMs: () => this.nowMs(),
       hooks: {
+        drainExecutionGraphPersistence: async (runningEntry) => {
+          await (this.executionGraphPersistenceQueues.get(runningEntry) ?? Promise.resolve()).catch(() => undefined);
+        },
         recordHistoryWriteFailure: (operation, reasonCode, error) =>
           this.recordHistoryWriteFailure(operation, reasonCode, error),
         persistExecutionGraphStateTransition: (runningEntry, toStatus, status, reasonCode, reasonDetail) =>
@@ -2408,6 +2414,7 @@ export class OrchestratorCore {
   private emitExplicitPhaseMarker(issue_id: string, workerEvent: WorkerObservabilityEvent): boolean {
     const running = this.state.running.get(issue_id);
     const markerBase = {
+      at_ms: workerEvent.timestamp_ms,
       detail: workerEvent.detail ?? null,
       attempt: running?.retry_attempt ?? 0,
       thread_id: workerEvent.thread_id ?? running?.thread_id ?? null,
@@ -2433,12 +2440,18 @@ export class OrchestratorCore {
   }
 
   private emitMappedPhaseMarker(issue_id: string, workerEvent: WorkerObservabilityEvent): void {
-    const mapped = this.mapPhaseForWorkerEvent(workerEvent.event);
+    const running = this.state.running.get(issue_id);
+    const mapped =
+      workerEvent.event === CANONICAL_EVENT.agentRunner.turnCancelled &&
+      running?.termination &&
+      successfulWorkflowTerminationProjection(running.termination.reason)
+        ? 'completed'
+        : this.mapPhaseForWorkerEvent(workerEvent.event);
     if (!mapped) {
       return;
     }
-    const running = this.state.running.get(issue_id);
     this.emitPhaseMarker(issue_id, {
+      at_ms: workerEvent.timestamp_ms,
       phase: mapped,
       detail: workerEvent.detail ?? null,
       attempt: running?.retry_attempt ?? 0,
@@ -2459,6 +2472,17 @@ export class OrchestratorCore {
         return 'implementation';
       case CANONICAL_EVENT.codex.turnCompleted:
         return 'validation';
+      case CANONICAL_EVENT.agentRunner.turnStarted:
+        return 'planning';
+      case CANONICAL_EVENT.agentRunner.activity:
+        return 'implementation';
+      case CANONICAL_EVENT.agentRunner.turnCompleted:
+        return 'completed';
+      case CANONICAL_EVENT.agentRunner.turnFailed:
+      case CANONICAL_EVENT.agentRunner.turnTimedOut:
+        return 'failed';
+      case CANONICAL_EVENT.agentRunner.turnCancelled:
+        return 'failed';
       case CANONICAL_EVENT.codex.turnFailed:
         return 'failed';
       case CANONICAL_EVENT.codex.turnInputRequired:
@@ -2471,6 +2495,7 @@ export class OrchestratorCore {
   private emitPhaseMarker(
     issue_id: string,
     marker: {
+      at_ms?: number;
       phase: PhaseMarkerName | string;
       detail: string | null;
       attempt: number;
@@ -2506,7 +2531,7 @@ export class OrchestratorCore {
       return;
     }
     const next: PhaseMarker = {
-      at_ms: this.nowMs(),
+      at_ms: marker.at_ms ?? this.nowMs(),
       phase: marker.phase,
       detail: marker.detail,
       attempt: marker.attempt,

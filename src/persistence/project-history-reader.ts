@@ -1,6 +1,7 @@
 import { sqlPlaceholders } from './sqlite-helpers';
 import { parseDurableIdentity } from './identity-projection-store';
 import type { PersistenceDatabase } from './store-context';
+import { hydrateTokenModelFact, type TokenModelFactDatabaseRecord } from './types';
 import type {
   AppServerEventLedgerRecord,
   AttemptRecord,
@@ -357,12 +358,12 @@ export class ProjectHistoryReader {
        ORDER BY blocked_at ASC, blocked_input_event_id ASC`,
       issueRunIds
     );
-    const tokenModelFacts = this.selectByIssueRunIds<TokenModelFactRecord>(
+    const tokenModelFacts = this.selectByIssueRunIds<TokenModelFactDatabaseRecord>(
       `SELECT * FROM history_token_model_fact
        WHERE issue_run_id IN (${sqlPlaceholders(issueRunIds)})
        ORDER BY observed_at ASC, token_model_fact_id ASC`,
       issueRunIds
-    );
+    ).map(hydrateTokenModelFact);
     const appServerEventRows = this.selectByIssueRunIds<
       Omit<AppServerEventLedgerRecord, 'summary_fields' | 'truncation' | 'full_payload_stored'> & {
         summary_fields: string;
@@ -433,8 +434,9 @@ export class ProjectHistoryReader {
       .all(identity.project.key, identity.ticket.key) as Array<Omit<IssueRunRecord, 'identity'> & { identity: string | null }>;
     const issueRunIds = issueRuns.map((run) => run.issue_run_id);
     const latestIssueRun = issueRuns.at(-1) ?? null;
-    const latestAttempt = this.latestSummaryAttempt(issueRunIds);
-    const latestOutcome = this.latestSummaryOutcome(issueRunIds);
+    const latestRunIds = latestIssueRun ? [latestIssueRun.issue_run_id] : [];
+    const latestAttempt = this.latestSummaryAttempt(latestRunIds);
+    const latestOutcome = this.latestSummaryOutcome(latestRunIds);
     const latestTrackerSnapshot = this.latestSummaryTrackerSnapshot(issueRunIds);
     const latestTransition = this.latestSummaryTransition(issueRunIds);
     const lastKnownStatus = latestTrackerSnapshot?.tracker_status ?? latestTransition?.to_status ?? latestIssueRun?.status ?? 'unknown';
@@ -586,7 +588,8 @@ export class ProjectHistoryReader {
         ? { count: 0, total_tokens: null as number | null }
         : (this.db
             .prepare(
-              `SELECT COUNT(*) AS count, SUM(total_tokens) AS total_tokens
+              `SELECT COUNT(*) AS count,
+                      SUM(CASE WHEN runtime_provider IS NULL OR runtime_provider != 'claude-cli' THEN total_tokens ELSE NULL END) AS total_tokens
                FROM history_token_model_fact
                WHERE issue_run_id IN (${sqlPlaceholders(issueRunIds)})`
             )

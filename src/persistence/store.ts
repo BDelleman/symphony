@@ -1,5 +1,7 @@
+import { REASON_CODES } from '../observability/reason-codes';
 import { redactUnknown } from '../security/redaction';
 import { AppServerLedgerStore } from './app-server-ledger-store';
+import { classifyPersistedWorkerOwnership, findLatestTerminalRunEventEvidence } from './execution-graph-reconciliation';
 import {
   ExecutionGraphWriter,
   type AppendDrainAuditHistoryParams,
@@ -8,6 +10,7 @@ import {
   type AppendIssueRunParams,
   type AppendOperatorActionHistoryParams,
   type AppendPhaseSpanParams,
+  type AppendProviderUsageStepFactParams,
   type AppendStateTransitionParams,
   type AppendThreadParams,
   type AppendTicketBlockerParams,
@@ -31,6 +34,7 @@ import { createPersistenceStoreContext, type PersistenceDatabase, type Persisten
 import type {
   AppServerEventLedgerRecord,
   BreakerMetadataRecord,
+  CompletedProviderUsageTotal,
   DurableRunHistoryRecord,
   DurableIdentity,
   DrainAuditEventRecord,
@@ -58,6 +62,7 @@ import type {
   TurnRecord,
   UiContinuityState
 } from './types';
+import { hydrateTokenModelFact, type TokenModelFactDatabaseRecord } from './types';
 
 interface PersistenceStoreOptions {
   dbPath: string;
@@ -73,6 +78,7 @@ function asIso(timestampMs: number): string {
 }
 
 export class SqlitePersistenceStore {
+  readonly completeRunIncludesTerminalEvidence = true;
   private readonly context: PersistenceStoreContext;
   private readonly dbPath: string;
   private readonly retentionDays: number;
@@ -179,6 +185,181 @@ export class SqlitePersistenceStore {
     return this.readHistorySchemaHealth();
   }
 
+  reconcileExecutionGraphAfterRestart(): { recovered: number; ambiguous: number } {
+    const rows = this.db
+      .prepare(
+        `SELECT issue_run.issue_run_id, issue_run.issue_id, issue_run.started_at,
+          runs.completed_at, runs.terminal_status, runs.terminal_reason_code, runs.terminal_reason_detail
+         FROM issue_run
+         LEFT JOIN runs ON runs.run_id = (
+           SELECT projected_run.run_id
+           FROM history_identity_projection
+           JOIN runs AS projected_run ON projected_run.run_id = history_identity_projection.source_id
+           WHERE history_identity_projection.source_table = 'runs'
+             AND history_identity_projection.issue_run_id = issue_run.issue_run_id
+           ORDER BY projected_run.started_at DESC, projected_run.run_id DESC
+           LIMIT 1
+         )
+         WHERE issue_run.ended_at IS NULL
+         ORDER BY issue_run.started_at ASC`
+      )
+      .all() as Array<{
+      issue_run_id: string;
+      issue_id: string;
+      started_at: string;
+      completed_at: string | null;
+      terminal_status: RunTerminalStatus | null;
+      terminal_reason_code: string | null;
+      terminal_reason_detail: string | null;
+    }>;
+    let recovered = 0;
+    let ambiguous = 0;
+    for (const row of rows) {
+      let recoveryAt = row.completed_at;
+      let recoveryStatus = row.terminal_status;
+      let recoveryDetail = 'Closed from the provably terminal parent run during startup reconciliation.';
+      if (!recoveryAt || !recoveryStatus) {
+        const terminalEvent = findLatestTerminalRunEventEvidence(this.db, row.issue_run_id, row.issue_id, row.started_at);
+        if (terminalEvent) {
+          recoveryAt = terminalEvent.at;
+          recoveryStatus = terminalEvent.status;
+          recoveryDetail = `Closed from terminal runner event ${terminalEvent.event} on run ${terminalEvent.run_id}.`;
+        }
+      }
+      if (!recoveryAt || !recoveryStatus) {
+        const supersedingRun = this.db
+          .prepare(
+            `SELECT issue_run_id, started_at
+             FROM issue_run
+             WHERE issue_id = ?
+               AND issue_run_id <> ?
+               AND started_at > ?
+               AND ended_at IS NOT NULL
+               AND status <> 'running'
+             ORDER BY started_at ASC
+             LIMIT 1`
+          )
+          .get(row.issue_id, row.issue_run_id, row.started_at) as
+          | { issue_run_id: string; started_at: string }
+          | undefined;
+        if (supersedingRun) {
+          recoveryAt = supersedingRun.started_at;
+          recoveryStatus = 'cancelled';
+          recoveryDetail = `Closed after later terminal issue run ${supersedingRun.issue_run_id} proved this run was superseded.`;
+        }
+      }
+      const workerOwners = this.db
+        .prepare(
+          `SELECT thread.worker_instance_id, thread.worker_process_pid
+           FROM thread
+           JOIN attempt ON attempt.attempt_id = thread.attempt_id
+           WHERE attempt.issue_run_id = ? AND thread.ended_at IS NULL`
+        )
+        .all(row.issue_run_id) as Array<{ worker_instance_id: string | null; worker_process_pid: number | null }>;
+      const workerOwnership = classifyPersistedWorkerOwnership(workerOwners);
+      if (workerOwnership === 'active_or_unknown') {
+        ambiguous += 1;
+        continue;
+      }
+      if (!recoveryAt || !recoveryStatus) {
+        if (workerOwnership !== 'inactive') {
+          ambiguous += 1;
+          continue;
+        }
+        recoveryAt = row.started_at;
+        recoveryStatus = 'failed';
+        recoveryDetail = 'Closed after the persisted worker process was confirmed absent during restart reconciliation.';
+      }
+      const latestGraphTimestamp = this.db
+        .prepare(
+          `SELECT MAX(value) AS latest FROM (
+             SELECT started_at AS value FROM issue_run WHERE issue_run_id = ?
+             UNION ALL SELECT started_at FROM attempt WHERE issue_run_id = ?
+             UNION ALL SELECT thread.started_at FROM thread JOIN attempt ON attempt.attempt_id = thread.attempt_id WHERE attempt.issue_run_id = ?
+             UNION ALL SELECT turn.started_at FROM turn JOIN thread ON thread.thread_id = turn.thread_id JOIN attempt ON attempt.attempt_id = thread.attempt_id WHERE attempt.issue_run_id = ?
+             UNION ALL SELECT phase_span.started_at FROM phase_span JOIN turn ON turn.turn_id = phase_span.turn_id JOIN thread ON thread.thread_id = turn.thread_id JOIN attempt ON attempt.attempt_id = thread.attempt_id WHERE attempt.issue_run_id = ?
+             UNION ALL SELECT tool_span.started_at FROM tool_span JOIN turn ON turn.turn_id = tool_span.turn_id JOIN thread ON thread.thread_id = turn.thread_id JOIN attempt ON attempt.attempt_id = thread.attempt_id WHERE attempt.issue_run_id = ?
+             UNION ALL SELECT transitioned_at FROM state_transition WHERE issue_run_id = ?
+           )`
+        )
+        .get(
+          row.issue_run_id,
+          row.issue_run_id,
+          row.issue_run_id,
+          row.issue_run_id,
+          row.issue_run_id,
+          row.issue_run_id,
+          row.issue_run_id
+        ) as
+        | { latest: string | null }
+        | undefined;
+      const endedAt = [recoveryAt, row.started_at, latestGraphTimestamp?.latest ?? row.started_at].sort().at(-1)!;
+      const attempts = this.db
+        .prepare('SELECT attempt_id, started_at FROM attempt WHERE issue_run_id = ? AND ended_at IS NULL ORDER BY attempt_number ASC')
+        .all(row.issue_run_id) as Array<{ attempt_id: string; started_at: string }>;
+      this.transaction(() => {
+        for (const attempt of attempts) {
+          const attemptEndedAt = endedAt < attempt.started_at ? attempt.started_at : endedAt;
+          this.executionGraphWriter.appendStateTransition({
+            issue_run_id: row.issue_run_id,
+            attempt_id: attempt.attempt_id,
+            from_status: 'running',
+            to_status: recoveryStatus,
+            transitioned_at: attemptEndedAt,
+            status: recoveryStatus,
+            reason_code: REASON_CODES.recoveredAfterRestart,
+            reason_detail: recoveryDetail
+          });
+          this.executionGraphWriter.completeAttemptRow({
+            attempt_id: attempt.attempt_id,
+            ended_at: attemptEndedAt,
+            status: recoveryStatus,
+            process_status: recoveryStatus,
+            workflow_outcome: recoveryStatus,
+            reason_code: REASON_CODES.recoveredAfterRestart,
+            reason_detail: recoveryDetail
+          });
+        }
+        this.executionGraphWriter.completeIssueRunRow({
+          issue_run_id: row.issue_run_id,
+          ended_at: endedAt,
+          status: recoveryStatus,
+          process_status: recoveryStatus,
+          workflow_outcome: recoveryStatus,
+          reason_code: REASON_CODES.recoveredAfterRestart,
+          reason_detail: recoveryDetail
+        });
+      });
+      recovered += 1;
+    }
+    if (ambiguous > 0) {
+      this.recordHistorySchemaState({
+        appliedVersion: this.readHistorySchemaHealth().applied_version,
+        status: 'degraded',
+        degradedReasonCode: 'history_orphan_reconciliation_ambiguous',
+        degradedDetail: `${ambiguous} active issue run(s) have ambiguous parent or worker ownership.`
+      });
+      this.recordHistoryHealthMetadata(
+        'degraded',
+        'history_orphan_reconciliation_ambiguous',
+        `${ambiguous} active issue run(s) have ambiguous parent or worker ownership.`
+      );
+    } else if (
+      ['history_orphan_reconciliation_ambiguous', 'history_write_failed'].includes(
+        this.readHistorySchemaHealth().degraded_reason_code ?? ''
+      )
+    ) {
+      this.recordHistorySchemaState({
+        appliedVersion: this.readHistorySchemaHealth().applied_version,
+        status: 'healthy',
+        degradedReasonCode: null,
+        degradedDetail: null
+      });
+      this.recordHistoryHealthMetadata('healthy', null, null);
+    }
+    return { recovered, ambiguous };
+  }
+
   recordHistoryWriteFailure(params: { operation: string; reason_code: string; detail?: string | null }): void {
     const recordedAt = asIso(this.nowMs());
     const detail = redactUnknown(params.detail ?? null) as string | null;
@@ -209,7 +390,13 @@ export class SqlitePersistenceStore {
       .all(limit) as HistoryWriteFailureRecord[];
   }
 
-  startRun(params: { issue_id: string; issue_identifier: string; identity: DurableIdentity; started_at?: string }): string {
+  startRun(params: {
+    issue_id: string;
+    issue_identifier: string;
+    identity: DurableIdentity;
+    started_at?: string;
+    issue_run_id?: string | null;
+  }): string {
     return this.runHistoryStore.startRun(params);
   }
 
@@ -335,6 +522,10 @@ export class SqlitePersistenceStore {
     return this.executionGraphWriter.appendTokenModelFact(params);
   }
 
+  appendProviderUsageStepFact(params: AppendProviderUsageStepFactParams): string {
+    return this.executionGraphWriter.appendProviderUsageStepFact(params);
+  }
+
   reconstructThreadLineage(threadId: string): ExecutionGraphThreadLineage | null {
     const thread = this.db.prepare('SELECT * FROM thread WHERE thread_id = ?').get(threadId) as ThreadRecord | undefined;
     if (!thread) {
@@ -357,13 +548,13 @@ export class SqlitePersistenceStore {
     const turns = this.db
       .prepare('SELECT * FROM turn WHERE thread_id = ? ORDER BY turn_index ASC, started_at ASC')
       .all(threadId) as TurnRecord[];
-    const tokenModelFacts = this.db
+    const tokenModelFacts = (this.db
       .prepare(
         `SELECT * FROM history_token_model_fact
          WHERE issue_run_id = ?
          ORDER BY observed_at ASC, token_model_fact_id ASC`
       )
-      .all(issueRun.issue_run_id) as TokenModelFactRecord[];
+      .all(issueRun.issue_run_id) as TokenModelFactDatabaseRecord[]).map(hydrateTokenModelFact);
 
     return {
       issue_run: issueRun,
@@ -444,6 +635,10 @@ export class SqlitePersistenceStore {
 
   listRunHistory(limit = 50): DurableRunHistoryRecord[] {
     return this.runHistoryStore.listRunHistory(limit);
+  }
+
+  listCompletedProviderUsageTotals(excludeIssueRunIds: string[] = []): CompletedProviderUsageTotal[] {
+    return this.runHistoryStore.listCompletedProviderUsageTotals(excludeIssueRunIds);
   }
 
   private recordHistoryHealthMetadata(status: 'healthy' | 'degraded', reasonCode: string | null, detail: string | null): void {

@@ -4,7 +4,7 @@ import { state } from './state';
 import { setRefreshStatus } from './connection';
 import { createActionButton, copyText, formatDiagnosticSummary, formatInputDecisionContext, getDiagnosticSummary, createOperatorHintBadge, createProvisioningBadge, createStateBadge, loadIssue } from './issue-detail';
 import { cancelBlockedIssue, resumeBlockedIssue, runOperatorAction, submitBlockedInput } from './operator-actions';
-import { createBlockedRootCauseBlock, createBudgetBlock, formatDate, formatDurationFromIso, formatDurationFromMs, formatElapsedMs, formatNumber, formatTokenBreakdown, getActionRequiredLabel, getProgressSignalLabel, getRetryStateLabel, getTokenConfidenceLabel, getTurnControlLabel } from './formatting';
+import { createBlockedRootCauseBlock, createBudgetBlock, formatDate, formatDurationFromIso, formatDurationFromMs, formatElapsedMs, formatNumber, formatProviderUsage, formatTokenBreakdown, getActionRequiredLabel, getProgressSignalLabel, getRetryStateLabel, getTokenConfidenceLabel, getTurnControlLabel } from './formatting';
 
 export function rowMatchesFilter(entry: any) {
     if (state.filter.status === 'running' && entry.state.toLowerCase().includes('retry')) {
@@ -82,6 +82,48 @@ export function renderRunning(payload: any) {
       if (runningHintBadge && entry.operator_explainer_hint.actionability !== 'none') {
         stateFlags.append(runningHintBadge);
       }
+      if (entry.quarantined_event_count > 0) {
+        const quarantineBadge = document.createElement('span');
+        quarantineBadge.className = 'status-pill failed';
+        quarantineBadge.textContent = 'Quarantined events ' + formatNumber(entry.quarantined_event_count);
+        stateFlags.append(quarantineBadge);
+      }
+      if (
+        entry.model_reroute ||
+        (entry.provider_usage && Array.isArray(entry.provider_usage.effective_models) &&
+          entry.provider_usage.effective_models.some((model: string) => model !== entry.requested_model))
+      ) {
+        const rerouteBadge = document.createElement('span');
+        rerouteBadge.className = 'status-pill pending';
+        rerouteBadge.textContent = 'Model rerouted';
+        stateFlags.append(rerouteBadge);
+      }
+      if (entry.provider_usage && entry.provider_usage.nested_session_detected) {
+        const nestedBadge = document.createElement('span');
+        nestedBadge.className = 'status-pill failed';
+        nestedBadge.textContent = 'Nested provider detected';
+        stateFlags.append(nestedBadge);
+      }
+      if (entry.provider_usage && (entry.provider_usage.permission_denial_count > 0 || entry.provider_usage.unknown_event_count > 0)) {
+        const protocolBadge = document.createElement('span');
+        protocolBadge.className = 'status-pill pending';
+        protocolBadge.textContent =
+          'Provider warnings ' +
+          formatNumber((entry.provider_usage.permission_denial_count || 0) + (entry.provider_usage.unknown_event_count || 0));
+        stateFlags.append(protocolBadge);
+      }
+      if (entry.provider_usage && (entry.provider_usage.status === 'partial' || entry.provider_usage.status === 'unobserved')) {
+        const coverageBadge = document.createElement('span');
+        coverageBadge.className = 'status-pill pending';
+        coverageBadge.textContent = entry.provider_usage.status === 'partial' ? 'Live provider usage lower bound' : 'Provider usage missing';
+        stateFlags.append(coverageBadge);
+      }
+      if (entry.provider_usage && entry.provider_usage.supervised_session_coverage !== 'complete') {
+        const coverageBadge = document.createElement('span');
+        coverageBadge.className = 'status-pill pending';
+        coverageBadge.textContent = 'Session coverage ' + (entry.provider_usage.supervised_session_coverage || 'missing');
+        stateFlags.append(coverageBadge);
+      }
       if (stateFlags.children.length > 0) {
         stateCell.append(stateFlags);
       }
@@ -92,6 +134,12 @@ export function renderRunning(payload: any) {
       const sessionMeta = document.createElement('div');
       sessionMeta.className = 'muted';
       const sessionMetaParts = [];
+      sessionMetaParts.push('Runtime ' + (entry.agent_runtime || 'codex-app-server'));
+      if (entry.requested_model) sessionMetaParts.push('Requested ' + entry.requested_model);
+      if (entry.effective_model) sessionMetaParts.push('Effective ' + entry.effective_model);
+      if (entry.worker_process_pid) sessionMetaParts.push('PID ' + entry.worker_process_pid);
+      if (entry.thread_id) sessionMetaParts.push('Thread ' + entry.thread_id);
+      if (entry.turn_id) sessionMetaParts.push('Turn ' + entry.turn_id);
       if (entry.worker_host) {
         sessionMetaParts.push('Host ' + entry.worker_host);
       }
@@ -127,11 +175,11 @@ export function renderRunning(payload: any) {
       const threadActivity = entry.codex_thread_activity || null;
       if (threadActivity && threadActivity.updated_at) {
         const threadStatus = threadActivity.thread_status ? ' • ' + threadActivity.thread_status : '';
-        threadActivityMeta.textContent = 'Codex thread active ' + formatDurationFromIso(threadActivity.updated_at) + ' ago' + threadStatus;
+        threadActivityMeta.textContent = 'Agent session active ' + formatDurationFromIso(threadActivity.updated_at) + ' ago' + threadStatus;
       } else if (entry.thread_id) {
-        threadActivityMeta.textContent = 'Codex thread activity unavailable';
+        threadActivityMeta.textContent = 'Agent session activity unavailable';
       } else {
-        threadActivityMeta.textContent = 'Codex thread n/a';
+        threadActivityMeta.textContent = 'Agent session n/a';
       }
       phaseCell.append(phaseLabel, phaseMeta, threadActivityMeta);
 
@@ -159,9 +207,32 @@ export function renderRunning(payload: any) {
       }
 
       const turnsCell = document.createElement('td');
-      turnsCell.textContent = formatNumber(entry.turn_count);
+      turnsCell.textContent = 'Outer ' + formatNumber(entry.turn_count);
+      if (entry.provider_usage) {
+        const providerTurns = document.createElement('div');
+        providerTurns.className = 'muted';
+        providerTurns.textContent = 'Provider ' + (typeof entry.provider_usage.provider_turn_count === 'number'
+          ? formatNumber(entry.provider_usage.provider_turn_count)
+          : 'n/a');
+        turnsCell.append(providerTurns);
+      }
 
       const tokensCell = document.createElement('td');
+      if (entry.agent_runtime === 'claude-cli') {
+        const providerTitle = document.createElement('div');
+        providerTitle.textContent = 'Provider usage';
+        const providerBadge = document.createElement('span');
+        const providerStatus = entry.provider_usage && entry.provider_usage.status;
+        providerBadge.className = 'mini-badge ' + (providerStatus === 'final' ? 'mini-badge-good' : providerStatus === 'unobserved' ? 'mini-badge-bad' : '');
+        providerBadge.textContent = providerStatus || 'unobserved';
+        const providerDetail = document.createElement('div');
+        providerDetail.className = 'muted';
+        providerDetail.textContent = formatProviderUsage(entry.provider_usage);
+        const enforcement = document.createElement('div');
+        enforcement.className = 'muted';
+        enforcement.textContent = 'Telemetry only • no Symphony token or cost enforcement';
+        tokensCell.append(providerTitle, providerBadge, providerDetail, enforcement);
+      } else {
       const tokenTotal = document.createElement('div');
       const telemetryStatus = entry.token_telemetry_status || 'unavailable';
       const telemetryConfidence = entry.token_telemetry_confidence || (telemetryStatus === 'available' ? 'observed_live' : 'missing');
@@ -185,6 +256,7 @@ export function renderRunning(payload: any) {
       tokenBadge.textContent = getTokenConfidenceLabel(telemetryConfidence);
       tokensCell.append(tokenTotal, tokenBadge, tokenDetail);
       tokensCell.append(createBudgetBlock(entry));
+      }
 
       const blockerCell = document.createElement('td');
       const blockerValue = document.createElement('div');

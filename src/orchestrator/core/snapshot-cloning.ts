@@ -109,6 +109,7 @@ export function cloneRunningEntry(entry: RunningEntry, options: Required<StateSn
     last_reported_tokens: { ...entry.last_reported_tokens },
     persisted_turn_ids: [...(entry.persisted_turn_ids ?? [])],
     pending_persisted_turn_ids: [...(entry.pending_persisted_turn_ids ?? [])],
+    execution_graph_turn_indices: { ...(entry.execution_graph_turn_indices ?? {}) },
     recent_events: entry.recent_events.map((event) => ({ ...event })),
     quarantined_events: (entry.quarantined_events ?? []).map((event) => ({ ...event })),
     quarantined_event_count: entry.quarantined_event_count ?? 0,

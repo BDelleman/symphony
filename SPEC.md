@@ -222,7 +222,9 @@ Fields:
 - `session_id` (string, `<thread_id>-<turn_id>`)
 - `thread_id` (string)
 - `turn_id` (string)
-- `codex_app_server_pid` (string or null)
+- `agent_runtime` (`codex-app-server` or `claude-cli`)
+- `worker_process_pid` (string or null)
+- `codex_app_server_pid` (string or null, retained for compatibility)
 - `last_codex_event` (string/enum or null)
 - `last_codex_timestamp` (timestamp or null)
 - `last_codex_message` (summarized payload)
@@ -234,6 +236,10 @@ Fields:
 - `last_reported_total_tokens` (integer)
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
+- `provider_usage` (provider-neutral snapshot or null)
+  - Separately reports provider-native input, output, cache-read, and cache-creation tokens; provider
+    turns; effective models; retries; and terminal estimated cost.
+  - Missing data remains null and is never converted to zero.
 
 #### 4.1.7 Retry Entry
 
@@ -946,7 +952,7 @@ Invariant 3: Workspace key is sanitized.
 
 ### 9.6 Workspace Provisioning Boundary
 
-The Workspace Manager owns filesystem workspace and Git worktree creation. The
+The Workspace Manager owns filesystem workspace and Git worktree/clone creation. The
 Codex Runner must receive an already-provisioned workspace path and must validate
 that path before launching the Codex App Server locally or remotely.
 
@@ -1245,12 +1251,44 @@ identity, stream EOF, and process close. The supported CLI version is pinned to
 `2.1.224`; upgrades require fixture and live contract evidence.
 
 The fixed command contract is `--print --input-format text --output-format
-stream-json --verbose --setting-sources user --model <pinned-model>
---dangerously-skip-permissions`, plus exact `--resume <uuid>` only for later
-outer-loop turns in the same worker attempt. The adapter does not accept tool,
-turn, budget, bare-mode, fallback, or arbitrary extra flags. Prompts and
-protocol lines are limited to 8 MiB. `DISABLE_AUTOUPDATER=1` and
-`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` are injected into every child.
+stream-json --verbose --setting-sources user --settings <generated-file>
+--mcp-config <generated-mcp-file> --strict-mcp-config --model <pinned-model>
+--permission-mode acceptEdits`, plus exact `--resume
+<uuid>` only for later outer-loop turns in the same worker attempt. The adapter
+does not accept tool, turn, budget, bare-mode, fallback, permission-bypass, or
+arbitrary extra flags. Prompts and protocol lines are limited to 8 MiB.
+`DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` are injected into
+every child.
+
+The generated settings file lives outside the worktree in a read-only policy
+directory separate from Claude's writable invocation temp directory and enables Claude's OS
+sandbox with fail-closed startup, no unsandboxed retry, sandboxed Bash automatic
+approval, and filesystem writes restricted to the workspace clone and invocation temp
+directory. It denies dotenv, parent-project credentials, auth stores, private
+keys, and the Claude installation. Network access uses exact validated hosts;
+wildcards, URLs, paths, broad Unix socket access, Apple Events, weaker network
+isolation, hooks, enabled plugins, custom agents, and executable user
+configuration are rejected. Host-managed Claude policy sources are rejected in
+the MVP because their effective merge cannot be attested. Production children receive a fixed non-credential
+environment allowlist, and every non-empty user-settings `env` entry is rejected.
+Strict allowlisting applies to sandboxed commands,
+and built-in WebFetch/WebSearch are denied so they cannot bypass the sandbox
+proxy; approved MCP servers remain separately trusted. Loopback egress and local
+binding are denied so the agent cannot call Symphony's unauthenticated local
+operator API. An SSH agent socket is inherited only for an actual SSH
+origin whose exact host is allowed, after realpath, socket ownership, and a
+stable hash of the loaded SSH identities; HTTPS origins never inherit it. Direct nested Claude execution is a
+non-retryable containment failure. The runner tracks provider descendants and
+terminates the process group after every outcome. Descendant escape is a
+non-retryable health failure and blocks broader rollout.
+
+The runtime validates user settings immediately before every invocation and
+binds their hash, sandbox policy, executable, version, model, workspace, OS
+user, issue, attempt, allowed MCP inventory, and sanitized init capability,
+instruction, and skill hashes, canonical credential-redacted Git origin, and
+SSH identity-set hash to the attempt-local session. Disconnected MCP
+entries are not part of the active capability fingerprint. Resume fails closed
+when any binding changes.
 
 By default, doctor and runtime require first-party Claude Team/Enterprise
 subscription authentication and reject API key, token, base URL,
@@ -1259,10 +1297,36 @@ the explicit `SYMPHONY_CLAUDE_ALLOW_NON_SUBSCRIPTION_AUTH=true` override.
 Authentication diagnostics retain only login status, auth method, API provider,
 and subscription type.
 
+`linear-server` is the default required and approved connected MCP server and
+must be configured at user scope with the exact `https://mcp.linear.app/mcp`
+HTTP endpoint and no inline command, environment, or header credentials. A
+same-name local override is rejected. The runner materializes only validated
+approved server definitions in its generated MCP file; strict MCP mode prevents
+other user entries from entering the model tool surface. Ordinary doctor checks
+are non-mutating and verify the exact Git remote plus host-side GitHub CLI route;
+an explicit Claude smoke command uses a disposable independent clone, may
+consume model quota, proves edit/commit/dry-run-push, npm/GitHub access, and
+sandbox denials, and makes one
+reversible change to a dedicated Linear test issue using the exact runtime argv
+and settings. The parent tracker control plane independently proves and removes
+the marker; a second fresh invocation verifies cleanup before the clone is removed.
+
+The protocol state machine requires exactly one authoritative init and one
+primary result; auxiliary task-notification and prompt-suggestion results are
+counted separately. It drains trailing events through EOF and process close.
+Assistant usage steps are deduplicated by `(session_id, message.id)` using
+component-wise maxima, producing live partial usage. Terminal result totals,
+per-model usage, turn count, and estimated cost are authoritative for one
+invocation and are reconciled against partial steps. Error, cancellation,
+timeout, crash, and missing-result paths retain the last available usage; a
+terminal result received during cancellation grace may finalize telemetry but
+never overwrite the already committed process/workflow outcome.
+
 Claude token, turn, cache, effective-model, and estimated-cost values are
-passive provider telemetry. They must never populate Codex enforcement totals
-or activate budget enforcement. Prompts, raw NDJSON, tool payloads, raw stderr,
-and reconstructed transcripts are not persisted. Configuration and protocol
+passive provider telemetry. They never populate Codex enforcement totals or
+activate budget enforcement. Prompts, assistant text, raw NDJSON, tool payloads,
+raw stderr, and reconstructed transcripts are not persisted. Configuration,
+protocol, sandbox, credential, MCP, model, session, and nested-runtime
 violations fail without retry; provider rate limits, overloads, transient
 network/server failures, crashes, and absolute timeouts remain eligible for the
 existing bounded Symphony retry policy. No cross-runtime fallback or
@@ -1356,6 +1420,13 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
   the agent toolchain rather than orchestrator business logic, and should be
   treated as exceptional for GraphQL-only Linear operations rather than the
   normal progress path.
+
+For workflows that use a Human Review handoff convention, the workflow prompt must refresh tracker
+labels/state at Agent Review start, immediately before entering Merging, and immediately before the
+merge. Each merge preflight must also re-read the current PR head SHA, checks, review decision, and
+exact-head approval. Observing Human Review at any preflight stops automation and leaves the issue
+unchanged. These checks narrow races but are an operational convention, not an authorization
+boundary, while the agent retains merge-capable credentials.
 
 ## 12. Prompt Construction and Context Assembly
 
@@ -1451,7 +1522,7 @@ correctness.
 
 ### 13.5 Session Metrics and Token Accounting
 
-Token accounting rules:
+Codex enforcement token accounting rules:
 
 - Agent events may include token counts in multiple payload shapes.
 - Prefer absolute thread totals when available, such as:
@@ -1464,6 +1535,50 @@ Token accounting rules:
 - Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
   way.
 - Accumulate aggregate totals in orchestrator state.
+
+Provider usage rules:
+
+- Expose a separate `provider_usage` snapshot for the active turn with runtime, status
+  (`awaiting`, `partial`, `final`, or `unobserved`), confidence, requested/effective models, four
+  provider token categories, provider turns, retry count, bounded tool/MCP name counts, update
+  timestamp, missing reason, nested-session detection, and supervised-session coverage.
+- Group durable `provider_totals` by runtime, positively observed effective model, ticket phase,
+  and invocation. Completed retained history remains in overview totals after a
+  worker leaves running state. When one invocation uses multiple models and the
+  provider does not allocate turns by model, expose those turns under a null
+  model instead of dropping or guessing their allocation. Do not create
+  zero-token reroute rows.
+- Keep partial cost null. A terminal provider estimate is not billed cost and must be labelled as
+  an estimate.
+- Do not expose a combined billing-equivalent token total for Claude; input, output, cache-read, and
+  cache-creation categories remain distinct.
+- Preserve null for unavailable values. A UI must distinguish awaiting, delayed partial, final, and
+  missing telemetry rather than rendering missing data as zero.
+- Claude provider usage never updates `codex_totals`, Codex throughput projection, or budget-stop
+  logic.
+
+Durable provider history uses idempotent normalized facts: one deduplicated assistant-step fact per
+message ID hash and one terminal invocation fact with authoritative totals, provider turns, result
+classification, estimated cost, retries, and positive per-model usage. It does not retain prompts,
+assistant text, tool arguments/results, raw streams, hooks, or stderr. When terminal usage is absent,
+the latest accumulated partial snapshot is projected with reduced confidence.
+
+Execution history writes preserve dependency order (issue run, attempt, session/thread, turn,
+then facts and transitions) and close descendants before parents. Pre-init
+process/turn events do not reserve a turn before a thread exists, and the
+per-worker persistence queue is drained before run closure. Related graph writes are
+transactional. Startup reconciliation closes only orphans whose absent worker and terminal parent
+outcome prove recovery is safe; ambiguous active records remain unchanged and degrade history
+health. Thread lineage retains the provider session, runtime, worker instance, and process PID.
+Ordinary doctor audits this state read-only; `doctor --fix --yes` closes only the provably terminal,
+process-absent subset and refuses ambiguous ownership. Generic runner completion
+does not fabricate a validation phase when the provider supplied no phase
+signal. History-write degradation is
+operator-visible and blocks release canaries.
+
+`process_status` and `workflow_outcome` are separate. For example, reaching Agent Review may cancel
+the provider process while recording `workflow_outcome=handoff_reached`; legacy terminal status
+continues to follow the workflow outcome.
 
 Runtime accounting:
 
@@ -1761,6 +1876,13 @@ Mandatory:
 - Workspace path must remain under configured workspace root.
 - Coding-agent cwd must be the per-issue workspace path for the current run.
 - Workspace directory names must use sanitized identifiers.
+- Managed worktrees must be audited before execution and at startup for dotenv files, agent/auth
+  stores, package-manager auth, cloud credentials, SSH private keys, and private-key material.
+- Optional ignored-file population must hard-deny those paths even when an include or allow pattern
+  explicitly selects them.
+- Remediation must be explicit and recoverable: `doctor --fix --yes` may move violations to
+  metadata-recorded quarantine outside the managed workspace root; ordinary doctor remains
+  non-mutating.
 
 Recommended additional hardening for ports:
 
@@ -1773,6 +1895,8 @@ Recommended additional hardening for ports:
 - Support `$VAR` indirection in workflow config.
 - Do not log API tokens or secret env values.
 - Validate presence of secrets without printing them.
+- Credential diagnostics report variable names and path/category/mode metadata only, never values or
+  file contents.
 
 ### 15.4 Hook Script Safety
 
@@ -2149,6 +2273,15 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
+- Sensitive ignored artifacts remain denied even through explicit include/allow patterns
+- Canonical tracked dotenv templates (`.env.example`, `.env.sample`, and
+  `.env.template`) are not treated as credentials, while real dotenv files,
+  `.pnpmrc`, auth stores, and key material remain denied
+- Source or managed-worktree symlinks that escape the audited root, are broken,
+  or resolve to sensitive material fail closed
+- Managed worktree credential-file findings expose metadata only and block agent launch
+- Explicit doctor repair uses a precommitted metadata-only move journal and
+  recoverable quarantine outside the managed workspace root
 
 ### 17.3 Issue Tracker Client
 
@@ -2209,6 +2342,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
   - invalid arguments, missing auth, and transport failures return structured failure payloads
   - unsupported tool names still fail without stalling the session
+- If the Claude CLI adapter is implemented:
+  - fixed shell-free argv, stdin prompt delivery, pinned version, and strict sandbox settings are
+    enforced
+  - unavailable sandboxing, unsandboxed retries, sensitive reads, unapproved hosts/MCPs, unsafe
+    user settings, configuration drift, and nested Claude execution fail closed
+  - init/result identity, trailing auxiliary events, malformed/oversized protocol data, split UTF-8,
+    error-result usage, cancellation races, and process-group cleanup are covered
+  - repeated assistant IDs use component-wise maximum usage; terminal totals reconcile against
+    invocation-local partial steps; resumed invocations reset partial accumulation
+  - exact attempt-local resume preserves session, workspace, model, sandbox, user-setting, and active
+    capability bindings
 
 ### 17.6 Observability
 
@@ -2220,6 +2364,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   not affect correctness
 - If humanized event summaries are implemented, they cover key wrapper/agent event classes without
   changing orchestrator behavior
+- Provider-native partial/final/missing usage remains separate from Codex enforcement totals
+- API and dashboard preserve null versus zero, expose runtime/process/session/turn lineage, and show
+  history, quarantine, protocol, reroute, nested-session, and coverage warnings
+- Provider step and terminal facts are idempotent; graph writes preserve dependency order; startup
+  reconciliation repairs only provable orphans and surfaces ambiguous records as degraded health
 
 ### 17.7 CLI and Host Lifecycle
 
