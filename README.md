@@ -12,7 +12,8 @@ implements the base contract in `SPEC.md` plus documented local extensions in
 
 ## Current Status
 
-- Core implementation and parity hardening phases are merged on `main`.
+- Core implementation and parity hardening phases are merged on `main`; Codex
+  remains the default agent runtime and the local Claude CLI runtime is opt-in.
 - Canonical requirements and governance evidence live in `SPEC.md`, `SPEC.ext.md`,
   and `docs/prd/`.
 
