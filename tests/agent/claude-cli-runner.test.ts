@@ -27,7 +27,6 @@ function createFixture(): {
   settingsFile: string;
   mcpFile: string;
   envFile: string;
-  nestedCommand: string;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-runner-'));
   const command = path.join(root, 'claude');
@@ -36,9 +35,6 @@ function createFixture(): {
   const settingsFile = path.join(root, 'settings.json');
   const mcpFile = path.join(root, 'mcp.json');
   const envFile = path.join(root, 'env.json');
-  const nestedCommand = path.join(root, 'nested', 'claude');
-  fs.mkdirSync(path.dirname(nestedCommand), { recursive: true });
-  fs.writeFileSync(nestedCommand, '#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n', { mode: 0o755 });
   fs.writeFileSync(
     command,
     `#!/usr/bin/env node
@@ -101,7 +97,10 @@ process.stdin.on('end', () => {
   }
   if (process.env.MOCK_MODE === 'nested-process') {
     const { spawn } = require('node:child_process');
-    spawn(process.env.MOCK_NESTED_CLAUDE, [], { stdio: 'ignore' });
+    spawn(process.env.MOCK_NESTED_CLAUDE, [], {
+      stdio: 'ignore',
+      env: { ...process.env, MOCK_MODE: 'hang' }
+    });
     setInterval(() => {}, 1000);
     return;
   }
@@ -188,7 +187,7 @@ process.exit(1);
 `,
     { mode: 0o755 }
   );
-  return { root, command, argsFile, promptFile, settingsFile, mcpFile, envFile, nestedCommand };
+  return { root, command, argsFile, promptFile, settingsFile, mcpFile, envFile };
 }
 
 function fixtureEnv(fixture: ReturnType<typeof createFixture>, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
@@ -201,7 +200,7 @@ function fixtureEnv(fixture: ReturnType<typeof createFixture>, extra: NodeJS.Pro
     MOCK_SETTINGS_FILE: fixture.settingsFile,
     MOCK_MCP_FILE: fixture.mcpFile,
     MOCK_ENV_FILE: fixture.envFile,
-    MOCK_NESTED_CLAUDE: fixture.nestedCommand,
+    MOCK_NESTED_CLAUDE: fixture.command,
     ...extra
   };
 }

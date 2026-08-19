@@ -1214,7 +1214,14 @@ function descendantProcessRows(rootPid: number | undefined, rows = readProcessRo
 
 function findNestedClaudeDescendant(rootPid: number | undefined, executable: string, rows = readProcessRows()): number | null {
   if (!rootPid) return null;
-  const executableName = path.basename(executable);
+  const resolvesToExecutable = (candidate: string): boolean => {
+    if (!path.isAbsolute(candidate)) return false;
+    try {
+      return fs.realpathSync(candidate) === executable;
+    } catch {
+      return false;
+    }
+  };
   for (const row of descendantProcessRows(rootPid, rows)) {
     if (process.platform === 'linux') {
       try {
@@ -1223,11 +1230,8 @@ function findNestedClaudeDescendant(rootPid: number | undefined, executable: str
         // The process may have exited between ps and /proc inspection.
       }
     }
-    const argv = row.args.trim().split(/\s+/).slice(0, 3);
-    if (
-      path.basename(row.command) === executableName ||
-      argv.some((value, index) => index < 2 && path.basename(value) === executableName)
-    ) {
+    const argv = row.args.trim().split(/\s+/).slice(0, 2);
+    if (resolvesToExecutable(row.command) || argv.some(resolvesToExecutable)) {
       return row.pid;
     }
   }
