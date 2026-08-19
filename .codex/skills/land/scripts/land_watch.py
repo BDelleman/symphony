@@ -4,9 +4,12 @@
 # ///
 
 import asyncio
+import argparse
 import json
+import os
 import random
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -21,6 +24,22 @@ CODEX_BOTS = {
 }
 MAX_GH_RETRIES = 5
 BASE_GH_BACKOFF_SECONDS = 2
+DEFAULT_TIMEOUT_SECONDS = 1800
+IMPLEMENTATION_REQUIRED_CHECKS = ("Fast validation (ubuntu-latest)",)
+LANDING_REQUIRED_CHECKS = (
+    "Fast validation (ubuntu-latest)",
+    "Integration validation (ubuntu-latest)",
+    "Windows install and build (windows-latest)",
+)
+
+
+@dataclass
+class WatchOptions:
+    mode: str
+    expected_head: str | None
+    expected_base: str | None
+    json_output: bool
+    timeout_seconds: int
 
 
 @dataclass
@@ -28,6 +47,9 @@ class PrInfo:
     number: int
     url: str
     head_sha: str
+    base_sha: str
+    state: str
+    is_draft: bool
     mergeable: str | None
     merge_state: str | None
 
@@ -71,13 +93,16 @@ async def get_pr_info() -> PrInfo:
         "pr",
         "view",
         "--json",
-        "number,url,headRefOid,mergeable,mergeStateStatus",
+        "number,url,headRefOid,baseRefOid,state,isDraft,mergeable,mergeStateStatus",
     )
     parsed = json.loads(data)
     return PrInfo(
         number=parsed["number"],
         url=parsed["url"],
         head_sha=parsed["headRefOid"],
+        base_sha=parsed["baseRefOid"],
+        state=parsed["state"],
+        is_draft=bool(parsed["isDraft"]),
         mergeable=parsed.get("mergeable"),
         merge_state=parsed.get("mergeStateStatus"),
     )
@@ -202,21 +227,25 @@ def dedupe_check_runs(check_runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(latest_by_name.values())
 
 
-def summarize_checks(check_runs: list[dict[str, Any]]) -> tuple[bool, bool, list[str]]:
-    if not check_runs:
-        return True, False, ["no checks reported"]
-    check_runs = dedupe_check_runs(check_runs)
+def summarize_checks(
+    check_runs: list[dict[str, Any]],
+    required_names: tuple[str, ...],
+) -> tuple[bool, bool, list[str]]:
+    latest_by_name = {check.get("name", "unknown"): check for check in dedupe_check_runs(check_runs)}
     pending = False
     failed = False
     failures: list[str] = []
-    for check in check_runs:
+    for name in required_names:
+        check = latest_by_name.get(name)
+        if check is None:
+            pending = True
+            continue
         status = check.get("status")
         conclusion = check.get("conclusion")
-        name = check.get("name", "unknown")
         if status != "completed":
             pending = True
             continue
-        if conclusion not in ("success", "skipped", "neutral"):
+        if conclusion != "success":
             failed = True
             failures.append(f"{name}: {conclusion}")
     return pending, failed, failures
@@ -518,52 +547,49 @@ def raise_on_human_feedback(
 async def wait_for_codex(pr_number: int, checks_done: asyncio.Event) -> None:
     print("Waiting for review feedback...", flush=True)
     while True:
-        (
-            issue_comments,
-            review_comments,
-            reviews,
-            review_request_at,
-        ) = await fetch_review_context(pr_number)
-        bot_issue_comments = filter_codex_comments(issue_comments, review_request_at)
-        bot_review_comments = filter_codex_comments(review_comments, review_request_at)
-        bot_comments = bot_issue_comments + bot_review_comments
-        raise_on_human_feedback(
-            issue_comments,
-            review_comments,
-            reviews,
-            review_request_at,
-        )
-        if bot_comments:
-            latest = max(
-                bot_comments,
-                key=lambda comment: parse_time(comment["created_at"]),
-            )
-            body = sanitize_terminal_output(latest.get("body") or "").strip()
-            if body:
-                print("Codex left comments. Address feedback before merge.")
-                print(body)
-                raise SystemExit(2)
+        await assert_no_review_feedback(pr_number)
         if checks_done.is_set():
             return
         await asyncio.sleep(POLL_SECONDS)
 
 
-async def wait_for_checks(head_sha: str, checks_done: asyncio.Event) -> None:
+async def assert_no_review_feedback(pr_number: int) -> None:
+    issue_comments, review_comments, reviews, review_request_at = await fetch_review_context(pr_number)
+    raise_on_human_feedback(issue_comments, review_comments, reviews, review_request_at)
+    bot_comments = filter_codex_comments(issue_comments, review_request_at) + filter_codex_comments(
+        review_comments,
+        review_request_at,
+    )
+    if not bot_comments:
+        return
+    latest = max(bot_comments, key=lambda comment: parse_time(comment["created_at"]))
+    body = sanitize_terminal_output(latest.get("body") or "").strip()
+    if body:
+        print("Codex left comments. Address feedback before merge.")
+        print(body)
+        raise SystemExit(2)
+
+
+async def wait_for_checks(
+    head_sha: str,
+    checks_done: asyncio.Event,
+    required_names: tuple[str, ...],
+) -> None:
     print("Waiting for CI checks...", flush=True)
     empty_seconds = 0
     while True:
         check_runs = await get_check_runs(head_sha)
-        if not check_runs:
+        observed_names = {check.get("name", "unknown") for check in dedupe_check_runs(check_runs)}
+        missing_names = [name for name in required_names if name not in observed_names]
+        if missing_names:
             empty_seconds += POLL_SECONDS
             if empty_seconds >= CHECKS_APPEAR_TIMEOUT_SECONDS:
-                print(
-                    "No checks detected after 120s; check CI configuration",
-                )
+                print(f"Required checks not detected after 120s: {', '.join(missing_names)}")
                 raise SystemExit(3)
             await asyncio.sleep(POLL_SECONDS)
             continue
         empty_seconds = 0
-        pending, failed, failures = summarize_checks(check_runs)
+        pending, failed, failures = summarize_checks(check_runs, required_names)
         if failed:
             print("Checks failed:")
             for failure in failures:
@@ -576,8 +602,19 @@ async def wait_for_checks(head_sha: str, checks_done: asyncio.Event) -> None:
         await asyncio.sleep(POLL_SECONDS)
 
 
-async def watch_pr() -> None:
+async def watch_pr(options: WatchOptions) -> dict[str, Any]:
+    started_at = asyncio.get_running_loop().time()
     pr = await get_pr_info()
+    if pr.state != "OPEN" or pr.is_draft:
+        raise RuntimeError(f"pr_not_open_or_ready:state={pr.state}:draft={pr.is_draft}")
+    if options.expected_head and pr.head_sha != options.expected_head:
+        raise RuntimeError(
+            f"expected_head_mismatch:expected={options.expected_head}:actual={pr.head_sha}",
+        )
+    if options.expected_base and pr.base_sha != options.expected_base:
+        raise RuntimeError(
+            f"expected_base_mismatch:expected={options.expected_base}:actual={pr.base_sha}",
+        )
     if is_merge_conflicting(pr):
         print(
             "PR has merge conflicts. Resolve/rebase against main and push before "
@@ -585,13 +622,20 @@ async def watch_pr() -> None:
         )
         raise SystemExit(5)
     head_sha = pr.head_sha
+    required_checks = (
+        IMPLEMENTATION_REQUIRED_CHECKS
+        if options.mode == "implementation-readiness"
+        else LANDING_REQUIRED_CHECKS
+    )
     checks_done = asyncio.Event()
     codex_task = asyncio.create_task(wait_for_codex(pr.number, checks_done))
-    checks_task = asyncio.create_task(wait_for_checks(head_sha, checks_done))
+    checks_task = asyncio.create_task(wait_for_checks(head_sha, checks_done, required_checks))
 
     async def head_monitor() -> None:
         while True:
             current = await get_pr_info()
+            if current.state != "OPEN" or current.is_draft:
+                raise RuntimeError(f"pr_not_open_or_ready:state={current.state}:draft={current.is_draft}")
             if is_merge_conflicting(current):
                 print(
                     "PR has merge conflicts. Resolve/rebase against main and push "
@@ -601,6 +645,10 @@ async def watch_pr() -> None:
             if current.head_sha != head_sha:
                 print("PR head updated; pull/amend/force-push to retrigger CI")
                 raise SystemExit(4)
+            if options.expected_base and current.base_sha != options.expected_base:
+                raise RuntimeError(
+                    f"expected_base_mismatch:expected={options.expected_base}:actual={current.base_sha}",
+                )
             await asyncio.sleep(POLL_SECONDS)
 
     monitor_task = asyncio.create_task(head_monitor())
@@ -616,10 +664,85 @@ async def watch_pr() -> None:
         exc = task.exception()
         if exc:
             raise exc
+    current = await get_pr_info()
+    if current.head_sha != head_sha:
+        raise RuntimeError(
+            f"expected_head_mismatch:expected={head_sha}:actual={current.head_sha}",
+        )
+    if current.state != "OPEN" or current.is_draft:
+        raise RuntimeError(f"pr_not_open_or_ready:state={current.state}:draft={current.is_draft}")
+    if is_merge_conflicting(current):
+        raise RuntimeError("pr_merge_conflict")
+    if options.expected_base and current.base_sha != options.expected_base:
+        raise RuntimeError(
+            f"expected_base_mismatch:expected={options.expected_base}:actual={current.base_sha}",
+        )
+    pending_checks, failed_checks, failures = summarize_checks(await get_check_runs(head_sha), required_checks)
+    if pending_checks or failed_checks:
+        raise RuntimeError(f"required_checks_not_ready:{','.join(failures) if failures else 'pending'}")
+    await assert_no_review_feedback(current.number)
+    return {
+        "status": "ready",
+        "mode": options.mode,
+        "pr_number": current.number,
+        "pr_url": current.url,
+        "head_sha": current.head_sha,
+        "base_sha": current.base_sha,
+        "required_checks": list(required_checks),
+        "duration_ms": round((asyncio.get_running_loop().time() - started_at) * 1000),
+        "mergeable": current.mergeable,
+        "merge_state": current.merge_state,
+    }
+
+
+def parse_args() -> WatchOptions:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=("implementation-readiness", "landing-readiness"),
+        default="landing-readiness",
+    )
+    parser.add_argument("--expected-head")
+    parser.add_argument("--expected-base")
+    parser.add_argument("--json", action="store_true", dest="json_output")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=int(os.environ.get("SYMPHONY_LAND_WATCH_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)),
+    )
+    args = parser.parse_args()
+    if args.timeout_seconds <= 0:
+        parser.error("--timeout-seconds must be positive")
+    return WatchOptions(
+        mode=args.mode,
+        expected_head=args.expected_head,
+        expected_base=args.expected_base,
+        json_output=args.json_output,
+        timeout_seconds=args.timeout_seconds,
+    )
 
 
 if __name__ == "__main__":
+    options = parse_args()
     try:
-        asyncio.run(watch_pr())
+        result = asyncio.run(asyncio.wait_for(watch_pr(options), timeout=options.timeout_seconds))
+        if options.json_output:
+            print(json.dumps(result, sort_keys=True))
     except SystemExit as exc:
         raise SystemExit(exc.code) from None
+    except asyncio.TimeoutError:
+        if options.json_output:
+            print(json.dumps({"status": "timed_out", "mode": options.mode}, sort_keys=True))
+        raise SystemExit(6) from None
+    except Exception as exc:
+        if options.json_output:
+            print(
+                json.dumps(
+                    {"status": "failed", "mode": options.mode, "reason": str(exc)},
+                    sort_keys=True,
+                ),
+                file=sys.stdout,
+            )
+        else:
+            print(str(exc), file=sys.stderr)
+        raise SystemExit(7) from None

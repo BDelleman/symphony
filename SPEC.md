@@ -1424,9 +1424,11 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
 For workflows that use a Human Review handoff convention, the workflow prompt must refresh tracker
 labels/state at Agent Review start, immediately before entering Merging, and immediately before the
 merge. Each merge preflight must also re-read the current PR head SHA, checks, review decision, and
-exact-head approval. Observing Human Review at any preflight stops automation and leaves the issue
-unchanged. These checks narrow races but are an operational convention, not an authorization
-boundary, while the agent retains merge-capable credentials.
+exact-head approval. Human Review routes a passing review to the Human Review state. Once a human
+moves the issue to Merging, that state is authoritative approval and a remaining Human Review label
+is audit evidence rather than a veto. Observing the issue in Human Review, or outside Merging during
+a landing preflight, stops automation. These checks narrow races but are an operational convention,
+not an authorization boundary, while the agent retains merge-capable credentials.
 
 ## 12. Prompt Construction and Context Assembly
 

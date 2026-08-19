@@ -162,6 +162,62 @@ function isBlockedVerdict(verdict) {
   return /(Blocked: move to In Progress|Reset required: move to Rework)/.test(verdict);
 }
 
+function scopeField(scope, label) {
+  const pattern = new RegExp(`^-\\s*${label.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\s*:\\s*(.+)$`, 'mi');
+  return pattern.exec(scope)?.[1]?.trim() || '';
+}
+
+function validateReviewReceipt(body, scope, verdict) {
+  const section = requireSection(body, 'Review Receipt');
+  const jsonText = section
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim();
+  let receipt;
+  try {
+    receipt = JSON.parse(jsonText);
+  } catch {
+    fail('Review Receipt must contain exactly one valid JSON object');
+  }
+  if (!receipt || Array.isArray(receipt) || typeof receipt !== 'object') {
+    fail('Review Receipt must be a JSON object');
+  }
+  const requiredStrings = ['issue_id', 'base_sha', 'head_sha', 'verdict', 'route', 'reviewer_attempt_id', 'created_at'];
+  if (receipt.version !== 1) fail('Review Receipt version must be 1');
+  if (!Number.isInteger(receipt.pr_number) || receipt.pr_number <= 0) fail('Review Receipt pr_number must be a positive integer');
+  if (!(receipt.issue_version === null || Number.isInteger(receipt.issue_version))) {
+    fail('Review Receipt issue_version must be an integer or null');
+  }
+  for (const field of requiredStrings) {
+    if (typeof receipt[field] !== 'string' || !receipt[field].trim()) fail(`Review Receipt missing ${field}`);
+  }
+  if (!['pass', 'blocked', 'reset'].includes(receipt.verdict)) fail('Review Receipt verdict is invalid');
+  if (!['human_review', 'merging', 'in_progress', 'rework'].includes(receipt.route)) fail('Review Receipt route is invalid');
+  if (!Number.isFinite(Date.parse(receipt.created_at))) fail('Review Receipt created_at must be an ISO timestamp');
+  const scopeIssue = scopeField(scope, 'Issue');
+  const scopePr = scopeField(scope, 'PR');
+  const scopeBase = scopeField(scope, 'Base SHA');
+  const scopeHead = scopeField(scope, 'Head SHA');
+  const scopePrNumber = /\/pull\/(\d+)(?:\b|$)/.exec(scopePr)?.[1] ?? /^#?(\d+)$/.exec(scopePr)?.[1];
+  if (receipt.issue_id !== scopeIssue) fail('Review Receipt issue_id must match Scope Read Issue');
+  if (!scopePrNumber || receipt.pr_number !== Number(scopePrNumber)) fail('Review Receipt pr_number must match Scope Read PR');
+  if (receipt.base_sha !== scopeBase) fail('Review Receipt base_sha must match Scope Read Base SHA');
+  if (receipt.head_sha !== scopeHead) fail('Review Receipt head_sha must match Scope Read Head SHA');
+
+  const expected = /Pass: route to Human Review/.test(verdict)
+    ? ['pass', 'human_review']
+    : /Pass: route to Merging/.test(verdict)
+      ? ['pass', 'merging']
+      : /Blocked: move to In Progress/.test(verdict)
+        ? ['blocked', 'in_progress']
+        : /Reset required: move to Rework/.test(verdict)
+          ? ['reset', 'rework']
+          : null;
+  if (expected && (receipt.verdict !== expected[0] || receipt.route !== expected[1])) {
+    fail('Review Receipt verdict and route must match the Verdict section');
+  }
+}
+
 function requiresCrossSurfaceTrace(body) {
   const lenses = sectionContent(body, 'Triggered Review Lenses') || '';
   const searchable = `${body}\n${lenses}`;
@@ -239,7 +295,7 @@ function validateReviewArtifact(rawBody) {
   }
 
   const scope = requireSection(body, 'Scope Read');
-  for (const field of ['Issue', 'PR', 'Head SHA', 'Prior findings reviewed']) {
+  for (const field of ['Issue', 'PR', 'Base SHA', 'Head SHA', 'Prior findings reviewed']) {
     requireField(scope, field);
   }
 
@@ -265,8 +321,17 @@ function validateReviewArtifact(rawBody) {
   }
 
   const verdict = requireSection(body, 'Verdict');
+  validateReviewReceipt(body, scope, verdict);
   if (!/(Blocked: move to In Progress|Reset required: move to Rework|Pass: route to Human Review|Pass: route to Merging)/.test(verdict)) {
     fail('Verdict must use one of the allowed routing outcomes');
+  }
+  const hasBlockingFinding = /\bP[12]\b/i.test(findings);
+  const isPassing = /Pass: route to (Human Review|Merging)/.test(verdict);
+  if (isPassing && (hasBlockingFinding || !/No blocking findings/i.test(findings))) {
+    fail('Passing verdict requires `No blocking findings` and cannot include P1/P2 findings');
+  }
+  if (!isPassing && !hasBlockingFinding) {
+    fail('Blocked or reset verdict requires at least one P1/P2 finding');
   }
   if (requiresCrossSurfaceTrace(body)) {
     validateCrossSurfaceArtifact(body, verdict);

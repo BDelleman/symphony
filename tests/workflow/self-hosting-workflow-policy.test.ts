@@ -13,13 +13,13 @@ describe('Symphony self-hosting workflow policy', () => {
   it('keeps Symphony-specific PR, spec, and governance gates in checked-in workflow guidance', () => {
     const workflow = readRepoFile('WORKFLOW.md');
 
-    expect(workflow).toContain('## PR feedback sweep protocol (required)');
-    expect(workflow).toContain('Ensure the GitHub PR has label `symphony`');
-    expect(workflow).toContain('npm run submit:pr-governed -- --mode create --title "<title>"');
-    expect(workflow).toContain('npm run submit:pr-governed -- --mode edit');
+    expect(workflow).toContain('## PR feedback sweep protocol');
+    expect(workflow).toContain('the `symphony` label');
+    expect(workflow).toContain('npm run submit:pr-governed -- --mode upsert --title "<title>"');
+    expect(workflow).toContain('--branch "<current-branch>" --wait');
     expect(workflow).toContain('The PR body must include Summary, Spec Alignment with relevant `SPEC.md`');
     expect(workflow).toContain('Review routing: Human Review label present');
-    expect(workflow).toContain('`Done` is only allowed after PR merge is confirmed in the `Merging` flow');
+    expect(workflow).toContain('`Done` is only allowed after the exact reviewed PR head is confirmed merged');
   });
 
   it('keeps reusable portable skills free of Symphony-only submit and review routing policy', () => {

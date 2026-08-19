@@ -3,6 +3,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { parseWorkflowFrontMatter } from '../../src/workflow/frontmatter';
+import { TemplateEngine } from '../../src/workflow/template-engine';
 
 describe('workflow command examples', () => {
   it('keeps runtime and model selection in the project environment', () => {
@@ -42,32 +43,56 @@ describe('workflow command examples', () => {
     };
 
     expect(tracker.active_states).toEqual(['Todo', 'In Progress', 'Agent Review', 'Merging', 'Rework']);
-    expect(tracker.handoff_states).toEqual(['Agent Review', 'Human Review']);
-    expect(tracker.fresh_dispatch_states).toEqual(['Agent Review']);
+    expect(tracker.handoff_states).toEqual(['Agent Review', 'Human Review', 'Merging', 'Rework']);
+    expect(tracker.fresh_dispatch_states).toEqual(['Agent Review', 'Merging', 'Rework']);
     expect(tracker.active_states).not.toContain('Human Review');
     expect(workflow).toContain(
-      '`Agent Review` is in `active_states` only with the paired `handoff_states` and `fresh_dispatch_states` entries'
+      'The implementation worker must not perform formal Agent Review'
+    );
+    expect(workflow).toContain('Any transition to another workflow phase ends the run');
+    expect(workflow).toContain(
+      'This is a fresh, independent review'
     );
     expect(workflow).toContain(
-      'The implementation worker must stop after moving the issue to `Agent Review`'
+      'If this run authored the candidate, stop and leave the issue unchanged'
     );
-    expect(workflow).toContain(
-      '`Agent Review` -> run Step 3 Agent Review flow in this fresh review context'
-    );
-    expect(workflow).toContain(
-      'If this run authored the implementation being reviewed, stop and leave the issue in `Agent Review`'
-    );
-    expect(workflow).toContain('Move issue from `Agent Review` to `In Progress`');
-    expect(workflow).toContain('Move issue from `Agent Review` to `Rework`');
+    expect(workflow).toContain('fixable P1/P2 to `In Progress`');
+    expect(workflow).toContain('reset-level P1/P2 to `Rework`');
     expect(workflow).toContain('A Linear label named `Human Review` is an explicit human-review routing requirement');
     expect(workflow).toContain('Match this label case-insensitively');
     expect(workflow).toContain('normalized to lowercase by the tracker model');
     expect(workflow).toContain('Review routing: Human Review label present');
-    expect(workflow).toContain(
-      'If review passes and none of these are present: UI review, non-UI human review, or the `Human Review` label requirement'
-    );
-    expect(workflow).toContain('Routing: Human Review');
-    expect(workflow).toContain('Routing: Merging');
+    expect(workflow).toContain('otherwise pass to `Merging`');
+    expect(workflow).toContain('make the chosen state transition');
+  });
+
+  it('renders only the instructions owned by the dispatch state', async () => {
+    const workflow = readFileSync(path.join(process.cwd(), 'WORKFLOW.md'), 'utf8');
+    const parsed = parseWorkflowFrontMatter(workflow);
+    const template = new TemplateEngine().compile(parsed.promptTemplate);
+    const issue = {
+      identifier: 'NIE-1',
+      title: 'Test',
+      description: 'Test change',
+      labels: [],
+      url: 'https://linear.app/test',
+      state: 'In Progress'
+    };
+
+    const implementation = await template.render({ issue, attempt: null });
+    expect(implementation).toContain('## Implementation flow');
+    expect(implementation).not.toContain('## Agent Review flow');
+    expect(implementation).not.toContain('## Merging flow');
+
+    const review = await template.render({ issue: { ...issue, state: 'Agent Review' }, attempt: null });
+    expect(review).toContain('## Agent Review flow');
+    expect(review).not.toContain('## Implementation flow');
+    expect(review).not.toContain('## Merging flow');
+
+    const merging = await template.render({ issue: { ...issue, state: 'Merging' }, attempt: null });
+    expect(merging).toContain('## Merging flow');
+    expect(merging).not.toContain('## Implementation flow');
+    expect(merging).not.toContain('## Agent Review flow');
   });
 
   it('requires scenario-to-surface review for cross-cutting contract changes', () => {
@@ -78,7 +103,6 @@ describe('workflow command examples', () => {
     expect(workflow).toContain('typed contract, lifecycle invariant, state');
     expect(workflow).toContain('`Propagation matrix: not required`');
     expect(workflow).toContain('Build the trace from current code reality');
-    expect(workflow).toContain('Recent Linear comments, review comments, and prior findings that add or');
     expect(workflow).toContain('### Scope Comments Reviewed');
     expect(workflow).toContain('### Scenario-To-Surface Trace');
     expect(workflow).toContain('### Path Census');
@@ -88,10 +112,7 @@ describe('workflow command examples', () => {
     expect(workflow).toContain('Persistence/history/audit');
     expect(workflow).toContain('Fixture data is not evidence unless a production consumer assertion proves');
     expect(workflow).toContain('One representative path is not enough for audit/history/refusal invariants');
-    expect(workflow).toContain('Combined "API/dashboard/persistence pass" verdicts are invalid');
-    expect(workflow).toContain('real implementation path behind');
-    expect(workflow).toContain('continue adjacent scanning far enough to batch');
-    expect(workflow).toContain('immediate P1 safety issue');
+    expect(workflow).toContain('combined "API/dashboard/persistence pass" verdicts are invalid');
     expect(workflow).not.toContain('| Persistence/API/dashboard/forensics | `<records/projections>` | `<pass/finding/N/A>` |');
   });
 
@@ -103,7 +124,7 @@ describe('workflow command examples', () => {
 
     expect(workflow).toContain('docs/agents/review-lenses.md');
     expect(workflow).toContain('evidence-backed Agent Review artifact');
-    expect(workflow).toContain('Prior findings reviewed:');
+    expect(workflow).toContain('Prior findings reviewed');
     expect(workflow).toContain('Independent Invariants');
     expect(workflow).toContain('Triggered Review Lenses');
     expect(workflow).toContain('without evidence-backed lens verdicts is invalid');
