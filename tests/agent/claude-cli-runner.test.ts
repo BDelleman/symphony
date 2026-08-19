@@ -171,6 +171,11 @@ process.stdin.on('end', () => {
   process.stdout.write(JSON.stringify(result) + '\\n');
   if (process.env.MOCK_AUXILIARY_RESULT === '1') process.stdout.write(JSON.stringify({ type: 'result', subtype: 'prompt_suggestion', session_id: '${SESSION_ID}' }) + '\\n');
   if (process.env.MOCK_DUPLICATE_RESULT === '1') process.stdout.write(JSON.stringify(result) + '\\n');
+  if (process.env.MOCK_CONTINUATION_TURN === '1') {
+    process.stdout.write(JSON.stringify(init) + '\\n');
+    process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-continuation', model, usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [] } }) + '\\n');
+    process.stdout.write(JSON.stringify(Object.assign({}, result, { result: 'continued-done' })) + '\\n');
+  }
   if (process.env.MOCK_MODE === 'nonzero') process.exitCode = 2;
 });
 `,
@@ -374,6 +379,25 @@ describe('ClaudeCliRunner', () => {
     }).startSessionAndRunTurn(startInput(fixture.root));
 
     expect(result).toMatchObject({ status: 'failed', error_code: 'claude_terminal_result_count:2', retryable: false });
+  });
+
+  it('accepts an init-delimited continuation turn and treats the last result as authoritative', async () => {
+    const fixture = createFixture();
+    const events: AgentRunnerEvent[] = [];
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_CONTINUATION_TURN: '1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn({ ...startInput(fixture.root), onEvent: (event) => events.push(event) });
+
+    expect(result).toMatchObject({ status: 'completed', last_agent_message: 'continued-done' });
+    expect(
+      events.some((event) => typeof event.detail === 'string' && event.detail.startsWith('claude_continuation_turn:'))
+    ).toBe(true);
+    expect(events.filter((event) => event.event === 'agent_runner.session.started')).toHaveLength(1);
   });
 
   it('fails closed and counts a system permission_denied event', async () => {

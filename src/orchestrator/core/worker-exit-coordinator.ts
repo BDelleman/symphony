@@ -693,6 +693,7 @@ export async function coordinateWorkerExit(
             error: error ?? null
           }
         });
+        context.state.claimed.delete(issue_id);
         context.ports.notifyObservers?.();
         return;
       }

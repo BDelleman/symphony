@@ -78,8 +78,10 @@ interface ParsedProtocolState {
   instructionFingerprint: string | null;
   skillFingerprint: string | null;
   terminalResult: Record<string, unknown> | null;
+  lastCompletedResult: Record<string, unknown> | null;
   terminalResultCount: number;
   auxiliaryResultCount: number;
+  continuationCount: number;
   initCount: number;
   apiRetryCount: number;
   permissionDenialCount: number;
@@ -1680,8 +1682,10 @@ export class ClaudeCliRunner implements AgentRunner {
         instructionFingerprint: null,
         skillFingerprint: null,
         terminalResult: null,
+        lastCompletedResult: null,
         terminalResultCount: 0,
         auxiliaryResultCount: 0,
+        continuationCount: 0,
         initCount: 0,
         apiRetryCount: 0,
         permissionDenialCount: 0,
@@ -1741,9 +1745,16 @@ export class ClaudeCliRunner implements AgentRunner {
 
         if (type === 'system' && subtype === 'init') {
           state.initCount += 1;
-          if (state.initCount > 1) {
+          const isContinuationInit = state.initCount > 1;
+          const previousRoundFingerprint = state.capabilityFingerprint;
+          if (isContinuationInit && state.terminalResultCount !== state.initCount - 1) {
             failProtocol(`claude_init_count:${state.initCount}`);
             return;
+          }
+          if (isContinuationInit) {
+            state.continuationCount += 1;
+            state.lastCompletedResult = state.terminalResult ?? state.lastCompletedResult;
+            state.terminalResult = null;
           }
           if (!sessionId) {
             failProtocol('claude_init_session_missing');
@@ -1770,6 +1781,10 @@ export class ClaudeCliRunner implements AgentRunner {
             state.instructionFingerprint,
             state.skillFingerprint
           ]);
+          if (isContinuationInit && previousRoundFingerprint && previousRoundFingerprint !== state.capabilityFingerprint) {
+            failProtocol('claude_capability_fingerprint_drift');
+            return;
+          }
           if (expectedSessionId) {
             const previousFingerprint = this.capabilityFingerprintBySession.get(expectedSessionId);
             if (previousFingerprint && previousFingerprint !== state.capabilityFingerprint) {
@@ -1793,6 +1808,16 @@ export class ClaudeCliRunner implements AgentRunner {
             failProtocol(`claude_required_mcp_missing:${missingServers.sort().join(',')}`);
             return;
           }
+          if (isContinuationInit) {
+            emit({
+              event: CANONICAL_EVENT.agentRunner.activity,
+              session_id: state.sessionId ?? undefined,
+              thread_id: state.sessionId ? `claude:${state.sessionId}` : undefined,
+              turn_id: turnId,
+              detail: `claude_continuation_turn:${state.continuationCount}`
+            });
+            return;
+          }
           emit({
             event: CANONICAL_EVENT.agentRunner.sessionStarted,
             session_id: state.sessionId ?? undefined,
@@ -1808,15 +1833,15 @@ export class ClaudeCliRunner implements AgentRunner {
             state.auxiliaryResultCount += 1;
             return;
           }
-          if (state.initCount !== 1 || !state.initSessionId) {
+          if (state.initCount < 1 || !state.initSessionId) {
             failProtocol('claude_result_before_init');
             return;
           }
-          state.terminalResultCount += 1;
-          if (state.terminalResultCount > 1) {
-            failProtocol(`claude_terminal_result_count:${state.terminalResultCount}`);
+          if (state.terminalResultCount >= state.initCount) {
+            failProtocol(`claude_terminal_result_count:${state.terminalResultCount + 1}`);
             return;
           }
+          state.terminalResultCount += 1;
           state.terminalResult = payload;
           return;
         }
@@ -2066,7 +2091,7 @@ export class ClaudeCliRunner implements AgentRunner {
         }
       }
       const stderrDigest = stderrBytes > 0 ? stderrHash.digest('hex') : null;
-      const terminal = state.terminalResult;
+      const terminal = state.terminalResult ?? state.lastCompletedResult;
       const terminalPermissionDenials = terminal && Array.isArray(terminal.permission_denials)
         ? terminal.permission_denials.length
         : 0;
@@ -2187,8 +2212,8 @@ export class ClaudeCliRunner implements AgentRunner {
         close.spawnError ||
         eventDeliveryError ||
         state.protocolError ||
-        (state.terminalResultCount !== 1 ? `claude_terminal_result_count:${state.terminalResultCount}` : null) ||
-        (state.initCount !== 1 ? `claude_init_count:${state.initCount}` : null) ||
+        (state.terminalResultCount < 1 ? `claude_terminal_result_count:${state.terminalResultCount}` : null) ||
+        (state.initCount < 1 ? `claude_init_count:${state.initCount}` : null) ||
         (!state.capabilityFingerprint ? 'claude_init_missing' : null) ||
         (!state.sessionId ? 'claude_session_id_missing' : null) ||
         (!state.initSessionId ? 'claude_init_session_missing' : null) ||
