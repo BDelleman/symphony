@@ -433,9 +433,6 @@ Use this only when completion is blocked by missing required tools or missing au
    - Refresh the issue immediately before review starts and record the observed
      issue version, labels, PR head SHA, checks, and review decision in the
      Agent Review artifact.
-   - If the `Human Review` label is present at this preflight, Human Review
-     routing is already owned by the human workflow: stop immediately and
-     leave the issue state, labels, comments, and PR unchanged.
 4. Validate the implementation agent's routing claim against the actual diff:
    - UI review is required when the change affects user-visible UI behavior, layout, styling, visual hierarchy, navigation, interactions, loading/error/empty states, or meaningful user-facing copy.
    - UI review is not required for frontend-internal refactors, tests-only changes, dependency/build mechanics, or typo-only copy fixes that do not change product meaning.
@@ -565,14 +562,10 @@ Use this only when completion is blocked by missing required tools or missing au
 10. If the implementation needs a fresh approach:
    - Post a normal Linear review findings comment that explains the reset-level reason.
    - Move issue from `Agent Review` to `Rework`.
-11. If review passes and UI review or non-UI human review is required:
+11. If review passes and UI review, non-UI human review, or the `Human Review` label requirement is present:
    - Post a short Linear comment: `Agent Review passed: no blocking findings. Routing: Human Review.`
    - Move issue from `Agent Review` to `Human Review`.
 12. If review passes and none of these are present: UI review, non-UI human review, or the `Human Review` label requirement:
-   - Refresh the issue and PR again immediately before changing state. Record
-     the observed issue version, labels, PR head SHA, checks, and review
-     decision. If `Human Review` is now present, do not move to `Merging`;
-     stop and leave the issue and PR unchanged.
    - Post a short Linear comment: `Agent Review passed: no blocking findings. Routing: Merging.`
    - Move issue from `Agent Review` to `Merging`.
 
