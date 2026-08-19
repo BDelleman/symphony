@@ -96,7 +96,7 @@ export function summarizeProjectHistoryMetrics(row: any) {
       'phases ' + formatNumber(summary.phase_count || 0),
       'threads ' + formatNumber(summary.thread_count || 0),
       'turns ' + formatNumber(summary.turn_count || 0),
-      'tokens ' + (summary.total_tokens === null || summary.total_tokens === undefined ? 'n/a' : formatNumber(summary.total_tokens))
+      'Codex enforcement tokens ' + (summary.total_tokens === null || summary.total_tokens === undefined ? 'n/a' : formatNumber(summary.total_tokens))
     ].join(' • ');
   }
 
@@ -349,7 +349,8 @@ export function renderProjectHistoryDetail() {
         return item.event_type + ' • ' + item.result_code + ' • ' + (item.actor || item.source || 'unknown') + ' • ' + formatDate(item.occurred_at);
       }),
       createProjectHistorySection('Attempts', detail.attempts, function (item: any) {
-        return 'Attempt ' + item.attempt_number + ' • ' + item.status + ' • ' + formatDate(item.started_at) + ' - ' + formatDate(item.ended_at);
+        return 'Attempt ' + item.attempt_number + ' • workflow ' + (item.workflow_outcome || item.status) +
+          ' • process ' + (item.process_status || 'n/a') + ' • ' + formatDate(item.started_at) + ' - ' + formatDate(item.ended_at);
       }),
       createProjectHistorySection('Phases', detail.phases, function (item: any) {
         return item.phase + ' • ' + item.status + ' • ' + formatDate(item.started_at) + ' - ' + formatDate(item.ended_at) + (item.reason_code ? ' • ' + item.reason_code : '');
@@ -358,7 +359,10 @@ export function renderProjectHistoryDetail() {
         return item.from_status + ' -> ' + item.to_status + ' • ' + formatDate(item.transitioned_at) + (item.reason_code ? ' • ' + item.reason_code : '');
       }),
       createProjectHistorySection('Thread References', detail.thread_references, function (item: any) {
-        return item.thread_id + ' • attempt ' + item.attempt_id + ' • ' + item.status + ' • ' + formatDate(item.started_at);
+        return item.thread_id + ' • session ' + (item.session_id || 'n/a') + ' • runtime ' + (item.agent_runtime || 'n/a') +
+          ' • pid ' + (item.worker_process_pid === null || item.worker_process_pid === undefined ? 'n/a' : item.worker_process_pid) +
+          ' • worker ' + (item.worker_instance_id || 'n/a') + ' • attempt ' + item.attempt_id + ' • ' + item.status +
+          ' • ' + formatDate(item.started_at);
       }),
       createProjectHistorySection('Turn References', detail.turn_references, function (item: any) {
         return item.turn_id + ' • thread ' + item.thread_id + ' • turn ' + item.turn_index + ' • ' + item.status;
@@ -386,11 +390,37 @@ export function renderProjectHistoryDetail() {
       createProjectHistorySection('App Server Lite Excerpts', detail.app_server_lite_summaries, function (item: any) {
         return item.source_event_name + ' • ' + item.detail_status + ' • ' + (item.summary || item.redacted_excerpt || item.unavailable_reason_code || 'no excerpt');
       }),
-      createProjectHistorySection('Token And Model Facts', detail.token_model_summaries, function (item: any) {
+      createProjectHistorySection('Completed Provider Totals', detail.provider_totals, function (item: any) {
+        const dimension = function (field: string) {
+          return item[field] === null || item[field] === undefined ? 'n/a' : formatNumber(item[field]);
+        };
+        const cost = item.estimated_cost_usd === null || item.estimated_cost_usd === undefined
+          ? 'n/a'
+          : '$' + Number(item.estimated_cost_usd).toFixed(4);
+        return (item.runtime_provider || 'runtime unknown') + ' • ' + (item.effective_model || 'model unknown') +
+          ' • phase ' + (item.ticket_phase || 'unknown') + ' • invocations ' + formatNumber(item.invocation_count) +
+          ' (' + formatNumber(item.final_invocation_count) + ' final, ' + formatNumber(item.partial_invocation_count) + ' partial, ' +
+          formatNumber(item.unobserved_invocation_count || 0) + ' unobserved, ' + formatNumber(item.missing_invocation_count || 0) + ' missing)' +
+          ' • in ' + dimension('input_tokens') + ' • out ' + dimension('output_tokens') +
+          ' • cache read ' + dimension('cache_read_tokens') + ' • cache create ' + dimension('cache_creation_tokens') +
+          ' • turns ' + dimension('provider_turn_count') + ' • provider estimate ' + cost +
+          ' • updated ' + formatDate(item.updated_at);
+      }),
+      createProjectHistorySection('Provider Usage And Model Facts', detail.token_model_summaries, function (item: any) {
         const runtime = item.runtime_provider || 'codex-app-server';
         const turns = item.provider_turn_count === null || item.provider_turn_count === undefined ? 'n/a' : formatNumber(item.provider_turn_count);
         const cost = item.estimated_cost_usd === null || item.estimated_cost_usd === undefined ? 'n/a' : '$' + Number(item.estimated_cost_usd).toFixed(4);
-        return runtime + ' • ' + (item.effective_model || item.requested_model || 'model unknown') + ' • tokens ' + (item.total_tokens === null || item.total_tokens === undefined ? 'n/a' : formatNumber(item.total_tokens)) + ' • turns ' + turns + ' • estimated ' + cost + ' • ' + (item.telemetry_confidence || 'confidence unknown');
+        if (runtime === 'claude-cli') {
+          const dimension = function (field: string) {
+            return item[field] === null || item[field] === undefined ? 'n/a' : formatNumber(item[field]);
+          };
+          return runtime + ' • ' + (item.effective_model || item.requested_model || 'model unknown') +
+            ' • in ' + dimension('input_tokens') + ' • out ' + dimension('output_tokens') +
+            ' • cache read ' + dimension('cached_input_tokens') + ' • cache create ' + dimension('cache_creation_input_tokens') +
+            ' • turns ' + turns + ' • provider estimate ' + cost + ' • ' +
+            (item.provider_usage_status || 'status unknown') + ' • ' + (item.telemetry_confidence || 'confidence unknown');
+        }
+        return runtime + ' • ' + (item.effective_model || item.requested_model || 'model unknown') + ' • enforcement tokens ' + (item.total_tokens === null || item.total_tokens === undefined ? 'n/a' : formatNumber(item.total_tokens)) + ' • ' + (item.telemetry_confidence || 'confidence unknown');
       }),
       createProjectHistorySection('Blocked Input Events', detail.blocked_input_events, function (item: any) {
         return (item.request_id || 'request') + ' • ' + (item.status || 'status unknown') + ' • ' + (item.reason_code || 'no reason');

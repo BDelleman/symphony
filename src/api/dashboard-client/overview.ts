@@ -1,12 +1,12 @@
 import { OPERATOR_TRANSITION_RULES } from './config';
 import { elements } from './dom';
 import { state } from './state';
-import { formatDate, formatElapsedMs, formatNumber, getActionRequiredLabel, isActionRequiredCode, formatOverviewTokenValue } from './formatting';
+import { formatDate, formatElapsedMs, formatNumber, getActionRequiredLabel, isActionRequiredCode, formatOverviewTokenValue, formatTokenDimension } from './formatting';
 import { renderRunning, renderRetry, renderBlocked } from './issues';
 
 const DRAIN_BLOCKER_LABELS: Record<string, string> = {
   active_worker: 'Active workers',
-  live_codex_app_server_process: 'Codex app servers',
+  live_codex_app_server_process: 'Agent runner processes',
   pending_retry: 'Pending retries',
   in_flight_tracker_write: 'Tracker writes',
   persistence_history_write: 'Current persistence/history writes',
@@ -440,6 +440,20 @@ export function renderOverview(payload: any) {
           return total + (Number(warning && warning.count) || 0);
         }, 0)
       : 0;
+    const providerTotals = Array.isArray(payload.provider_totals) ? payload.provider_totals : [];
+    const providerSum = function (field: string) {
+      const values = providerTotals
+        .map(function (entry: any) { return entry[field]; })
+        .filter(function (value: any) { return typeof value === 'number'; });
+      return values.length ? values.reduce(function (total: number, value: number) { return total + value; }, 0) : null;
+    };
+    const providerCost = providerSum('estimated_cost_usd');
+    const providerFinalInvocations = providerSum('final_invocation_count') ?? 0;
+    const providerPartialInvocations = providerSum('partial_invocation_count') ?? 0;
+    const providerUnobservedInvocations = providerSum('unobserved_invocation_count') ?? 0;
+    const providerMissingInvocations = providerSum('missing_invocation_count') ?? 0;
+    const providerCoverageGaps =
+      providerPartialInvocations + providerUnobservedInvocations + providerMissingInvocations;
     elements.kpiGrid.replaceChildren(
       createMetricCard('Safe To Shutdown', quiescence.safe_to_shutdown ? 'Yes' : 'No'),
       createMetricCard('Shutdown Blockers', formatNumber(drainBlockerCount)),
@@ -450,12 +464,23 @@ export function renderOverview(payload: any) {
       createMetricCard('Stopped', formatNumber(payload.counts.stopped || 0)),
       createMetricCard('Stalled Waiting', formatNumber(payload.counts.running_stalled_waiting_count || 0)),
       createMetricCard('Awaiting Input', formatNumber(payload.counts.running_awaiting_input_count || 0)),
-      createMetricCard('Total Tokens', formatOverviewTokenValue(payload, 'total_tokens', splitUnavailable)),
-      createMetricCard('Input Tokens', formatOverviewTokenValue(payload, 'input_tokens', splitUnavailable)),
-      createMetricCard('Output Tokens', formatOverviewTokenValue(payload, 'output_tokens', splitUnavailable)),
-      createMetricCard('Cached Input Tokens', formatOverviewTokenValue(payload, 'cached_input_tokens', splitUnavailable)),
-      createMetricCard('Reasoning Output Tokens', formatOverviewTokenValue(payload, 'reasoning_output_tokens', splitUnavailable)),
-      createMetricCard('Max Context Window', formatOverviewTokenValue(payload, 'model_context_window', splitUnavailable)),
+      createMetricCard('Codex Enforcement Total', formatOverviewTokenValue(payload, 'total_tokens', splitUnavailable)),
+      createMetricCard('Codex Enforcement Input', formatOverviewTokenValue(payload, 'input_tokens', splitUnavailable)),
+      createMetricCard('Codex Enforcement Output', formatOverviewTokenValue(payload, 'output_tokens', splitUnavailable)),
+      createMetricCard('Codex Cached Input', formatOverviewTokenValue(payload, 'cached_input_tokens', splitUnavailable)),
+      createMetricCard('Codex Reasoning Output', formatOverviewTokenValue(payload, 'reasoning_output_tokens', splitUnavailable)),
+      createMetricCard('Codex Max Context', formatOverviewTokenValue(payload, 'model_context_window', splitUnavailable)),
+      createMetricCard('Provider Input', formatTokenDimension(providerSum('input_tokens'), 'Unavailable')),
+      createMetricCard('Provider Output', formatTokenDimension(providerSum('output_tokens'), 'Unavailable')),
+      createMetricCard('Provider Cache Read', formatTokenDimension(providerSum('cache_read_tokens'), 'Unavailable')),
+      createMetricCard('Provider Cache Create', formatTokenDimension(providerSum('cache_creation_tokens'), 'Unavailable')),
+      createMetricCard('Provider Turns', formatTokenDimension(providerSum('provider_turn_count'), 'Unavailable')),
+      createMetricCard('Provider Estimated Cost', providerCost === null ? 'Unavailable' : '$' + Number(providerCost).toFixed(4)),
+      createMetricCard('Provider Final Invocations', formatNumber(providerFinalInvocations)),
+      createMetricCard('Provider Partial Invocations', formatNumber(providerPartialInvocations)),
+      createMetricCard('Provider Unobserved Invocations', formatNumber(providerUnobservedInvocations)),
+      createMetricCard('Provider Missing Invocations', formatNumber(providerMissingInvocations)),
+      createMetricCard('Provider Coverage Gaps', formatNumber(providerCoverageGaps)),
       createMetricCard('Runtime Seconds', formatNumber(computeDisplayRuntimeSeconds(payload)))
     );
 
@@ -1004,15 +1029,30 @@ export function renderActionRequiredBanner(payload: any) {
   }
 
 export function renderApiDegradedBanner(payload: any) {
-    if (!payload || !payload.api_degraded_mode) {
+    const historyWarnings = payload && payload.quiescence && Array.isArray(payload.quiescence.warnings)
+      ? payload.quiescence.warnings.filter(function (warning: any) {
+          return warning && warning.category === 'persistence_history_degraded';
+        })
+      : [];
+    if (!payload || (!payload.api_degraded_mode && historyWarnings.length === 0)) {
       elements.apiDegradedBanner.classList.add('hidden');
       elements.apiDegradedSummary.textContent = '';
       return;
     }
+    elements.apiDegradedTitle.textContent = payload.api_degraded_mode
+      ? (historyWarnings.length > 0 ? 'API and Audit History Degraded' : 'API Degraded')
+      : 'Audit History Degraded';
     const routes = Array.isArray(payload.api_degraded_routes) ? payload.api_degraded_routes.join(', ') : 'n/a';
     elements.apiDegradedBanner.classList.remove('hidden');
-    elements.apiDegradedSummary.textContent =
-      (payload.api_degraded_reason_code || 'unknown') + ' • fallback routes: ' + routes;
+    const messages = [];
+    if (payload.api_degraded_mode) {
+      messages.push((payload.api_degraded_reason_code || 'unknown') + ' • fallback routes: ' + routes);
+    }
+    historyWarnings.forEach(function (warning: any) {
+      messages.push('History degraded: ' + (warning.reason_code || warning.detail || 'unknown') +
+        (warning.observed_at ? ' • observed ' + warning.observed_at : ''));
+    });
+    elements.apiDegradedSummary.textContent = messages.join(' • ');
   }
 
 export function describeTransition(transition: any) {

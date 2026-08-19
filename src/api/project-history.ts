@@ -140,13 +140,41 @@ export interface ProjectHistoryTicketListResponse {
   facts: ProjectHistoryFactState[];
 }
 
+export interface ProjectHistoryProviderUsageTotal {
+  runtime_provider: string;
+  effective_model: string | null;
+  ticket_phase: string | null;
+  invocation_count: number;
+  final_invocation_count: number;
+  partial_invocation_count: number;
+  unobserved_invocation_count: number;
+  missing_invocation_count: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+  provider_turn_count: number | null;
+  estimated_cost_usd: number | null;
+  updated_at: string | null;
+}
+
 export interface ProjectHistoryTicketDetailResponse extends ProjectHistoryTicketRow {
   health: ProjectHistoryHealth;
   timeline: TicketTimelineRecord;
   attempts: TicketTimelineRecord['attempts'];
   phases: TicketTimelineRecord['phase_spans'];
   state_transitions: TicketTimelineRecord['state_transitions'];
-  thread_references: Array<{ thread_id: string; attempt_id: string; started_at: string; ended_at: string | null; status: string }>;
+  thread_references: Array<{
+    thread_id: string;
+    attempt_id: string;
+    session_id: string | null;
+    agent_runtime: string | null;
+    worker_instance_id: string | null;
+    worker_process_pid: number | null;
+    started_at: string;
+    ended_at: string | null;
+    status: string;
+  }>;
   turn_references: Array<{ turn_id: string; thread_id: string; turn_index: number; started_at: string; ended_at: string | null; status: string }>;
   outcomes: TicketTimelineRecord['terminal_outcomes'];
   blockers: TicketTimelineRecord['blockers'];
@@ -158,6 +186,7 @@ export interface ProjectHistoryTicketDetailResponse extends ProjectHistoryTicket
   blocked_input_events: TicketTimelineRecord['blocked_input_events'];
   app_server_lite_summaries: AppServerEventLedgerExcerpt[];
   token_model_summaries: TicketTimelineRecord['token_model_facts'];
+  provider_totals: ProjectHistoryProviderUsageTotal[];
 }
 
 export interface ProjectHistoryConsumerSummaryResponse {
@@ -321,6 +350,10 @@ export function buildProjectHistoryTicketDetailResponse(
     thread_references: timeline.threads.map((thread) => ({
       thread_id: thread.thread_id,
       attempt_id: thread.attempt_id,
+      session_id: thread.session_id ?? null,
+      agent_runtime: thread.agent_runtime ?? null,
+      worker_instance_id: thread.worker_instance_id ?? null,
+      worker_process_pid: thread.worker_process_pid ?? null,
       started_at: thread.started_at,
       ended_at: thread.ended_at,
       status: thread.status
@@ -342,7 +375,8 @@ export function buildProjectHistoryTicketDetailResponse(
     drain_audit_events: timeline.drain_audit_events,
     blocked_input_events: timeline.blocked_input_events,
     app_server_lite_summaries: timeline.app_server_events,
-    token_model_summaries: timeline.token_model_facts
+    token_model_summaries: timeline.token_model_facts,
+    provider_totals: buildCompletedProviderTotals(timeline)
   };
 }
 
@@ -385,7 +419,7 @@ export function buildProjectHistoryConsumerSummaryResponse(
     resolved_at: blocker.resolved_at
   }));
   const recentTokenFacts = latestItems(timeline.token_model_facts, (fact) => fact.observed_at, 5);
-  const providerGroups = groupProviderFacts(timeline.token_model_facts);
+  const providerGroups = groupProviderFacts(timeline);
   const recentAppServerEvents = latestItems(timeline.app_server_events, (event) => event.observed_at, 5);
   const appServerPolicy = classifyAppServerLitePolicy(recentAppServerEvents);
   const appServerExcerpts = recentAppServerEvents.map((event) => ({
@@ -436,8 +470,8 @@ export function buildProjectHistoryConsumerSummaryResponse(
       effective_models: uniqueStrings(timeline.token_model_facts.map((fact) => fact.effective_model)),
       telemetry_confidences: uniqueStrings(timeline.token_model_facts.map((fact) => fact.telemetry_confidence)),
       runtime_providers: uniqueStrings(timeline.token_model_facts.map((fact) => fact.runtime_provider ?? null)),
-      provider_turn_count: sumNullable(timeline.token_model_facts.map((fact) => fact.provider_turn_count ?? null)),
-      estimated_cost_usd: sumNullable(timeline.token_model_facts.map((fact) => fact.estimated_cost_usd ?? null)),
+      provider_turn_count: sumNullable(providerGroups.map((group) => group.provider_turn_count)),
+      estimated_cost_usd: sumNullable(providerGroups.map((group) => group.estimated_cost_usd)),
       by_runtime_and_model: providerGroups,
       recent: recentTokenFacts.map((fact) => ({
         requested_model: fact.requested_model,
@@ -1068,13 +1102,256 @@ function sumNullable(values: Array<number | null>): number | null {
   return present.reduce((sum, value) => sum + value, 0);
 }
 
-function groupProviderFacts(facts: TicketTimelineRecord['token_model_facts']): ProjectHistoryConsumerSummaryResponse['token_model']['by_runtime_and_model'] {
+function optionalFiniteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function providerFactRank(fact: TicketTimelineRecord['token_model_facts'][number]): number {
+  if (fact.provider_usage_status === 'final' || fact.telemetry_confidence === 'provider_result') return 3;
+  if (fact.provider_usage_status === 'partial' || fact.telemetry_confidence === 'provider_step') return 2;
+  return 1;
+}
+
+function preferProviderFact(
+  current: TicketTimelineRecord['token_model_facts'][number] | undefined,
+  candidate: TicketTimelineRecord['token_model_facts'][number]
+): TicketTimelineRecord['token_model_facts'][number] {
+  if (!current) return candidate;
+  const rankDelta = providerFactRank(candidate) - providerFactRank(current);
+  if (rankDelta !== 0) return rankDelta > 0 ? candidate : current;
+  return candidate.observed_at >= current.observed_at ? candidate : current;
+}
+
+function buildCompletedProviderTotals(timeline: TicketTimelineRecord): ProjectHistoryProviderUsageTotal[] {
+  type ProviderFact = TicketTimelineRecord['token_model_facts'][number];
+  type UsageRow = {
+    runtime_provider: string;
+    effective_model: string | null;
+    ticket_phase: string | null;
+    invocation_key: string;
+    status: string | null;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    cache_read_tokens: number | null;
+    cache_creation_tokens: number | null;
+    provider_turn_count: number | null;
+    estimated_cost_usd: number | null;
+    updated_at: string;
+  };
+
+  const phaseByTurn = new Map<string, { phase: string; started_at: string }>();
+  for (const phase of timeline.phase_spans) {
+    const current = phaseByTurn.get(phase.turn_id);
+    if (!current || phase.started_at >= current.started_at) {
+      phaseByTurn.set(phase.turn_id, { phase: phase.phase, started_at: phase.started_at });
+    }
+  }
+
+  const invocationFacts = new Map<string, ProviderFact>();
+  const modelFacts = new Map<string, ProviderFact>();
+  for (const fact of timeline.token_model_facts) {
+    if (fact.runtime_provider !== 'claude-cli') continue;
+    const invocationKey = fact.turn_id ?? fact.token_model_fact_id;
+    if (fact.model_source === 'claude_model_usage') {
+      const modelKey = `${invocationKey}\0${fact.effective_model ?? 'unknown'}`;
+      modelFacts.set(modelKey, preferProviderFact(modelFacts.get(modelKey), fact));
+      continue;
+    }
+    invocationFacts.set(invocationKey, preferProviderFact(invocationFacts.get(invocationKey), fact));
+  }
+
+  const rows: UsageRow[] = [];
+  for (const [invocationKey, invocation] of invocationFacts) {
+    const ticketPhase = invocation.turn_id ? phaseByTurn.get(invocation.turn_id)?.phase ?? null : null;
+    const persistedModels = [...modelFacts.entries()]
+      .filter(([key]) => key.startsWith(`${invocationKey}\0`))
+      .map(([, fact]) => fact)
+      .filter((fact) =>
+        [fact.input_tokens, fact.output_tokens, fact.cached_input_tokens, fact.cache_creation_input_tokens]
+          .some((value) => typeof value === 'number' && value > 0)
+      );
+    const embeddedModels = persistedModels.length === 0
+      ? (invocation.model_usage ?? []).flatMap((usage) => {
+          const model = typeof usage.model === 'string' && usage.model.trim().length > 0 ? usage.model.trim() : null;
+          const input = optionalFiniteNumber(usage.input_tokens);
+          const output = optionalFiniteNumber(usage.output_tokens);
+          const cacheRead = optionalFiniteNumber(usage.cache_read_tokens);
+          const cacheCreation = optionalFiniteNumber(usage.cache_creation_tokens);
+          if (!model || ![input, output, cacheRead, cacheCreation].some((value) => (value ?? 0) > 0)) return [];
+          return [{ model, input, output, cacheRead, cacheCreation, cost: optionalFiniteNumber(usage.estimated_cost_usd) }];
+        })
+      : [];
+
+    if (persistedModels.length > 0) {
+      for (const model of persistedModels) {
+        rows.push({
+          runtime_provider: 'claude-cli',
+          effective_model: model.effective_model ?? 'unknown',
+          ticket_phase: ticketPhase,
+          invocation_key: invocationKey,
+          status: invocation.provider_usage_status ?? null,
+          input_tokens: model.input_tokens,
+          output_tokens: model.output_tokens,
+          cache_read_tokens: model.cached_input_tokens,
+          cache_creation_tokens: model.cache_creation_input_tokens ?? null,
+          provider_turn_count: persistedModels.length === 1 ? invocation.provider_turn_count ?? null : null,
+          estimated_cost_usd: model.estimated_cost_usd ?? null,
+          updated_at: invocation.observed_at
+        });
+      }
+      if (persistedModels.length > 1 && invocation.provider_turn_count !== null && invocation.provider_turn_count !== undefined) {
+        rows.push({
+          runtime_provider: 'claude-cli',
+          effective_model: null,
+          ticket_phase: ticketPhase,
+          invocation_key: invocationKey,
+          status: invocation.provider_usage_status ?? null,
+          input_tokens: null,
+          output_tokens: null,
+          cache_read_tokens: null,
+          cache_creation_tokens: null,
+          provider_turn_count: invocation.provider_turn_count,
+          estimated_cost_usd: null,
+          updated_at: invocation.observed_at
+        });
+      }
+      continue;
+    }
+    if (embeddedModels.length > 0) {
+      for (const model of embeddedModels) {
+        rows.push({
+          runtime_provider: 'claude-cli',
+          effective_model: model.model,
+          ticket_phase: ticketPhase,
+          invocation_key: invocationKey,
+          status: invocation.provider_usage_status ?? null,
+          input_tokens: model.input,
+          output_tokens: model.output,
+          cache_read_tokens: model.cacheRead,
+          cache_creation_tokens: model.cacheCreation,
+          provider_turn_count: embeddedModels.length === 1 ? invocation.provider_turn_count ?? null : null,
+          estimated_cost_usd: model.cost,
+          updated_at: invocation.observed_at
+        });
+      }
+      if (embeddedModels.length > 1 && invocation.provider_turn_count !== null && invocation.provider_turn_count !== undefined) {
+        rows.push({
+          runtime_provider: 'claude-cli',
+          effective_model: null,
+          ticket_phase: ticketPhase,
+          invocation_key: invocationKey,
+          status: invocation.provider_usage_status ?? null,
+          input_tokens: null,
+          output_tokens: null,
+          cache_read_tokens: null,
+          cache_creation_tokens: null,
+          provider_turn_count: invocation.provider_turn_count,
+          estimated_cost_usd: null,
+          updated_at: invocation.observed_at
+        });
+      }
+      continue;
+    }
+    rows.push({
+      runtime_provider: 'claude-cli',
+      effective_model: invocation.effective_model ?? invocation.requested_model ?? 'unknown',
+      ticket_phase: ticketPhase,
+      invocation_key: invocationKey,
+      status: invocation.provider_usage_status ?? null,
+      input_tokens: invocation.input_tokens,
+      output_tokens: invocation.output_tokens,
+      cache_read_tokens: invocation.cached_input_tokens,
+      cache_creation_tokens: invocation.cache_creation_input_tokens ?? null,
+      provider_turn_count: invocation.provider_turn_count ?? null,
+      estimated_cost_usd: invocation.estimated_cost_usd ?? null,
+      updated_at: invocation.observed_at
+    });
+  }
+
+  const groups = new Map<string, ProjectHistoryProviderUsageTotal & {
+    invocation_keys: Set<string>;
+    input_values: Array<number | null>;
+    output_values: Array<number | null>;
+    cache_read_values: Array<number | null>;
+    cache_creation_values: Array<number | null>;
+    turn_values: Array<number | null>;
+    cost_values: Array<number | null>;
+  }>();
+  for (const row of rows) {
+    const key = `${row.runtime_provider}\0${row.effective_model}\0${row.ticket_phase ?? ''}`;
+    const group = groups.get(key) ?? {
+      runtime_provider: row.runtime_provider,
+      effective_model: row.effective_model,
+      ticket_phase: row.ticket_phase,
+      invocation_count: 0,
+      final_invocation_count: 0,
+      partial_invocation_count: 0,
+      unobserved_invocation_count: 0,
+      missing_invocation_count: 0,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      provider_turn_count: null,
+      estimated_cost_usd: null,
+      updated_at: null,
+      invocation_keys: new Set<string>(),
+      input_values: [],
+      output_values: [],
+      cache_read_values: [],
+      cache_creation_values: [],
+      turn_values: [],
+      cost_values: []
+    };
+    if (!group.invocation_keys.has(row.invocation_key)) {
+      group.invocation_keys.add(row.invocation_key);
+      group.invocation_count += 1;
+      if (row.status === 'final') group.final_invocation_count += 1;
+      else if (row.status === 'partial' || row.status === 'legacy_partial') group.partial_invocation_count += 1;
+      else if (row.status === 'unobserved') group.unobserved_invocation_count += 1;
+      else group.missing_invocation_count += 1;
+    }
+    group.input_values.push(row.input_tokens);
+    group.output_values.push(row.output_tokens);
+    group.cache_read_values.push(row.cache_read_tokens);
+    group.cache_creation_values.push(row.cache_creation_tokens);
+    group.turn_values.push(row.provider_turn_count);
+    group.cost_values.push(row.estimated_cost_usd);
+    group.updated_at = !group.updated_at || row.updated_at > group.updated_at ? row.updated_at : group.updated_at;
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .map(({
+      invocation_keys: _invocationKeys,
+      input_values,
+      output_values,
+      cache_read_values,
+      cache_creation_values,
+      turn_values,
+      cost_values,
+      ...group
+    }) => ({
+      ...group,
+      input_tokens: sumNullable(input_values),
+      output_tokens: sumNullable(output_values),
+      cache_read_tokens: sumNullable(cache_read_values),
+      cache_creation_tokens: sumNullable(cache_creation_values),
+      provider_turn_count: sumNullable(turn_values),
+      estimated_cost_usd: sumNullable(cost_values)
+    }))
+    .sort((a, b) =>
+      `${a.runtime_provider}/${a.effective_model ?? ''}/${a.ticket_phase ?? ''}`
+        .localeCompare(`${b.runtime_provider}/${b.effective_model ?? ''}/${b.ticket_phase ?? ''}`)
+    );
+}
+
+function groupProviderFacts(timeline: TicketTimelineRecord): ProjectHistoryConsumerSummaryResponse['token_model']['by_runtime_and_model'] {
   const groups = new Map<string, ProjectHistoryConsumerSummaryResponse['token_model']['by_runtime_and_model'][number] & {
     token_values: Array<number | null>;
     turn_values: Array<number | null>;
     cost_values: Array<number | null>;
   }>();
-  for (const fact of facts) {
+  for (const fact of timeline.token_model_facts.filter((candidate) => candidate.runtime_provider !== 'claude-cli')) {
     const runtimeProvider = fact.runtime_provider ?? 'codex-app-server';
     const effectiveModel = fact.effective_model ?? 'unknown';
     const key = `${runtimeProvider}\u0000${effectiveModel}`;
@@ -1093,6 +1370,26 @@ function groupProviderFacts(facts: TicketTimelineRecord['token_model_facts']): P
     group.token_values.push(fact.total_tokens);
     group.turn_values.push(fact.provider_turn_count ?? null);
     group.cost_values.push(fact.estimated_cost_usd ?? null);
+    groups.set(key, group);
+  }
+  for (const total of buildCompletedProviderTotals(timeline)) {
+    const effectiveModel = total.effective_model ?? 'unallocated-provider-turns';
+    const key = `${total.runtime_provider}\u0000${effectiveModel}`;
+    const group = groups.get(key) ?? {
+      runtime_provider: total.runtime_provider,
+      effective_model: effectiveModel,
+      fact_count: 0,
+      total_tokens: null,
+      provider_turn_count: null,
+      estimated_cost_usd: null,
+      token_values: [],
+      turn_values: [],
+      cost_values: []
+    };
+    group.fact_count += total.invocation_count;
+    group.token_values.push(null);
+    group.turn_values.push(total.provider_turn_count);
+    group.cost_values.push(total.estimated_cost_usd);
     groups.set(key, group);
   }
   return [...groups.values()]

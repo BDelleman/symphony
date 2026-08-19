@@ -60,7 +60,7 @@ export function renderDashboardHtml(_config?: DashboardClientConfig): string {
   </section>
 
   <section id="api-degraded-banner" class="api-degraded-banner hidden" role="region" aria-live="polite">
-    <strong>API Degraded</strong>
+    <strong id="api-degraded-title">API Degraded</strong>
     <span id="api-degraded-summary"></span>
   </section>
 

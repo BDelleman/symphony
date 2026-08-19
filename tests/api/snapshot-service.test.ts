@@ -201,6 +201,69 @@ function makeTranscriptScanBudget() {
 }
 
 describe('SnapshotService', () => {
+  it('projects Claude usage separately without changing Codex enforcement totals or nulls', () => {
+    const service = new SnapshotService({ nowMs: () => Date.parse('2026-04-10T10:02:00.000Z') });
+    const state = makeState({
+      running: new Map([
+        [
+          'issue-1',
+          makeRunningEntry({
+            agent_runtime: 'claude-cli',
+            worker_process_pid: '4321',
+            requested_model: 'claude-sonnet-4-6',
+            effective_model: 'claude-sonnet-4-6',
+            provider_usage: {
+              runtime: 'claude-cli',
+              model: 'claude-sonnet-4-6',
+              effective_models: ['claude-sonnet-4-6'],
+              input_tokens: 120,
+              output_tokens: 30,
+              cache_read_tokens: null,
+              cache_creation_tokens: 5,
+              provider_turn_count: 2,
+              estimated_cost_usd: null,
+              source: 'claude_stream_result',
+              status: 'partial',
+              confidence: 'provider_step',
+              api_retry_count: 0,
+              tool_counts: { Read: 1 },
+              mcp_counts: { 'linear-server': 1 },
+              updated_at: '2026-04-10T10:01:30.000Z',
+              supervised_session_coverage: 'partial'
+            }
+          })
+        ]
+      ])
+    });
+
+    const projected = service.projectState(state);
+    expect(projected.codex_totals).toMatchObject({ input_tokens: 10, output_tokens: 20, total_tokens: 30 });
+    expect(projected.running[0]).toMatchObject({
+      agent_runtime: 'claude-cli',
+      worker_process_pid: '4321',
+      provider_usage: {
+        status: 'partial',
+        input_tokens: 120,
+        output_tokens: 30,
+        cache_read_tokens: null,
+        estimated_cost_usd: null,
+        supervised_session_coverage: 'partial'
+      }
+    });
+    expect(projected.provider_totals).toEqual([
+      expect.objectContaining({
+        runtime: 'claude-cli',
+        effective_model: 'claude-sonnet-4-6',
+        partial_invocation_count: 1,
+        input_tokens: 120,
+        output_tokens: 30,
+        cache_read_tokens: null,
+        cache_creation_tokens: 5,
+        estimated_cost_usd: null
+      })
+    ]);
+  });
+
   it('projects orchestrator state into API state contract and includes active runtime seconds', () => {
     const service = new SnapshotService({
       nowMs: () => Date.parse('2026-04-10T10:02:00.000Z')

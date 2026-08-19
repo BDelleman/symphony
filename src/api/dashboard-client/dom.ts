@@ -39,6 +39,7 @@ export function resolveDashboardElements(doc = document) {
     drainWaitButton: doc.getElementById('drain-wait-button'),
     drainShutdownButton: doc.getElementById('drain-shutdown-button'),
     apiDegradedBanner: doc.getElementById('api-degraded-banner'),
+    apiDegradedTitle: doc.getElementById('api-degraded-title'),
     apiDegradedSummary: doc.getElementById('api-degraded-summary'),
     snapshotErrorPanel: doc.getElementById('snapshot-error-panel'),
     snapshotErrorMessage: doc.getElementById('snapshot-error-message'),

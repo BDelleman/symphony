@@ -107,6 +107,20 @@ export function toStateRunningRow(
     thread_id: entry.thread_id,
     turn_id: entry.turn_id,
     codex_app_server_pid: entry.codex_app_server_pid,
+    agent_runtime: entry.agent_runtime ?? null,
+    worker_process_pid: entry.worker_process_pid ?? null,
+    provider_usage: entry.provider_usage
+      ? {
+          ...entry.provider_usage,
+          effective_models: [...(entry.provider_usage.effective_models ?? [])],
+          tool_counts: { ...(entry.provider_usage.tool_counts ?? {}) },
+          mcp_counts: { ...(entry.provider_usage.mcp_counts ?? {}) },
+          model_usage: (entry.provider_usage.model_usage ?? []).map((usage) => ({ ...usage })),
+          reconciliation_delta: entry.provider_usage.reconciliation_delta
+            ? { ...entry.provider_usage.reconciliation_delta }
+            : null
+        }
+      : null,
     turn_count: entry.turn_count,
     last_event: entry.last_event,
     last_event_summary: entry.last_event_summary,

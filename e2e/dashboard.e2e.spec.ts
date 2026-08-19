@@ -23,6 +23,7 @@ type DashboardStatePayload = {
     output_tokens: number;
     seconds_running: number;
   };
+  provider_totals?: Array<Record<string, unknown>>;
   rate_limits: Record<string, unknown> | null;
   throughput: {
     windows: Array<Record<string, unknown>>;
@@ -614,6 +615,181 @@ test.describe('phase-marker dashboard e2e', () => {
     await expect(page.locator('#running-rows')).toContainText('No phase movement yet');
   });
 
+  test('renders live Claude dimensions and retained provider overview totals without fake zeroes', async ({ page }) => {
+    const providerUsage = {
+      runtime: 'claude-cli',
+      model: 'claude-sonnet-4-6',
+      effective_models: ['claude-sonnet-4-6'],
+      input_tokens: 120,
+      output_tokens: 30,
+      cache_read_tokens: 50,
+      cache_creation_tokens: 10,
+      provider_turn_count: 3,
+      estimated_cost_usd: null,
+      source: 'claude_assistant_step',
+      status: 'partial',
+      confidence: 'provider_step',
+      api_retry_count: 1,
+      tool_counts: { Read: 2 },
+      mcp_counts: { 'linear-server': 1 },
+      updated_at: ISO_NOW,
+      missing_reason: null,
+      reconciliation_delta: null,
+      model_usage: [],
+      nested_session_detected: false,
+      supervised_session_coverage: 'partial'
+    };
+    await installDashboardApiMocks(page, {
+      state: baseState({
+        counts: {
+          running: 1,
+          retrying: 0,
+          blocked: 0,
+          stopped: 0,
+          running_stalled_waiting_count: 0,
+          running_awaiting_input_count: 0
+        },
+        provider_totals: [{
+          runtime: 'claude-cli',
+          effective_model: 'claude-sonnet-4-6',
+          invocation_count: 2,
+          final_invocation_count: 1,
+          partial_invocation_count: 1,
+          input_tokens: 420,
+          output_tokens: 90,
+          cache_read_tokens: 150,
+          cache_creation_tokens: 20,
+          provider_turn_count: 7,
+          estimated_cost_usd: 0.42,
+          updated_at: ISO_NOW
+        }],
+        running: [{
+          issue_identifier: 'NIE-CLAUDE',
+          state: 'running',
+          agent_runtime: 'claude-cli',
+          requested_model: 'claude-sonnet-4-6',
+          effective_model: 'claude-sonnet-4-6',
+          worker_process_pid: 4242,
+          session_id: '11111111-1111-4111-8111-111111111111',
+          thread_id: 'claude:11111111-1111-4111-8111-111111111111',
+          turn_id: 'claude-turn-1',
+          workspace_path: '/tmp/workspaces/NIE-CLAUDE',
+          provisioner_type: 'git_worktree',
+          branch_name: 'feature/NIE-CLAUDE',
+          workspace_git_status: 'clean',
+          started_at: ISO_OLD,
+          turn_count: 1,
+          provider_usage: providerUsage,
+          last_event_summary: 'Claude usage partial',
+          last_event: 'agent_runner.activity',
+          last_event_at: ISO_NOW,
+          progress_signal_state: 'advancing',
+          turn_control_state: 'agent_turn'
+        }]
+      })
+    });
+
+    await page.goto('/');
+
+    await expect(page.locator('#kpi-grid')).toContainText('Provider Input420');
+    await expect(page.locator('#kpi-grid')).toContainText('Provider Estimated Cost$0.4200');
+    await expect(page.locator('#running-rows')).toContainText('Runtime claude-cli');
+    await expect(page.locator('#running-rows')).toContainText('In 120 / Out 30 / Cache read 50 / Cache create 10');
+    await expect(page.locator('#running-rows')).toContainText('Partial provider usage');
+    await expect(page.locator('#running-rows')).not.toContainText('Estimated $0.0000');
+  });
+
+  test('issue detail distinguishes partial, final, and unobserved Claude telemetry transitions', async ({ page }) => {
+    const baseUsage = {
+      runtime: 'claude-cli',
+      model: 'claude-sonnet-4-6',
+      effective_models: ['claude-sonnet-4-6'],
+      input_tokens: 25,
+      output_tokens: 5,
+      cache_read_tokens: 8,
+      cache_creation_tokens: 2,
+      provider_turn_count: 1,
+      estimated_cost_usd: null,
+      source: 'claude_assistant_step',
+      status: 'partial',
+      confidence: 'provider_step',
+      api_retry_count: 0,
+      tool_counts: { Read: 1 },
+      mcp_counts: { 'linear-server': 1 },
+      updated_at: ISO_NOW,
+      missing_reason: null,
+      supervised_session_coverage: 'partial'
+    };
+    let providerUsage: Record<string, unknown> = baseUsage;
+    await installDashboardApiMocks(page, {
+      state: baseState(),
+      issues: {
+        'NIE-CLAUDE-DETAIL': () => ({
+          issue_identifier: 'NIE-CLAUDE-DETAIL',
+          issue_id: 'issue-claude-detail',
+          status: 'running',
+          workspace: { path: '/tmp/workspaces/NIE-CLAUDE-DETAIL' },
+          running: {
+            agent_runtime: 'claude-cli',
+            requested_model: 'claude-sonnet-4-6',
+            effective_model: 'claude-sonnet-4-6',
+            worker_process_pid: '4242',
+            session_id: '33333333-3333-4333-8333-333333333333',
+            thread_id: 'claude:33333333-3333-4333-8333-333333333333',
+            turn_id: 'claude-detail-turn',
+            provider_usage: providerUsage,
+            provisioner_type: 'git_clone',
+            branch_name: 'feature/NIE-CLAUDE-DETAIL',
+            workspace_git_status: 'clean'
+          },
+          retry: null,
+          blocked: null,
+          phase_timeline: [],
+          recent_events: []
+        })
+      }
+    });
+
+    await page.goto('/');
+    await page.locator('#issue-input').fill('NIE-CLAUDE-DETAIL');
+    await page.locator('#issue-load').click();
+    await expect(page.locator('#issue-summary')).toContainText('Agent runtime: claude-cli');
+    await expect(page.locator('#issue-summary')).toContainText('In 25 / Out 5 / Cache read 8 / Cache create 2');
+    await expect(page.locator('#issue-summary')).toContainText('partial • provider_step');
+    await expect(page.locator('#issue-summary')).not.toContainText('Estimated $0.0000');
+
+    providerUsage = {
+      ...baseUsage,
+      input_tokens: 40,
+      output_tokens: 9,
+      provider_turn_count: 2,
+      estimated_cost_usd: 0.031,
+      source: 'claude_stream_result',
+      status: 'final',
+      confidence: 'provider_result',
+      supervised_session_coverage: 'complete'
+    };
+    await page.locator('#issue-load').click();
+    await expect(page.locator('#issue-summary')).toContainText('Estimated $0.0310');
+    await expect(page.locator('#issue-summary')).toContainText('final • provider_result');
+
+    providerUsage = {
+      ...baseUsage,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      provider_turn_count: null,
+      status: 'unobserved',
+      confidence: 'missing',
+      missing_reason: 'process_closed_without_usage',
+      supervised_session_coverage: 'missing'
+    };
+    await page.locator('#issue-load').click();
+    await expect(page.locator('#issue-summary')).toContainText('Provider usage missing • process_closed_without_usage');
+    await expect(page.locator('#issue-summary')).toContainText('Provider coverage warning: missing');
+  });
+
   test('renders operator explainer counters, row hints, and stalled-wait issue detail card', async ({ page }) => {
     await installDashboardApiMocks(page, {
       state: baseState({
@@ -1031,12 +1207,39 @@ test.describe('phase-marker dashboard e2e', () => {
             previous_thread_id: 'thread-prev-manual',
             turn_control_state: 'blocked_manual_resume',
             progress_signal_state: 'stalled_waiting',
+            runtime_state_kind: 'blocked_input',
             requires_manual_resume: true,
             awaiting_operator: true,
             required_actions: [
               'Mark acceptance complete and resume',
               'Push additional commit and resume',
               'Cancel and return to backlog'
+            ],
+            available_actions: [
+              {
+                id: 'resume',
+                label: 'Mark Acceptance Complete + Resume',
+                endpoint: '/api/v1/issues/NIE-66-MANUAL/resume',
+                method: 'POST',
+                requires_reason_note: true,
+                destructive: false
+              },
+              {
+                id: 'resume',
+                label: 'Push Commit + Resume',
+                endpoint: '/api/v1/issues/NIE-66-MANUAL/resume',
+                method: 'POST',
+                requires_reason_note: true,
+                destructive: false
+              },
+              {
+                id: 'cancel',
+                label: 'Cancel to Backlog',
+                endpoint: '/api/v1/issues/NIE-66-MANUAL/cancel',
+                method: 'POST',
+                requires_reason_note: true,
+                destructive: true
+              }
             ],
             pending_input: null,
             last_input_submit: null

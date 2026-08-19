@@ -1,4 +1,5 @@
 import type { RunningEntry, OrchestratorState } from '../../orchestrator';
+import { REASON_CODES } from '../../observability';
 import { resolveSnapshotFreshness } from '../runtime-visibility';
 import type { ApiCodexSessionTranscriptScanBudget } from '../types';
 import { asIsoDate } from './time';
@@ -8,7 +9,7 @@ export function projectPhaseTiming(entry: { current_phase_at_ms?: number | null 
   return {
     phase_started_at: phaseStartedAtMs ? asIsoDate(phaseStartedAtMs) : null,
     phase_elapsed_ms: phaseStartedAtMs ? Math.max(0, nowMs - phaseStartedAtMs) : null,
-    source: phaseStartedAtMs ? ('symphony_phase_marker' as const) : null
+    source: phaseStartedAtMs ? REASON_CODES.symphonyPhaseMarker : null
   };
 }
 

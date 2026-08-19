@@ -361,6 +361,46 @@ export class SnapshotService {
           : {}),
         seconds_running: state.codex_totals.seconds_running + activeSeconds
       },
+      provider_totals: Array.from(
+        running.reduce((groups, entry) => {
+          const usage = entry.provider_usage;
+          if (!usage) return groups;
+          const model = usage.model ?? entry.effective_model ?? entry.requested_model ?? null;
+          const key = `claude-cli\0${model ?? ''}`;
+          const current = groups.get(key) ?? {
+            runtime: 'claude-cli' as const,
+            effective_model: model,
+            invocation_count: 0,
+            final_invocation_count: 0,
+            partial_invocation_count: 0,
+            unobserved_invocation_count: 0,
+            missing_invocation_count: 0,
+            input_tokens: null,
+            output_tokens: null,
+            cache_read_tokens: null,
+            cache_creation_tokens: null,
+            provider_turn_count: null,
+            estimated_cost_usd: null,
+            updated_at: null
+          };
+          const addNullable = (left: number | null, right: number | null) =>
+            right === null ? left : (left ?? 0) + right;
+          current.invocation_count += 1;
+          if (usage.status === 'final') current.final_invocation_count += 1;
+          if (usage.status === 'partial') current.partial_invocation_count += 1;
+          else if (usage.status === 'unobserved') current.unobserved_invocation_count += 1;
+          else if (usage.status !== 'final') current.missing_invocation_count += 1;
+          current.input_tokens = addNullable(current.input_tokens, usage.input_tokens);
+          current.output_tokens = addNullable(current.output_tokens, usage.output_tokens);
+          current.cache_read_tokens = addNullable(current.cache_read_tokens, usage.cache_read_tokens);
+          current.cache_creation_tokens = addNullable(current.cache_creation_tokens, usage.cache_creation_tokens);
+          current.provider_turn_count = addNullable(current.provider_turn_count, usage.provider_turn_count);
+          current.estimated_cost_usd = addNullable(current.estimated_cost_usd, usage.estimated_cost_usd);
+          if (usage.updated_at && (!current.updated_at || usage.updated_at > current.updated_at)) current.updated_at = usage.updated_at;
+          groups.set(key, current);
+          return groups;
+        }, new Map<string, ApiStateResponse['provider_totals'][number]>()).values()
+      ).sort((left, right) => (left.effective_model ?? '').localeCompare(right.effective_model ?? '')),
       rate_limits: state.codex_rate_limits,
       health: {
         dispatch_validation: state.health.dispatch_validation,
@@ -517,6 +557,20 @@ export class SnapshotService {
           thread_id: entry.thread_id,
           turn_id: entry.turn_id,
           codex_app_server_pid: entry.codex_app_server_pid,
+          agent_runtime: entry.agent_runtime ?? null,
+          worker_process_pid: entry.worker_process_pid ?? null,
+          provider_usage: entry.provider_usage
+            ? {
+                ...entry.provider_usage,
+                effective_models: [...(entry.provider_usage.effective_models ?? [])],
+                tool_counts: { ...(entry.provider_usage.tool_counts ?? {}) },
+                mcp_counts: { ...(entry.provider_usage.mcp_counts ?? {}) },
+                model_usage: (entry.provider_usage.model_usage ?? []).map((usage) => ({ ...usage })),
+                reconciliation_delta: entry.provider_usage.reconciliation_delta
+                  ? { ...entry.provider_usage.reconciliation_delta }
+                  : null
+              }
+            : null,
           turn_count: entry.turn_count,
           state: entry.issue.state,
           started_at: asIsoDate(entry.started_at_ms),

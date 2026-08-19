@@ -366,9 +366,12 @@ export async function loadDiagnostics() {
       const nodes = runs.map((entry: any) => {
         const item = document.createElement('li');
         const title = document.createElement('strong');
-        title.textContent = entry.issue_identifier + ' (' + (entry.terminal_status || 'active') + ')';
+        title.textContent = entry.issue_identifier + ' (' + (entry.workflow_outcome || entry.terminal_status || 'active') + ')';
         const meta = document.createElement('span');
-        meta.textContent = ' • started ' + formatDate(entry.started_at) + (entry.ended_at ? ' • ended ' + formatDate(entry.ended_at) : '');
+        meta.textContent =
+          ' • process ' + (entry.process_status || 'n/a') +
+          ' • started ' + formatDate(entry.started_at) +
+          (entry.ended_at ? ' • ended ' + formatDate(entry.ended_at) : '');
         item.append(title, meta);
         return item;
       });
