@@ -97,7 +97,7 @@ This is retry attempt #{{ attempt }}. Continue from the current workspace and do
 ## Universal rules
 
 1. Work only in the provided repository copy. Never inspect or modify another checkout.
-2. Use the user-scoped Linear MCP for issue reads and writes. If `linear-server` is unavailable, stop with a typed readiness failure. Never fall back to `LINEAR_API_KEY`, curl, or raw HTTP.
+2. Prefer Symphony's injected `linear_graphql` tool for issue reads and writes. If it is unavailable, use the user-scoped Linear MCP. If neither is available, stop with a typed readiness failure. Never use `LINEAR_API_KEY`, curl, or raw HTTP directly.
 3. Follow repository guidance and explicitly open any skill you use. Use `.codex/skills/commit/SKILL.md` before committing and the project push/land skills where directed.
 4. Keep one unresolved `## Codex Workpad` comment. Start it with a compact plan, update it only when the plan materially changes, and finish it with validation and finalization evidence. Do not narrate every command.
 5. Stay within the ticket. Start with the issue, repository guidance, changed files, and directly affected contracts. Expand only when concrete evidence requires it.
