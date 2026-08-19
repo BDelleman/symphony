@@ -39,6 +39,8 @@ implements the base contract in `SPEC.md` plus documented local extensions in
 	npm test
 	```
 
+	This runs the fast deterministic unit suite.
+
 	Run `npm run test:integration` when changing git, worktree, or
 	process-heavy behavior.
 
