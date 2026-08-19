@@ -115,7 +115,7 @@ export function renderRunning(payload: any) {
       if (entry.provider_usage && (entry.provider_usage.status === 'partial' || entry.provider_usage.status === 'unobserved')) {
         const coverageBadge = document.createElement('span');
         coverageBadge.className = 'status-pill pending';
-        coverageBadge.textContent = entry.provider_usage.status === 'partial' ? 'Partial provider usage' : 'Provider usage missing';
+        coverageBadge.textContent = entry.provider_usage.status === 'partial' ? 'Live provider usage lower bound' : 'Provider usage missing';
         stateFlags.append(coverageBadge);
       }
       if (entry.provider_usage && entry.provider_usage.supervised_session_coverage !== 'complete') {
@@ -123,16 +123,6 @@ export function renderRunning(payload: any) {
         coverageBadge.className = 'status-pill pending';
         coverageBadge.textContent = 'Session coverage ' + (entry.provider_usage.supervised_session_coverage || 'missing');
         stateFlags.append(coverageBadge);
-      }
-      if (
-        entry.provider_usage &&
-        entry.provider_usage.reconciliation_delta &&
-        Object.values(entry.provider_usage.reconciliation_delta).some(function (value: any) { return value !== 0; })
-      ) {
-        const reconciliationBadge = document.createElement('span');
-        reconciliationBadge.className = 'status-pill pending';
-        reconciliationBadge.textContent = 'Usage reconciliation mismatch';
-        stateFlags.append(reconciliationBadge);
       }
       if (stateFlags.children.length > 0) {
         stateCell.append(stateFlags);

@@ -522,6 +522,7 @@ describe('dashboard assets', () => {
     const html = renderDashboardHtml();
 
     expect(html).toContain('Turn every run from first signal to confident handoff.');
+    expect(html).toContain('<link rel="icon" href="data:," />');
     expect(html).not.toContain('Live orchestration visibility with retry control, issue drilldown, and desktop/browser parity.');
   });
 

@@ -9,6 +9,7 @@ export function renderDashboardHtml(_config?: DashboardClientConfig): string {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="symphony-dashboard-asset-revision" content="${revision}" />
   <title>Symphony Operator Control</title>
+  <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/dashboard/styles.css?v=${revision}" />
   <script src="/dashboard/client.js?v=${revision}" defer></script>
 </head>

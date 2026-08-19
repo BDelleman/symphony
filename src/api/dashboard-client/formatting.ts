@@ -321,7 +321,7 @@ export function formatProviderUsage(usage: any) {
     if (usage.status === 'final' && typeof usage.estimated_cost_usd === 'number') {
       parts.push('Estimated $' + Number(usage.estimated_cost_usd).toFixed(4));
     }
-    parts.push(usage.status + ' • ' + usage.confidence);
+    parts.push((usage.status === 'partial' ? 'live lower bound' : usage.status) + ' • ' + usage.confidence);
     if (usage.supervised_session_coverage) parts.push('coverage ' + usage.supervised_session_coverage);
     if (typeof usage.api_retry_count === 'number') parts.push('API retries ' + formatNumber(usage.api_retry_count));
     const tools = Object.entries(usage.tool_counts || {});
