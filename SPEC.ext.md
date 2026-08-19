@@ -472,6 +472,34 @@ The v1 reference implementation evidence is:
 - Workflow lifecycle instructions: `WORKFLOW.md` defines Agent Review, Human
   Review, Merging, and Rework routing; covered by
   `tests/workflow/workflow-command-examples.test.ts`.
+- Governed Agent Review evidence: `scripts/review-with-governance.js` prepares
+  an exact-head review capsule under Git metadata and finalizes the existing v1
+  Review Receipt only after an adjacent GitHub identity and feedback refresh;
+  covered by `tests/cli/review-governance.test.ts`.
+
+### 10.1 Governed Agent Review Capsule
+
+The bundled Agent Review phase uses two local commands without adding runtime
+configuration or tracker mutation authority:
+
+- `review:governed prepare` requires the issue-derived branch, the explicit
+  Linear-linked open non-draft PR targeting `main`, matching local and remote
+  head SHAs, and a successful latest exact-head
+  `Fast validation (ubuntu-latest)` check. It records normalized PR context and
+  feedback, the complete changed-file manifest, the full binary-safe patch,
+  and their hashes under the current worktree's Git metadata.
+- `review:governed finalize` requires the same clean branch and capsule,
+  verifies capsule hashes, refreshes the explicit PR and feedback, rebuilds the
+  live diff, and refuses identity, content, feedback, or diff drift. It appends
+  the canonical verdict and version-1 Review Receipt, invokes the existing
+  artifact validator, and atomically writes the final artifact.
+
+The capsule is authoritative evidence for mechanical repository identity. It
+does not decide which review lenses apply, evaluate acceptance criteria, post
+comments, change Linear state, or merge a PR. Linear is refreshed immediately
+before finalization by the reviewer, and the Merging phase remains the final
+exact-head safeguard. Linear state and labels are refreshed again after the
+review comment and immediately before its state transition.
 
 Deferred or out-of-scope items:
 

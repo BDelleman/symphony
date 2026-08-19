@@ -64,6 +64,13 @@ describe('workflow command examples', () => {
     expect(workflow).toContain('Review routing: Human Review label present');
     expect(workflow).toContain('otherwise pass to `Merging`');
     expect(workflow).toContain('make the chosen state transition');
+    expect(workflow).toContain('npm run review:governed -- prepare --issue');
+    expect(workflow).toContain('--pr "<linked-pr-number>"');
+    expect(workflow).toContain('npm run review:governed -- finalize --body-file');
+    expect(workflow.match(/review:governed -- prepare/g)).toHaveLength(1);
+    expect(workflow).toContain('Do not query GitHub separately; the prepare command owns that snapshot');
+    expect(workflow).toContain('Immediately refresh Linear again');
+    expect(workflow).not.toContain('review_round');
   });
 
   it('renders only the instructions owned by the dispatch state', async () => {
@@ -128,6 +135,10 @@ describe('workflow command examples', () => {
     expect(workflow).toContain('Independent Invariants');
     expect(workflow).toContain('Triggered Review Lenses');
     expect(workflow).toContain('without evidence-backed lens verdicts is invalid');
+    expect(workflow).toContain('Trigger lenses from changed semantics, not vocabulary');
+    expect(workflow).toContain('Do not add P3 notes');
+    expect(lenses).toContain('documentation sentence that merely mentions a command');
+    expect(lenses).toContain('Record only triggered lenses');
     expect(lenses).toContain('### Multi-Phase Mutation');
     expect(lenses).toContain('### Control-Plane Hot Path');
     expect(lenses).toContain('### Generated Asset And Freshness');
@@ -147,6 +158,8 @@ describe('workflow command examples', () => {
     expect(spec).toContain('src/orchestrator/local-worker-runner.ts');
     expect(spec).toContain('tests/orchestrator/core-handoff.test.ts');
     expect(spec).toContain('tests/orchestrator/core-reconciliation.test.ts');
+    expect(spec).toContain('### 10.1 Governed Agent Review Capsule');
+    expect(spec).toContain('scripts/review-with-governance.js');
     expect(spec).not.toContain('Runtime stop, resume, and fresh-dispatch behavior is implemented by later slices');
     expect(spec).not.toContain('The following runtime behaviors are intentionally deferred');
   });
