@@ -34,6 +34,8 @@ import type {
 describe('OrchestratorCore persistence', () => {
   it('persists unobserved Claude usage when the process fails before a session exists', async () => {
     const tokenFacts: Array<Parameters<NonNullable<OrchestratorPersistencePort['appendTokenModelFact']>>[0]> = [];
+    const completedRuns: Array<Parameters<OrchestratorPersistencePort['completeRun']>[0]> = [];
+    const transitions: Array<Parameters<NonNullable<OrchestratorPersistencePort['appendStateTransition']>>[0]> = [];
     const persistence: OrchestratorPersistencePort = {
       startRun: async () => 'pre-init-run',
       appendIssueRun: async () => 'pre-init-issue-run',
@@ -42,9 +44,15 @@ describe('OrchestratorCore persistence', () => {
         tokenFacts.push(params);
         return String(params.token_model_fact_id);
       },
+      appendStateTransition: async (params) => {
+        transitions.push(params);
+        return 'pre-init-transition';
+      },
       recordSession: async () => undefined,
       recordEvent: async () => undefined,
-      completeRun: async () => undefined
+      completeRun: async (params) => {
+        completedRuns.push(params);
+      }
     };
     const harness = createHarness({ persistence });
     harness.tracker.fetch_candidate_issues.mockResolvedValue([
@@ -56,6 +64,7 @@ describe('OrchestratorCore persistence', () => {
       timestamp_ms: harness.now.value + 1,
       event: CANONICAL_EVENT.agentRunner.turnFailed,
       agent_runtime: 'claude-cli',
+      turn_id: 'pre-init-transient-turn',
       requested_model: 'claude-sonnet-4-6',
       provider_usage: {
         runtime: 'claude-cli',
@@ -88,6 +97,15 @@ describe('OrchestratorCore persistence', () => {
       })
     ]);
     await harness.orchestrator.onWorkerExit('i-claude-pre-init', 'abnormal');
+    expect(completedRuns).toEqual([
+      expect.objectContaining({
+        run_id: 'pre-init-run',
+        thread_id: null,
+        turn_id: null
+      })
+    ]);
+    expect(transitions).not.toEqual([]);
+    expect(transitions.every((transition) => transition.thread_id == null && transition.turn_id == null)).toBe(true);
   });
 
   it('waits for fresh Claude lineage persistence before closing the run', async () => {

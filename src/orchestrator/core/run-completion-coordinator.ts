@@ -29,6 +29,36 @@ interface RootCauseDiagnostic {
   turn_id: string | null;
 }
 
+interface PersistedCompletionLineage {
+  thread_id: string | null;
+  turn_id: string | null;
+}
+
+function persistedCompletionLineage(
+  runningEntry: RunningEntry,
+  preferredThreadId: string | null,
+  preferredTurnId: string | null
+): PersistedCompletionLineage {
+  if (!runningEntry.issue_run_id) {
+    return {
+      thread_id: preferredThreadId ?? runningEntry.thread_id ?? null,
+      turn_id: preferredTurnId ?? runningEntry.turn_id ?? null
+    };
+  }
+  const persistedThreadId = runningEntry.persisted_thread_id ?? null;
+  const observedThreadId = preferredThreadId ?? runningEntry.thread_id;
+  const threadId =
+    persistedThreadId && (!observedThreadId || observedThreadId === persistedThreadId) ? persistedThreadId : null;
+  if (!threadId) {
+    return { thread_id: null, turn_id: null };
+  }
+  const persistedTurnIds = runningEntry.persisted_turn_ids ?? [];
+  const turnId = [preferredTurnId, runningEntry.turn_id].find(
+    (candidate): candidate is string => Boolean(candidate && persistedTurnIds.includes(candidate))
+  );
+  return { thread_id: threadId, turn_id: turnId ?? null };
+}
+
 export interface RunCompletionCoordinatorHooks {
   drainExecutionGraphPersistence: (runningEntry: RunningEntry) => Promise<void>;
   recordHistoryWriteFailure: (operation: string, reasonCode: string, error: unknown) => Promise<void>;
@@ -253,6 +283,7 @@ export async function completeRunRecord(
   runningEntry.history_terminalizing = true;
   await context.hooks.drainExecutionGraphPersistence(runningEntry);
   const rootCause = extractRootCauseDiagnostic(runningEntry, error_code);
+  const persistedLineage = persistedCompletionLineage(runningEntry, rootCause.thread_id, rootCause.turn_id);
   if (!context.persistence.completeRunIncludesTerminalEvidence) {
     await persistTicketTerminalOutcome(
       context,
@@ -260,7 +291,8 @@ export async function completeRunRecord(
       terminal_status,
       error_code,
       terminalReasonDetail,
-      rootCause
+      rootCause,
+      persistedLineage
     );
   }
   try {
@@ -277,8 +309,8 @@ export async function completeRunRecord(
       root_cause_reason_detail: rootCause.reason_detail,
       root_cause_at: rootCause.at,
       session_id: rootCause.session_id ?? runningEntry.session_id,
-      thread_id: rootCause.thread_id ?? runningEntry.thread_id ?? runningEntry.persisted_thread_id ?? null,
-      turn_id: rootCause.turn_id ?? runningEntry.turn_id ?? null,
+      thread_id: persistedLineage.thread_id,
+      turn_id: persistedLineage.turn_id,
       missing_tool_output_recovery: buildDurableMissingToolOutputRecoveryContext(runningEntry, recoveryOverride)
     });
   } catch (error) {
@@ -307,7 +339,8 @@ export async function persistTicketTerminalOutcome(
     at: string | null;
     thread_id: string | null;
     turn_id: string | null;
-  }
+  },
+  persistedLineage = persistedCompletionLineage(runningEntry, rootCause.thread_id, rootCause.turn_id)
 ): Promise<void> {
   if (!context.persistence?.appendTicketTerminalOutcome || !runningEntry.issue_run_id) {
     return;
@@ -317,8 +350,8 @@ export async function persistTicketTerminalOutcome(
     await context.persistence.appendTicketTerminalOutcome({
       issue_run_id: runningEntry.issue_run_id,
       attempt_id: runningEntry.attempt_id ?? null,
-      thread_id: rootCause.thread_id ?? runningEntry.thread_id ?? runningEntry.persisted_thread_id ?? null,
-      turn_id: rootCause.turn_id ?? runningEntry.turn_id ?? null,
+      thread_id: persistedLineage.thread_id,
+      turn_id: persistedLineage.turn_id,
       outcome: terminalStatus,
       reason_code: reasonCode,
       reason_detail: reasonDetail,

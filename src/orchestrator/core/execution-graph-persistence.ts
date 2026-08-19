@@ -1079,13 +1079,22 @@ export async function persistExecutionGraphStateTransition(params: {
   if (!persistence || !runningEntry.issue_run_id) {
     return;
   }
+  const persistedThreadId = runningEntry.persisted_thread_id ?? null;
+  const threadId =
+    persistedThreadId && (!runningEntry.thread_id || runningEntry.thread_id === persistedThreadId)
+      ? persistedThreadId
+      : null;
+  const turnId =
+    threadId && runningEntry.turn_id && (runningEntry.persisted_turn_ids ?? []).includes(runningEntry.turn_id)
+      ? runningEntry.turn_id
+      : null;
 
   try {
     await persistence.appendStateTransition?.({
       issue_run_id: runningEntry.issue_run_id,
       attempt_id: runningEntry.attempt_id,
-      thread_id: runningEntry.thread_id,
-      turn_id: runningEntry.turn_id,
+      thread_id: threadId,
+      turn_id: turnId,
       from_status: null,
       to_status: toStatus,
       transitioned_at: asIso(nowMs()),
@@ -1129,7 +1138,7 @@ export async function persistExecutionGraphRetryTransition(params: {
       issue_run_id: retryEntry.issue_run_id,
       attempt_id: retryEntry.previous_attempt_id,
       thread_id: retryEntry.previous_thread_id,
-      turn_id: retryEntry.previous_turn_id ?? null,
+      turn_id: retryEntry.previous_thread_id ? (retryEntry.previous_turn_id ?? null) : null,
       from_status: null,
       to_status: toStatus,
       transitioned_at: asIso(nowMs()),
