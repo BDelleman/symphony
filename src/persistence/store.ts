@@ -187,7 +187,7 @@ export class SqlitePersistenceStore {
   reconcileExecutionGraphAfterRestart(): { recovered: number; ambiguous: number } {
     const rows = this.db
       .prepare(
-        `SELECT issue_run.issue_run_id, issue_run.started_at,
+        `SELECT issue_run.issue_run_id, issue_run.issue_id, issue_run.started_at,
           runs.completed_at, runs.terminal_status, runs.terminal_reason_code, runs.terminal_reason_detail
          FROM issue_run
          LEFT JOIN history_identity_projection
@@ -199,6 +199,7 @@ export class SqlitePersistenceStore {
       )
       .all() as Array<{
       issue_run_id: string;
+      issue_id: string;
       started_at: string;
       completed_at: string | null;
       terminal_status: RunTerminalStatus | null;
@@ -208,9 +209,32 @@ export class SqlitePersistenceStore {
     let recovered = 0;
     let ambiguous = 0;
     for (const row of rows) {
-      if (!row.completed_at || !row.terminal_status) {
-        ambiguous += 1;
-        continue;
+      let recoveryAt = row.completed_at;
+      let recoveryStatus = row.terminal_status;
+      let recoveryDetail = 'Closed from the provably terminal parent run during startup reconciliation.';
+      if (!recoveryAt || !recoveryStatus) {
+        const supersedingRun = this.db
+          .prepare(
+            `SELECT issue_run_id, started_at
+             FROM issue_run
+             WHERE issue_id = ?
+               AND issue_run_id <> ?
+               AND started_at > ?
+               AND ended_at IS NOT NULL
+               AND status <> 'running'
+             ORDER BY started_at ASC
+             LIMIT 1`
+          )
+          .get(row.issue_id, row.issue_run_id, row.started_at) as
+          | { issue_run_id: string; started_at: string }
+          | undefined;
+        if (!supersedingRun) {
+          ambiguous += 1;
+          continue;
+        }
+        recoveryAt = supersedingRun.started_at;
+        recoveryStatus = 'cancelled';
+        recoveryDetail = `Closed after later terminal issue run ${supersedingRun.issue_run_id} proved this run was superseded.`;
       }
       const workerOwners = this.db
         .prepare(
@@ -256,7 +280,7 @@ export class SqlitePersistenceStore {
         ) as
         | { latest: string | null }
         | undefined;
-      const endedAt = [row.completed_at, row.started_at, latestGraphTimestamp?.latest ?? row.started_at].sort().at(-1)!;
+      const endedAt = [recoveryAt, row.started_at, latestGraphTimestamp?.latest ?? row.started_at].sort().at(-1)!;
       const attempts = this.db
         .prepare('SELECT attempt_id, started_at FROM attempt WHERE issue_run_id = ? AND ended_at IS NULL ORDER BY attempt_number ASC')
         .all(row.issue_run_id) as Array<{ attempt_id: string; started_at: string }>;
@@ -267,30 +291,30 @@ export class SqlitePersistenceStore {
             issue_run_id: row.issue_run_id,
             attempt_id: attempt.attempt_id,
             from_status: 'running',
-            to_status: row.terminal_status!,
+            to_status: recoveryStatus,
             transitioned_at: attemptEndedAt,
-            status: row.terminal_status!,
+            status: recoveryStatus,
             reason_code: REASON_CODES.recoveredAfterRestart,
-            reason_detail: 'Closed from the provably terminal parent run during startup reconciliation.'
+            reason_detail: recoveryDetail
           });
           this.executionGraphWriter.completeAttemptRow({
             attempt_id: attempt.attempt_id,
             ended_at: attemptEndedAt,
-            status: row.terminal_status!,
-            process_status: row.terminal_status!,
-            workflow_outcome: row.terminal_status!,
+            status: recoveryStatus,
+            process_status: recoveryStatus,
+            workflow_outcome: recoveryStatus,
             reason_code: REASON_CODES.recoveredAfterRestart,
-            reason_detail: 'Closed from the provably terminal parent run during startup reconciliation.'
+            reason_detail: recoveryDetail
           });
         }
         this.executionGraphWriter.completeIssueRunRow({
           issue_run_id: row.issue_run_id,
           ended_at: endedAt,
-          status: row.terminal_status!,
-          process_status: row.terminal_status!,
-          workflow_outcome: row.terminal_status!,
+          status: recoveryStatus,
+          process_status: recoveryStatus,
+          workflow_outcome: recoveryStatus,
           reason_code: REASON_CODES.recoveredAfterRestart,
-          reason_detail: 'Closed from the provably terminal parent run during startup reconciliation.'
+          reason_detail: recoveryDetail
         });
       });
       recovered += 1;

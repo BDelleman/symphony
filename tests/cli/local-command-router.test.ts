@@ -31,7 +31,6 @@ import { WorkflowLoader } from '../../src/workflow/loader';
 import { ConfigResolver } from '../../src/workflow/resolver';
 import { createWorkspaceProvisioner } from '../../src/workspace/provisioner';
 import { buildDurableIdentity, SqlitePersistenceStore } from '../../src/persistence';
-import { createPersistenceStoreContext } from '../../src/persistence/store-context';
 
 const execFileAsync = promisify(execFile);
 const realCliScript = path.join(process.cwd(), 'scripts', 'symphony.js');
@@ -1679,7 +1678,7 @@ describe('local symphony command router', () => {
     expect(JSON.stringify(doctorFinding(payload, 'claude.auth'))).not.toContain('must-not-leak@example.test');
   });
 
-  it('reports and explicitly repairs only provably orphaned execution history', async () => {
+  it('reports and explicitly repairs execution history superseded by a later terminal issue run', async () => {
     const { repoRoot, binDir } = await createDoctorRepo();
     const projectRoot = await createDoctorProject();
     const dbPath = path.join(projectRoot, '.symphony', 'system', 'runtime.sqlite');
@@ -1694,7 +1693,7 @@ describe('local symphony command router', () => {
       humanIssueIdentifier: 'DOC-HISTORY-1'
     });
     const store = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
-    const started = store.recordRunStarted({
+    store.recordRunStarted({
       issue_id: 'doctor-history-1',
       issue_identifier: 'DOC-HISTORY-1',
       identity,
@@ -1702,18 +1701,22 @@ describe('local symphony command router', () => {
       attempt_number: 0,
       status: 'running'
     });
+    const replacement = store.recordRunStarted({
+      issue_id: 'doctor-history-1',
+      issue_identifier: 'DOC-HISTORY-1',
+      identity,
+      started_at: '2026-08-18T10:10:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    store.completeRun({
+      run_id: replacement.run_id,
+      issue_run_id: replacement.issue_run_id,
+      attempt_id: replacement.attempt_id,
+      terminal_status: 'succeeded',
+      terminal_reason_code: 'completed'
+    });
     store.close();
-    const context = createPersistenceStoreContext({ dbPath, retentionDays: 14, nowMs: () => Date.now() });
-    context.db.prepare(
-      `UPDATE runs SET ended_at = ?, completed_at = ?, terminal_status = ?, terminal_reason_code = ? WHERE run_id = ?`
-    ).run(
-      '2026-08-18T10:05:00.000Z',
-      '2026-08-18T10:05:00.000Z',
-      'failed',
-      'worker_crashed',
-      started.run_id
-    );
-    context.db.close();
 
     const inspectHarness = createHarness({ repoRoot });
     inspectHarness.deps.cwd = projectRoot;

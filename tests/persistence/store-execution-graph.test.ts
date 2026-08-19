@@ -243,6 +243,55 @@ describe('SqlitePersistenceStore execution graph', () => {
     });
   });
 
+  it('repairs an inactive issue run superseded by a later terminal run for the same issue', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-execution-graph-superseded-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'runtime.sqlite');
+    let nowMs = Date.parse('2026-04-11T10:00:00.000Z');
+    const durableIdentity = identity({ issue_id: 'i-superseded', issue_identifier: 'ABC-SUPERSEDED' });
+    const store = new SqlitePersistenceStore({ dbPath, retentionDays: 14, nowMs: () => nowMs });
+    stores.push(store);
+    const superseded = store.recordRunStarted({
+      issue_id: 'i-superseded',
+      issue_identifier: 'ABC-SUPERSEDED',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    nowMs = Date.parse('2026-04-11T10:10:00.000Z');
+    const replacement = store.recordRunStarted({
+      issue_id: 'i-superseded',
+      issue_identifier: 'ABC-SUPERSEDED',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:10:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    nowMs = Date.parse('2026-04-11T10:15:00.000Z');
+    store.completeRun({
+      run_id: replacement.run_id,
+      issue_run_id: replacement.issue_run_id,
+      attempt_id: replacement.attempt_id,
+      terminal_status: 'succeeded',
+      terminal_reason_code: 'completed'
+    });
+
+    expect(store.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 1, ambiguous: 0 });
+    const timeline = store.reconstructTicketTimeline(durableIdentity);
+    expect(timeline.issue_runs.find((run) => run.issue_run_id === superseded.issue_run_id)).toMatchObject({
+      ended_at: '2026-04-11T10:10:00.000Z',
+      status: 'cancelled',
+      process_status: 'cancelled',
+      workflow_outcome: 'cancelled',
+      reason_code: 'recovered_after_restart'
+    });
+    expect(timeline.issue_runs.find((run) => run.issue_run_id === replacement.issue_run_id)).toMatchObject({
+      ended_at: '2026-04-11T10:15:00.000Z',
+      status: 'succeeded'
+    });
+  });
+
   it('refuses restart reconciliation while persisted worker ownership is still live', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-execution-graph-live-owner-'));
     dirs.push(dir);
@@ -268,23 +317,26 @@ describe('SqlitePersistenceStore execution graph', () => {
       started_at: '2026-04-11T10:00:01.000Z',
       status: 'running'
     });
-    const db = openDatabase(dbPath);
-    try {
-      db.prepare(
-        `UPDATE runs SET ended_at = ?, completed_at = ?, terminal_status = ?, terminal_reason_code = ? WHERE run_id = ?`
-      ).run(
-        '2026-04-11T10:05:00.000Z',
-        '2026-04-11T10:05:00.000Z',
-        'failed',
-        'worker_crashed',
-        started.run_id
-      );
-    } finally {
-      db.close();
-    }
+    const replacement = store.recordRunStarted({
+      issue_id: 'i-live-owner',
+      issue_identifier: 'ABC-LIVE-OWNER',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:10:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    store.completeRun({
+      run_id: replacement.run_id,
+      issue_run_id: replacement.issue_run_id,
+      attempt_id: replacement.attempt_id,
+      terminal_status: 'failed',
+      terminal_reason_code: 'worker_crashed'
+    });
 
     expect(store.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 0, ambiguous: 1 });
-    expect(store.reconstructTicketTimeline(durableIdentity).issue_runs[0]?.ended_at).toBeNull();
+    expect(
+      store.reconstructTicketTimeline(durableIdentity).issue_runs.find((run) => run.issue_run_id === started.issue_run_id)?.ended_at
+    ).toBeNull();
     expect(store.historySchemaHealth()).toMatchObject({
       status: 'degraded',
       degraded_reason_code: 'history_orphan_reconciliation_ambiguous'

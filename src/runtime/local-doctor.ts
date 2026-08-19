@@ -2039,14 +2039,21 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
     const issueRunTable = db!.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'issue_run'").get();
     if (!issueRunTable) return { databaseExists: true, active: 0, repairable: 0, ambiguous: 0, error: null };
     const rows = db!.prepare(
-      `SELECT issue_run.issue_run_id, runs.completed_at, runs.terminal_status
+      `SELECT issue_run.issue_run_id, issue_run.issue_id, issue_run.started_at,
+        runs.completed_at, runs.terminal_status
        FROM issue_run
        LEFT JOIN history_identity_projection
          ON history_identity_projection.source_table = 'runs'
         AND history_identity_projection.issue_run_id = issue_run.issue_run_id
        LEFT JOIN runs ON runs.run_id = history_identity_projection.source_id
        WHERE issue_run.ended_at IS NULL`
-    ).all() as Array<{ issue_run_id: string; completed_at: string | null; terminal_status: string | null }>;
+    ).all() as Array<{
+      issue_run_id: string;
+      issue_id: string;
+      started_at: string;
+      completed_at: string | null;
+      terminal_status: string | null;
+    }>;
     const threadColumns = new Set(
       (db!.prepare('PRAGMA table_info(thread)').all() as Array<{ name: string }>).map((column) => column.name)
     );
@@ -2060,8 +2067,21 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
     let ambiguous = 0;
     for (const row of rows) {
       if (!row.completed_at || !row.terminal_status) {
-        ambiguous += 1;
-        continue;
+        const supersedingRun = db!.prepare(
+          `SELECT issue_run_id
+           FROM issue_run
+           WHERE issue_id = ?
+             AND issue_run_id <> ?
+             AND started_at > ?
+             AND ended_at IS NOT NULL
+             AND status <> 'running'
+           ORDER BY started_at ASC
+           LIMIT 1`
+        ).get(row.issue_id, row.issue_run_id, row.started_at);
+        if (!supersedingRun) {
+          ambiguous += 1;
+          continue;
+        }
       }
       const owners = db!.prepare(
         `SELECT ${workerInstanceProjection}, ${workerPidProjection}
