@@ -473,7 +473,7 @@ export class CloneProvisioner implements WorkspaceProvisioner {
     await this.rmPath(params.workspacePath, { recursive: true, force: true });
     const clone = await this.runGit({
       cwd: process.cwd(),
-      args: ['clone', '--no-hardlinks', '--branch', cloneBranch, '--single-branch', this.repoRoot, params.workspacePath]
+      args: ['clone', '--no-hardlinks', '--branch', cloneBranch, '--single-branch', upstreamRemote, params.workspacePath]
     });
     if (!clone.ok) {
       throw new WorkspaceError('workspace_provision_failed', clone.stderr.trim() || 'clone_failed');

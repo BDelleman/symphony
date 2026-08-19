@@ -30,7 +30,7 @@ workspace:
   provisioner:
     type: clone
     repo_root: .
-    base_ref: main
+    base_ref: origin/main
     branch_template: feature/{{ issue.identifier }}
     teardown_mode: keep
     allow_dirty_repo: false
@@ -358,6 +358,7 @@ Use this only when completion is blocked by missing required tools or missing au
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
     - Also run `git ls-files -u`; pushing is forbidden if any unmerged index
       entry remains.
+    - Fetch `origin` and inspect `git diff --stat origin/main...HEAD`; pushing is forbidden when the branch contains changes outside the ticket's intended scope.
 8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
     - Prefer Linear MCP link support through `save_issue` links for ordinary PR
       attachments; use raw GraphQL only when richer Linear-specific attachment

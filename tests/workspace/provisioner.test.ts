@@ -229,7 +229,15 @@ describe('WorkspaceProvisioner', () => {
     expect(result.status).toBe('provisioned');
     expect(runGit).toHaveBeenCalledWith({
       cwd: process.cwd(),
-      args: ['clone', '--no-hardlinks', '--branch', 'main', '--single-branch', repoRoot, workspacePath]
+      args: [
+        'clone',
+        '--no-hardlinks',
+        '--branch',
+        'main',
+        '--single-branch',
+        'ssh://git@github.com/example/repo.git',
+        workspacePath
+      ]
     });
     expect(runGit).toHaveBeenCalledWith({
       cwd: workspacePath,
