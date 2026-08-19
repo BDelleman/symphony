@@ -8,6 +8,17 @@ Use the lenses as an adversarial review tool, not as a checklist to rubber
 stamp. A reviewer may mark a triggered lens as not applicable only when the
 review artifact explains why the trigger does not affect the current diff.
 
+Trigger lenses from behavior or contract semantics changed by the patch. A
+documentation sentence that merely mentions a command, API, runtime,
+dashboard, persistence, security, or integration term does not trigger the
+corresponding implementation lens. Record only triggered lenses in the review
+artifact; do not enumerate lenses that were considered but not triggered.
+
+Read the complete diff. Beyond changed files, inspect only consumers,
+contracts, and runtime paths for which the changed semantics create a concrete
+risk. Reuse successful exact-head CI evidence and run extra validation only to
+resolve a specific uncovered risk.
+
 ## Required Artifact
 
 Agent Review comments must follow the artifact shape in `WORKFLOW.md`:
@@ -19,9 +30,11 @@ Agent Review comments must follow the artifact shape in `WORKFLOW.md`:
 - Findings
 - Verdict
 
-Each triggered lens row must include concrete evidence: files, functions,
-tests, commands, screenshots, PR comments, or runtime paths inspected. Passing
-tests alone are validation evidence; they do not replace lens evidence.
+Each triggered lens row must include concise concrete evidence: files,
+functions, tests, commands, screenshots, PR comments, or runtime paths
+inspected. Passing tests alone are validation evidence; they do not replace
+lens evidence. Do not add P3 suggestions, repeat the same evidence across
+sections, or narrate the review procedure.
 
 ## Base Lenses
 
