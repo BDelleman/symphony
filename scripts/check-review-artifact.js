@@ -319,6 +319,9 @@ function validateReviewArtifact(rawBody) {
   if (!/(P1|P2|P3|No blocking findings)/i.test(findings)) {
     fail('Findings must list P1/P2/P3 findings or `No blocking findings`');
   }
+  if (/\bP3\b/i.test(findings)) {
+    fail('Findings must not include P3 or non-blocking suggestions');
+  }
 
   const verdict = requireSection(body, 'Verdict');
   validateReviewReceipt(body, scope, verdict);

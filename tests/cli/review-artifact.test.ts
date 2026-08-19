@@ -128,6 +128,13 @@ describe('review artifact check', () => {
     expect(result.stdout).toContain('Review artifact check passed.');
   });
 
+  it('rejects P3 suggestions even when the artifact has no blocking findings', () => {
+    const result = runReviewCheck(validReview.replace('No blocking findings.', 'No blocking findings.\n- P3: consider more examples.'));
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Findings must not include P3 or non-blocking suggestions');
+  });
+
   it('does not require cross-surface sections for an explicit non-cross-cutting review', () => {
     const result = runReviewCheck(
       validReview.replace(
