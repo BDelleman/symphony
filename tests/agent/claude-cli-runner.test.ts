@@ -157,10 +157,6 @@ process.stdin.on('end', () => {
   if (process.env.MOCK_EMPTY_ASSISTANT_USAGE === '1') {
     process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'empty-usage', model, usage: {}, content: [] } }) + '\\n');
   }
-  if (process.env.MOCK_MODE === 'nested') {
-    process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'nested', model, usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: 'tool_use', id: 'tool-nested', name: 'Bash', input: { command: 'claude -p nested' } }] } }) + '\\n');
-    return;
-  }
   if (process.env.MOCK_API_RETRY === '1') process.stdout.write(JSON.stringify({ type: 'system', subtype: 'api_retry', session_id: '${SESSION_ID}', error: 'overloaded' }) + '\\n');
   if (process.env.MOCK_PERMISSION_DENIED_EVENT === '1') process.stdout.write(JSON.stringify({ type: 'system', subtype: 'permission_denied', session_id: '${SESSION_ID}', tool_use_id: 'denied-1', tool_name: 'Bash' }) + '\\n');
   if (process.env.MOCK_MODE === 'error-result') { result.subtype = 'error_during_execution'; result.is_error = true; }
@@ -1113,17 +1109,6 @@ describe('ClaudeCliRunner', () => {
       status: 'failed',
       error_code: 'claude_managed_policy_unsupported:remote-settings.json'
     });
-
-    const nestedFixture = createFixture();
-    const nested = await new ClaudeCliRunner({
-      command: nestedFixture.command,
-      projectRoot: nestedFixture.root,
-      model: 'claude-sonnet-4-6',
-      allowNonSubscriptionAuth: false,
-      env: fixtureEnv(nestedFixture, { MOCK_MODE: 'nested' }),
-      homedir: () => nestedFixture.root
-    }).startSessionAndRunTurn(startInput(nestedFixture.root));
-    expect(nested).toMatchObject({ status: 'failed', error_code: 'claude_nested_runtime_detected', retryable: false });
   });
 
   it('terminates a nested Claude descendant even when the tool command was not observable', async () => {

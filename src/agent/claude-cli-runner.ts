@@ -1942,12 +1942,6 @@ export class ClaudeCliRunner implements AgentRunner {
               toolCounts[boundedToolName] = (toolCounts[boundedToolName] ?? 0) + 1;
               const mcpServer = mcpServerFromToolName(boundedToolName);
               if (mcpServer) mcpCounts[mcpServer] = (mcpCounts[mcpServer] ?? 0) + 1;
-              const toolInput = asRecord(block.input);
-              const command = toolName === 'Bash' && toolInput ? readString(toolInput, 'command') : null;
-              if (command && /(^|[;&|()\s])(?:claude|[^\s/]*\/claude)(?:\s|$)/i.test(command)) {
-                failProtocol('claude_nested_runtime_detected');
-                return;
-              }
             }
           }
           if (latestPartialUsage) {
