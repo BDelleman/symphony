@@ -354,6 +354,7 @@ export interface ApiToolCallLedgerEntry {
   last_seen_at_ms: number;
   completed_at: string | null;
   completed_at_ms: number | null;
+  duration_ms: number | null;
   completion_status: ToolCallCompletionStatus;
   evidence_sources: ToolCallEvidenceSource[];
   start_evidence_source: ToolCallEvidenceSource | null;
@@ -573,6 +574,7 @@ export interface ApiStateResponse extends SnapshotFreshnessFields, ApiDegradedFi
     issue_id: string;
     issue_identifier: string;
     state: string;
+    dispatch_state: string;
     session_id: string | null;
     worker_host: string | null;
     workspace_path: string | null;
@@ -1313,6 +1315,7 @@ export interface ApiIssueResponse extends SnapshotFreshnessFields, ApiDegradedFi
     provider_usage: ProviderUsage | null;
     turn_count: number;
     state: string;
+    dispatch_state: string;
     started_at: string;
     last_event: string | null;
     last_event_summary: string | null;

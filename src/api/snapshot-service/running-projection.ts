@@ -91,6 +91,7 @@ export function toStateRunningRow(
     issue_identifier: entry.identifier,
     ...projectBudget(entry),
     state: entry.issue.state,
+    dispatch_state: entry.dispatch_state ?? entry.started_issue_state ?? entry.issue.state,
     session_id: entry.session_id,
     worker_host: entry.worker_host ?? null,
     workspace_path: entry.workspace_path ?? null,

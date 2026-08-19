@@ -56,6 +56,10 @@ export function renderRunning(payload: any) {
 
       const stateCell = document.createElement('td');
       stateCell.appendChild(createStateBadge(entry.state));
+      const dispatchState = document.createElement('div');
+      dispatchState.className = 'muted';
+      dispatchState.textContent = 'Dispatched from ' + (entry.dispatch_state || entry.state);
+      stateCell.append(dispatchState);
       const stateFlags = document.createElement('div');
       stateFlags.className = 'inline-badges';
       const turnBadge = document.createElement('span');
@@ -219,10 +223,10 @@ export function renderRunning(payload: any) {
 
       const tokensCell = document.createElement('td');
       if (entry.agent_runtime === 'claude-cli') {
-        const providerTitle = document.createElement('div');
-        providerTitle.textContent = 'Provider usage';
-        const providerBadge = document.createElement('span');
         const providerStatus = entry.provider_usage && entry.provider_usage.status;
+        const providerTitle = document.createElement('div');
+        providerTitle.textContent = providerStatus === 'partial' ? 'Partial provider usage' : 'Provider usage';
+        const providerBadge = document.createElement('span');
         providerBadge.className = 'mini-badge ' + (providerStatus === 'final' ? 'mini-badge-good' : providerStatus === 'unobserved' ? 'mini-badge-bad' : '');
         providerBadge.textContent = providerStatus || 'unobserved';
         const providerDetail = document.createElement('div');

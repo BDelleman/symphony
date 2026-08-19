@@ -573,6 +573,7 @@ export class SnapshotService {
             : null,
           turn_count: entry.turn_count,
           state: entry.issue.state,
+          dispatch_state: entry.dispatch_state ?? entry.started_issue_state ?? entry.issue.state,
           started_at: asIsoDate(entry.started_at_ms),
           last_event: entry.last_event,
           last_event_summary: entry.last_event_summary,
