@@ -7,6 +7,7 @@ import { StringDecoder } from 'node:string_decoder';
 
 import { CANONICAL_EVENT } from '../observability/events';
 import { REASON_CODES } from '../observability/reason-codes';
+import { auditSensitiveWorkspaceFiles } from '../workspace/sensitive-files';
 import type {
   AgentRunResult,
   AgentRunner,
@@ -21,7 +22,13 @@ const MAX_PROMPT_BYTES = 8 * 1024 * 1024;
 const MAX_PROTOCOL_LINE_BYTES = 8 * 1024 * 1024;
 const MAX_RESULT_DETAIL_BYTES = 16 * 1024;
 const HEARTBEAT_MS = 5_000;
+const NESTED_PROCESS_SCAN_MS = 1_000;
 const TERMINATION_GRACE_MS = 5_000;
+const PROCESS_CLOSE_GRACE_MS = 2_000;
+const PREFLIGHT_TIMEOUT_MS = 10_000;
+const MAX_TELEMETRY_IDENTITIES = 10_000;
+const MAX_TELEMETRY_NAME_BYTES = 256;
+const MAX_SESSION_BINDINGS = 1_000;
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const NON_SUBSCRIPTION_ENV_NAMES = [
@@ -42,7 +49,13 @@ const NON_SUBSCRIPTION_ENV_NAMES = [
 export interface ClaudeCliRunnerOptions {
   command: string;
   model: string;
+  projectRoot: string;
+  gitCommand?: string;
+  githubCommand?: string;
   allowNonSubscriptionAuth: boolean;
+  networkAllowedDomains?: string[];
+  allowedMcpServers?: string[];
+  requiredMcpServers?: string[];
   supportedVersion?: string;
   env?: NodeJS.ProcessEnv;
   homedir?: () => string;
@@ -59,10 +72,17 @@ interface ClaudeAuthStatus {
 
 interface ParsedProtocolState {
   sessionId: string | null;
+  initSessionId: string | null;
   effectiveModel: string | null;
   capabilityFingerprint: string | null;
+  instructionFingerprint: string | null;
+  skillFingerprint: string | null;
   terminalResult: Record<string, unknown> | null;
   terminalResultCount: number;
+  auxiliaryResultCount: number;
+  initCount: number;
+  apiRetryCount: number;
+  permissionDenialCount: number;
   unknownEventCount: number;
   lastEvent: string;
   protocolError: string | null;
@@ -74,8 +94,55 @@ interface ClaudeSessionBinding {
   issue_identifier: string;
   attempt: number | null;
   workspace_realpath: string;
+  project_root_realpath: string;
   model: string;
   os_user: number | string;
+  config_hash: string;
+}
+
+interface UsageNumbers {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+}
+
+interface UserSettingsAssessment {
+  hash: string;
+  selectors: string[];
+  unsafe: string[];
+  environmentNames: string[];
+}
+
+interface ManagedPolicyAssessment {
+  hash: string;
+  present: string[];
+}
+
+interface GitRemoteIdentity {
+  scheme: 'ssh' | 'https' | 'http' | 'other' | 'missing';
+  host: string | null;
+  repository: string | null;
+  has_credentials: boolean;
+}
+
+interface ValidatedSshAgent {
+  socketPath: string;
+  identityHash: string;
+}
+
+interface GitHubCapability {
+  host: string;
+  token: string;
+  executable: string;
+  identityHash: string;
+}
+
+export interface ClaudeUserMcpAssessment {
+  hash: string;
+  unsafe: string[];
+  configuredUserServers: string[];
+  approvedServerConfiguration: Record<string, Record<string, unknown>>;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -94,6 +161,16 @@ function readFiniteNumber(record: Record<string, unknown>, key: string): number 
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+function readTokenCount(record: Record<string, unknown>, key: string): number | null {
+  const value = readFiniteNumber(record, key);
+  return value !== null && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function readNonNegativeNumber(record: Record<string, unknown>, key: string): number | null {
+  const value = readFiniteNumber(record, key);
+  return value !== null && value >= 0 ? value : null;
+}
+
 function trimUtf8(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, 'utf8') <= maxBytes) {
     return value;
@@ -105,20 +182,35 @@ function trimUtf8(value: string, maxBytes: number): string {
   return `${value.slice(0, end)}…`;
 }
 
-function resolveExecutable(command: string, env: NodeJS.ProcessEnv): string {
+function isPathInside(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+export function resolveTrustedExecutable(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  forbiddenRoots: string[] = []
+): string {
   if (command.includes(path.sep)) {
-    const absolute = path.resolve(command);
+    if (!path.isAbsolute(command)) throw new Error(`claude_executable_untrusted:${command}`);
+    const absolute = command;
     const resolved = fs.realpathSync(absolute);
     fs.accessSync(resolved, fs.constants.X_OK);
+    if (forbiddenRoots.some((root) => isPathInside(root, resolved))) throw new Error(`claude_executable_untrusted:${command}`);
+    if ((fs.statSync(resolved).mode & 0o022) !== 0) throw new Error(`claude_executable_insecure_permissions:${command}`);
     return resolved;
   }
 
   for (const directory of (env.PATH ?? '').split(path.delimiter)) {
-    if (!directory) continue;
+    if (!directory || !path.isAbsolute(directory)) continue;
     const candidate = path.join(directory, command);
     try {
       fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.realpathSync(candidate);
+      const resolved = fs.realpathSync(candidate);
+      if (forbiddenRoots.some((root) => isPathInside(root, resolved))) continue;
+      if ((fs.statSync(resolved).mode & 0o022) !== 0) continue;
+      return resolved;
     } catch {
       // Continue searching PATH.
     }
@@ -126,15 +218,30 @@ function resolveExecutable(command: string, env: NodeJS.ProcessEnv): string {
   throw new Error(`claude_executable_not_found:${command}`);
 }
 
-function userSettingSelectors(home: string): string[] {
+function assessUserSettings(home: string): UserSettingsAssessment {
   const settingsPath = path.join(home, '.claude', 'settings.json');
-  if (!fs.existsSync(settingsPath)) return [];
+  if (!fs.existsSync(settingsPath)) {
+    return {
+      hash: crypto.createHash('sha256').update('missing').digest('hex'),
+      selectors: [],
+      unsafe: [],
+      environmentNames: []
+    };
+  }
   try {
-    const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as unknown;
+    const raw = fs.readFileSync(settingsPath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
     const settings = asRecord(parsed);
     if (!settings) throw new Error('settings_not_object');
     const selectors = settings.apiKeyHelper ? ['apiKeyHelper'] : [];
+    const unsafe: string[] = [];
+    if (settings.apiKeyHelper !== undefined) unsafe.push('apiKeyHelper');
     const settingsEnv = asRecord(settings.env);
+    const environmentNames = settingsEnv
+      ? Object.entries(settingsEnv)
+          .filter(([, value]) => (typeof value === 'string' ? value.trim().length > 0 : value !== null && value !== undefined))
+          .map(([name]) => name)
+      : [];
     if (settingsEnv) {
       selectors.push(
         ...NON_SUBSCRIPTION_ENV_NAMES.filter((name) => {
@@ -142,10 +249,263 @@ function userSettingSelectors(home: string): string[] {
           return typeof value === 'string' ? value.trim().length > 0 : value !== null && value !== undefined;
         })
       );
+      for (const name of environmentNames) unsafe.push(`env.${name}`);
     }
-    return [...new Set(selectors)];
+    const hooks = asRecord(settings.hooks);
+    const enabledPlugins = asRecord(settings.enabledPlugins);
+    const plugins = asRecord(settings.plugins);
+    const sandbox = asRecord(settings.sandbox);
+    const sandboxFilesystem = asRecord(sandbox?.filesystem);
+    const sandboxNetwork = asRecord(sandbox?.network);
+    const permissions = asRecord(settings.permissions);
+    if (hooks && Object.keys(hooks).length > 0) unsafe.push('hooks');
+    if (enabledPlugins && Object.values(enabledPlugins).some((value) => value === true)) unsafe.push('enabledPlugins');
+    if (plugins && Object.keys(plugins).length > 0) unsafe.push('plugins');
+    if (settings.agents !== undefined) unsafe.push('agents');
+    if (sandbox && Array.isArray(sandbox.excludedCommands) && sandbox.excludedCommands.length > 0) unsafe.push('sandbox.excludedCommands');
+    if (sandbox?.allowUnsandboxedCommands === true) unsafe.push('sandbox.allowUnsandboxedCommands');
+    if (sandbox?.failIfUnavailable === false) unsafe.push('sandbox.failIfUnavailable');
+    if (sandbox?.allowAppleEvents === true) unsafe.push('sandbox.allowAppleEvents');
+    if (sandboxFilesystem?.disabled === true) unsafe.push('sandbox.filesystem.disabled');
+    if (sandboxNetwork?.allowAllUnixSockets === true) unsafe.push('sandbox.network.allowAllUnixSockets');
+    if (sandboxNetwork?.enableWeakerNetworkIsolation === true) unsafe.push('sandbox.network.enableWeakerNetworkIsolation');
+    if (permissions?.defaultMode === 'bypassPermissions') unsafe.push('permissions.defaultMode');
+    if (Array.isArray(permissions?.allow) && permissions.allow.length > 0) unsafe.push('permissions.allow');
+    if (Array.isArray(permissions?.additionalDirectories) && permissions.additionalDirectories.length > 0) {
+      unsafe.push('permissions.additionalDirectories');
+    }
+    if (sandboxFilesystem && Array.isArray(sandboxFilesystem.allowWrite) && sandboxFilesystem.allowWrite.length > 0) {
+      unsafe.push('sandbox.filesystem.allowWrite');
+    }
+    if (sandboxFilesystem && Array.isArray(sandboxFilesystem.allowRead) && sandboxFilesystem.allowRead.length > 0) {
+      unsafe.push('sandbox.filesystem.allowRead');
+    }
+    if (sandboxNetwork && Array.isArray(sandboxNetwork.allowedDomains) && sandboxNetwork.allowedDomains.length > 0) {
+      unsafe.push('sandbox.network.allowedDomains');
+    }
+    if (sandboxNetwork && Array.isArray(sandboxNetwork.allowUnixSockets) && sandboxNetwork.allowUnixSockets.length > 0) {
+      unsafe.push('sandbox.network.allowUnixSockets');
+    }
+    if (sandboxNetwork?.allowAllUnixSockets === true) unsafe.push('sandbox.network.allowAllUnixSockets');
+    if (sandboxNetwork?.allowLocalBinding === true) unsafe.push('sandbox.network.allowLocalBinding');
+    if (Array.isArray(sandboxNetwork?.allowMachLookup) && sandboxNetwork.allowMachLookup.length > 0) {
+      unsafe.push('sandbox.network.allowMachLookup');
+    }
+    if (sandboxNetwork?.httpProxyPort !== undefined) unsafe.push('sandbox.network.httpProxyPort');
+    if (sandboxNetwork?.socksProxyPort !== undefined) unsafe.push('sandbox.network.socksProxyPort');
+    if (sandboxNetwork?.tlsTerminate !== undefined) unsafe.push('sandbox.network.tlsTerminate');
+    if (sandbox?.enableWeakerNestedSandbox === true) unsafe.push('sandbox.enableWeakerNestedSandbox');
+    if (sandbox?.enableWeakerNetworkIsolation === true) unsafe.push('sandbox.enableWeakerNetworkIsolation');
+    if (sandbox?.ignoreViolations !== undefined) unsafe.push('sandbox.ignoreViolations');
+    if (sandbox?.ripgrep !== undefined) unsafe.push('sandbox.ripgrep');
+    if (settings.processWrapper !== undefined) unsafe.push('processWrapper');
+    if (settings.statusLine !== undefined) unsafe.push('statusLine');
+    if (settings.fileSuggestion !== undefined) unsafe.push('fileSuggestion');
+    return {
+      hash: crypto.createHash('sha256').update(raw).digest('hex'),
+      selectors: [...new Set(selectors)],
+      unsafe: [...new Set(unsafe)],
+      environmentNames: [...new Set(environmentNames)]
+    };
   } catch (error) {
     throw new Error(`claude_user_settings_unreadable:${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function assessManagedPolicy(platform: NodeJS.Platform, home: string): ManagedPolicyAssessment {
+  const baseCandidates = platform === 'darwin'
+    ? [
+        '/Library/Application Support/ClaudeCode/managed-settings.json',
+        '/Library/Application Support/ClaudeCode/managed-mcp.json',
+        '/Library/Managed Preferences/com.anthropic.claudecode.plist',
+        '/Library/Managed Preferences/com.anthropic.ClaudeCode.plist'
+      ]
+    : platform === 'linux'
+      ? ['/etc/claude-code/managed-settings.json', '/etc/claude-code/managed-mcp.json']
+      : [];
+  const dropInDirectories = platform === 'darwin'
+    ? ['/Library/Application Support/ClaudeCode/managed-settings.d']
+    : platform === 'linux'
+      ? ['/etc/claude-code/managed-settings.d']
+      : [];
+  const dropIns = dropInDirectories.flatMap((directory) => {
+    try {
+      return fs.readdirSync(directory)
+        .filter((entry) => entry.endsWith('.json'))
+        .map((entry) => path.join(directory, entry));
+    } catch {
+      return [];
+    }
+  });
+  const remoteSettings = path.join(home, '.claude', 'remote-settings.json');
+  const remoteSettingsPresent = (() => {
+    if (!fs.existsSync(remoteSettings)) return false;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(remoteSettings, 'utf8')) as unknown;
+      if (Array.isArray(parsed)) return parsed.length > 0;
+      const record = asRecord(parsed);
+      return Boolean(record && Object.keys(record).length > 0);
+    } catch {
+      return true;
+    }
+  })();
+  const candidates = [
+    ...baseCandidates,
+    ...dropIns,
+    path.join(home, '.claude', 'managed-settings.json'),
+    path.join(home, '.claude', 'managed-mcp.json'),
+    ...(remoteSettingsPresent ? [remoteSettings] : [])
+  ];
+  const present = candidates.filter((candidate) => fs.existsSync(candidate));
+  const digest = crypto.createHash('sha256');
+  for (const candidate of present) {
+    digest.update(candidate).update('\0').update(fs.readFileSync(candidate)).update('\0');
+  }
+  return { hash: digest.update(present.length === 0 ? 'missing' : '').digest('hex'), present };
+}
+
+function assessUserCustomAgents(home: string): { hash: string; present: string[] } {
+  const directory = path.join(home, '.claude', 'agents');
+  let present: string[] = [];
+  try {
+    present = fs.readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
+      .map((entry) => path.join(directory, entry.name))
+      .sort();
+  } catch {
+    present = [];
+  }
+  const digest = crypto.createHash('sha256');
+  for (const candidate of present) {
+    digest.update(path.basename(candidate)).update('\0').update(fs.readFileSync(candidate)).update('\0');
+  }
+  return { hash: digest.update(present.length === 0 ? 'missing' : '').digest('hex'), present };
+}
+
+function hashUserInstructionSurface(home: string): string {
+  const roots = [
+    path.join(home, '.claude', 'CLAUDE.md'),
+    path.join(home, '.claude', 'rules'),
+    path.join(home, '.claude', 'skills'),
+    path.join(home, '.claude', 'commands')
+  ];
+  const files: string[] = [];
+  const pending = [...roots];
+  while (pending.length > 0) {
+    const candidate = pending.pop()!;
+    if (!fs.existsSync(candidate)) continue;
+    const stat = fs.lstatSync(candidate);
+    if (stat.isSymbolicLink()) throw new Error('claude_user_instruction_symlink_unsupported');
+    if (stat.isDirectory()) {
+      for (const entry of fs.readdirSync(candidate)) pending.push(path.join(candidate, entry));
+      continue;
+    }
+    if (stat.isFile()) files.push(candidate);
+    if (files.length > 1_000) throw new Error('claude_user_instruction_inventory_too_large');
+  }
+  files.sort();
+  const digest = crypto.createHash('sha256');
+  let totalBytes = 0;
+  for (const file of files) {
+    const content = fs.readFileSync(file);
+    totalBytes += content.length;
+    if (totalBytes > 16 * 1024 * 1024) throw new Error('claude_user_instruction_inventory_too_large');
+    digest.update(path.relative(home, file)).update('\0').update(content).update('\0');
+  }
+  return digest.update(files.length === 0 ? 'missing' : '').digest('hex');
+}
+
+export function inspectClaudeUserMcpConfiguration(params: {
+  home: string;
+  workspace: string;
+  allowedServers: Iterable<string>;
+  requiredServers: Iterable<string>;
+}): ClaudeUserMcpAssessment {
+  const allowed = new Set([...params.allowedServers].map((name) => name.toLowerCase()));
+  const required = new Set([...params.requiredServers].map((name) => name.toLowerCase()));
+  const configPath = path.join(params.home, '.claude.json');
+  if (!fs.existsSync(configPath)) {
+    return {
+      hash: stableConfigurationHash(['missing']),
+      unsafe: [...required].map((name) => `user_mcp_missing.${name}`),
+      configuredUserServers: [],
+      approvedServerConfiguration: {}
+    };
+  }
+  try {
+    const parsed = asRecord(JSON.parse(fs.readFileSync(configPath, 'utf8')));
+    if (!parsed) throw new Error('config_not_object');
+    const rawUserServers = asRecord(parsed.mcpServers) ?? {};
+    const userServers = Object.fromEntries(Object.entries(rawUserServers).map(([name, value]) => [name.toLowerCase(), value]));
+    const configuredUserServers = Object.keys(userServers).sort();
+    const unsafe: string[] = [];
+    const approvedServerConfiguration: Record<string, Record<string, unknown>> = {};
+    for (const name of required) {
+      if (!asRecord(userServers[name])) unsafe.push(`user_mcp_missing.${name}`);
+    }
+    for (const name of [...allowed].sort()) {
+      const server = asRecord(userServers[name]);
+      if (!server) continue;
+      const reasonName = name.replace(/-/g, '_');
+      const transport = readString(server, 'type')?.toLowerCase();
+      const url = readString(server, 'url');
+      let parsedUrl: URL | null = null;
+      try {
+        parsedUrl = url ? new URL(url) : null;
+      } catch {
+        // Reported below as an invalid endpoint.
+      }
+      if (!['http', 'streamable-http'].includes(transport ?? '')) unsafe.push(`user_mcp_${reasonName}.transport`);
+      if (
+        !parsedUrl ||
+        parsedUrl.protocol !== 'https:' ||
+        parsedUrl.username ||
+        parsedUrl.password ||
+        parsedUrl.search ||
+        parsedUrl.hash
+      ) {
+        unsafe.push(`user_mcp_${reasonName}.endpoint`);
+      }
+      if (Object.keys(server).some((key) => !['type', 'url'].includes(key))) {
+        unsafe.push(`user_mcp_${reasonName}.inline_configuration`);
+      }
+      if (!unsafe.some((entry) => entry.startsWith(`user_mcp_${reasonName}.`)) && transport && url) {
+        approvedServerConfiguration[name] = { type: transport, url };
+      }
+    }
+    const linear = asRecord(userServers['linear-server']);
+    if (linear) {
+      const url = readString(linear, 'url');
+      if (url !== 'https://mcp.linear.app/mcp') unsafe.push('user_mcp_linear_server.endpoint');
+    }
+    const projects = asRecord(parsed.projects) ?? {};
+    const workspace = path.resolve(params.workspace);
+    let localPermissionsPresent = false;
+    for (const [projectPath, rawProject] of Object.entries(projects)) {
+      if (path.resolve(projectPath) !== workspace) continue;
+      const project = asRecord(rawProject) ?? {};
+      if (Array.isArray(project.allowedTools) && project.allowedTools.length > 0) {
+        unsafe.push('local_permissions.allowedTools');
+        localPermissionsPresent = true;
+      }
+      const localServers = asRecord(project.mcpServers) ?? {};
+      for (const name of Object.keys(localServers).map((entry) => entry.toLowerCase())) {
+        if (allowed.has(name) || required.has(name)) unsafe.push(`local_mcp_override.${name}`);
+      }
+    }
+    return {
+      hash: stableConfigurationHash([approvedServerConfiguration, localPermissionsPresent, [...new Set(unsafe)].sort()]),
+      unsafe: [...new Set(unsafe)].sort(),
+      configuredUserServers,
+      approvedServerConfiguration
+    };
+  } catch (error) {
+    return {
+      hash: stableConfigurationHash(['invalid']),
+      unsafe: [`user_mcp_config_unreadable.${boundedFailureSignal(error instanceof Error ? error.message : String(error)) ?? 'invalid'}`],
+      configuredUserServers: [],
+      approvedServerConfiguration: {}
+    };
   }
 }
 
@@ -155,6 +515,7 @@ function readAuthStatus(executable: string, cwd: string, env: NodeJS.ProcessEnv)
     env,
     encoding: 'utf8',
     maxBuffer: 1024 * 1024,
+    timeout: PREFLIGHT_TIMEOUT_MS,
     shell: false
   });
   if (result.status !== 0) {
@@ -179,9 +540,10 @@ function assertApprovedAuth(
   home: string,
   allowNonSubscriptionAuth: boolean
 ): void {
+  const assessment = assessUserSettings(home);
   const selectors: string[] = [
     ...NON_SUBSCRIPTION_ENV_NAMES.filter((name) => Boolean(env[name]?.trim())),
-    ...userSettingSelectors(home)
+    ...assessment.selectors
   ];
   if (!allowNonSubscriptionAuth && selectors.length > 0) {
     throw new Error(`claude_non_subscription_auth_forbidden:${[...new Set(selectors)].join(',')}`);
@@ -201,12 +563,25 @@ function assertApprovedAuth(
 function isRetryableClaudeFailure(code: string): boolean {
   return (
     code.startsWith('claude_process_exit:') ||
+    /api_status=(?:429|5\d\d)/i.test(code) ||
     /rate.?limit|overload|network|server|temporar|unavailable|api_retry/i.test(code)
   );
 }
 
+function boundedFailureSignal(value: unknown): string | null {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const normalized = String(value).trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, '_').slice(0, 80);
+  return normalized || null;
+}
+
 function assertSupportedVersion(executable: string, cwd: string, env: NodeJS.ProcessEnv, supported: string): void {
-  const result = spawnSync(executable, ['--version'], { cwd, env, encoding: 'utf8', shell: false });
+  const result = spawnSync(executable, ['--version'], {
+    cwd,
+    env,
+    encoding: 'utf8',
+    shell: false,
+    timeout: PREFLIGHT_TIMEOUT_MS
+  });
   if (result.status !== 0) throw new Error('claude_version_unavailable');
   const match = result.stdout.match(/\b\d+\.\d+\.\d+\b/);
   if (match?.[0] !== supported) {
@@ -214,47 +589,647 @@ function assertSupportedVersion(executable: string, cwd: string, env: NodeJS.Pro
   }
 }
 
-function buildCapabilityFingerprint(payload: Record<string, unknown>): string {
+function hashInitSurface(payload: Record<string, unknown>, keys: string[]): string {
+  const normalized = Object.fromEntries(
+    keys.filter((key) => payload[key] !== undefined).map((key) => [key, payload[key]])
+  );
+  return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+}
+
+function buildCapabilityFingerprint(payload: Record<string, unknown>, activeServers: Set<string>): string {
   const normalized = {
     tools: Array.isArray(payload.tools) ? payload.tools.map(String).sort() : [],
-    mcp_servers: Array.isArray(payload.mcp_servers)
-      ? payload.mcp_servers
-          .map((entry) => {
-            const record = asRecord(entry);
-            return record ? { name: readString(record, 'name'), status: readString(record, 'status') } : null;
-          })
-          .filter(Boolean)
-          .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
-      : [],
-    plugins: Array.isArray(payload.plugins)
-      ? payload.plugins
-          .map((entry) => readString(asRecord(entry) ?? {}, 'name'))
-          .filter(Boolean)
-          .sort()
-      : []
+    active_mcp_servers: [...activeServers].sort()
   };
   return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
 }
 
-function usageFromResult(result: Record<string, unknown>, model: string | null): ProviderUsage {
-  const usage = asRecord(result.usage) ?? {};
+function zeroUsage(): UsageNumbers {
+  return { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 };
+}
+
+function usageNumbers(value: unknown): UsageNumbers | null {
+  const usage = asRecord(value);
+  if (!usage) return null;
+  const inputTokens = readTokenCount(usage, 'input_tokens');
+  const outputTokens = readTokenCount(usage, 'output_tokens');
+  const cacheReadTokens = readTokenCount(usage, 'cache_read_input_tokens');
+  const cacheCreationTokens = readTokenCount(usage, 'cache_creation_input_tokens');
+  if ([inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens].some((count) => count === null)) return null;
+  return {
+    input_tokens: inputTokens!,
+    output_tokens: outputTokens!,
+    cache_read_tokens: cacheReadTokens!,
+    cache_creation_tokens: cacheCreationTokens!
+  };
+}
+
+function addUsage(target: UsageNumbers, value: UsageNumbers): UsageNumbers {
+  return {
+    input_tokens: target.input_tokens + value.input_tokens,
+    output_tokens: target.output_tokens + value.output_tokens,
+    cache_read_tokens: target.cache_read_tokens + value.cache_read_tokens,
+    cache_creation_tokens: target.cache_creation_tokens + value.cache_creation_tokens
+  };
+}
+
+function maxUsage(left: UsageNumbers | undefined, right: UsageNumbers): UsageNumbers {
+  if (!left) return right;
+  return {
+    input_tokens: Math.max(left.input_tokens, right.input_tokens),
+    output_tokens: Math.max(left.output_tokens, right.output_tokens),
+    cache_read_tokens: Math.max(left.cache_read_tokens, right.cache_read_tokens),
+    cache_creation_tokens: Math.max(left.cache_creation_tokens, right.cache_creation_tokens)
+  };
+}
+
+function modelUsageFromResult(result: Record<string, unknown>) {
+  const value = asRecord(result.modelUsage) ?? asRecord(result.model_usage);
+  if (!value) return [];
+  return Object.entries(value)
+    .map(([model, raw]) => {
+      const usage = asRecord(raw) ?? {};
+      return {
+        model,
+        input_tokens: readTokenCount(usage, 'inputTokens') ?? 0,
+        output_tokens: readTokenCount(usage, 'outputTokens') ?? 0,
+        cache_read_tokens: readTokenCount(usage, 'cacheReadInputTokens') ?? 0,
+        cache_creation_tokens: readTokenCount(usage, 'cacheCreationInputTokens') ?? 0,
+        estimated_cost_usd: readNonNegativeNumber(usage, 'costUSD')
+      };
+    })
+    .filter((usage) =>
+      usage.input_tokens > 0 ||
+      usage.output_tokens > 0 ||
+      usage.cache_read_tokens > 0 ||
+      usage.cache_creation_tokens > 0 ||
+      (usage.estimated_cost_usd ?? 0) > 0
+    );
+}
+
+function usageFromResult(
+  result: Record<string, unknown>,
+  model: string | null,
+  partial: ProviderUsage | null,
+  apiRetryCount: number,
+  toolCounts: Record<string, number>,
+  mcpCounts: Record<string, number>,
+  updatedAt: string,
+  protocol: {
+    timeToFirstTokenMs: number | null;
+    permissionDenialCount: number;
+    unknownEventCount: number;
+    auxiliaryResultCount: number;
+  }
+): ProviderUsage {
+  const usageRecord = asRecord(result.usage);
+  const usage = usageRecord ?? {};
+  const modelUsage = modelUsageFromResult(result);
+  const finalNumbers = usageNumbers(usage);
+  const finalTurns = readTokenCount(result, 'num_turns');
+  const hasTokenEvidence = [
+    'input_tokens',
+    'output_tokens',
+    'cache_read_input_tokens',
+    'cache_creation_input_tokens'
+  ].some((key) => readTokenCount(usage, key) !== null);
+  const reconciliationDelta = partial && hasTokenEvidence && finalNumbers
+    ? {
+        input_tokens: finalNumbers.input_tokens - (partial.input_tokens ?? 0),
+        output_tokens: finalNumbers.output_tokens - (partial.output_tokens ?? 0),
+        cache_read_tokens: finalNumbers.cache_read_tokens - (partial.cache_read_tokens ?? 0),
+        cache_creation_tokens: finalNumbers.cache_creation_tokens - (partial.cache_creation_tokens ?? 0),
+        provider_turn_count: (finalTurns ?? 0) - (partial.provider_turn_count ?? 0)
+      }
+    : null;
+  const hasCostEvidence = readNonNegativeNumber(result, 'total_cost_usd') !== null;
   return {
     runtime: 'claude-cli',
     model,
-    input_tokens: readFiniteNumber(usage, 'input_tokens'),
-    output_tokens: readFiniteNumber(usage, 'output_tokens'),
-    cache_read_tokens: readFiniteNumber(usage, 'cache_read_input_tokens'),
-    cache_creation_tokens: readFiniteNumber(usage, 'cache_creation_input_tokens'),
-    provider_turn_count: readFiniteNumber(result, 'num_turns'),
-    estimated_cost_usd: readFiniteNumber(result, 'total_cost_usd'),
+    effective_models: [...new Set([model, ...modelUsage.map((entry) => entry.model)].filter((value): value is string => Boolean(value)))],
+    input_tokens: readTokenCount(usage, 'input_tokens'),
+    output_tokens: readTokenCount(usage, 'output_tokens'),
+    cache_read_tokens: readTokenCount(usage, 'cache_read_input_tokens'),
+    cache_creation_tokens: readTokenCount(usage, 'cache_creation_input_tokens'),
+    provider_turn_count: readTokenCount(result, 'num_turns'),
+    estimated_cost_usd: readNonNegativeNumber(result, 'total_cost_usd'),
     source: 'claude_stream_result',
-    confidence: result.usage || result.total_cost_usd !== undefined ? 'provider_estimate' : 'missing'
+    status: hasTokenEvidence || hasCostEvidence ? 'final' : 'unobserved',
+    confidence: hasTokenEvidence || hasCostEvidence ? 'provider_result' : 'missing',
+    api_retry_count: apiRetryCount,
+    api_error_status:
+      readFiniteNumber(result, 'api_error_status') ?? readString(result, 'api_error_status'),
+    terminal_reason: readString(result, 'terminal_reason'),
+    stop_reason: readString(result, 'stop_reason'),
+    duration_ms: readNonNegativeNumber(result, 'duration_ms'),
+    duration_api_ms: readNonNegativeNumber(result, 'duration_api_ms'),
+    time_to_first_token_ms: protocol.timeToFirstTokenMs,
+    permission_denial_count: protocol.permissionDenialCount,
+    unknown_event_count: protocol.unknownEventCount,
+    auxiliary_result_count: protocol.auxiliaryResultCount,
+    nested_session_detected: false,
+    supervised_session_coverage: hasTokenEvidence ? 'complete' : hasCostEvidence ? 'partial' : 'missing',
+    tool_counts: { ...toolCounts },
+    mcp_counts: { ...mcpCounts },
+    updated_at: updatedAt,
+    missing_reason: hasTokenEvidence ? null : hasCostEvidence ? 'claude_result_token_usage_missing' : 'claude_result_usage_missing',
+    reconciliation_delta: reconciliationDelta,
+    model_usage: modelUsage
   };
 }
 
 function effectiveModelsFromResult(result: Record<string, unknown>, initModel: string | null): string[] {
-  const modelUsage = asRecord(result.modelUsage) ?? asRecord(result.model_usage);
-  return [...new Set([initModel, ...(modelUsage ? Object.keys(modelUsage) : [])].filter((model): model is string => Boolean(model)))];
+  return [...new Set([initModel, ...modelUsageFromResult(result).map((usage) => usage.model)].filter((model): model is string => Boolean(model)))];
+}
+
+function mcpServerFromToolName(toolName: string): string | null {
+  if (!toolName.startsWith('mcp__')) return null;
+  const separator = toolName.indexOf('__', 5);
+  return separator > 5 ? toolName.slice(5, separator).toLowerCase() : null;
+}
+
+function activeMcpServers(payload: Record<string, unknown>): Set<string> {
+  const active = new Set<string>();
+  if (Array.isArray(payload.tools)) {
+    for (const rawName of payload.tools) {
+      const server = mcpServerFromToolName(String(rawName));
+      if (server) active.add(server);
+    }
+  }
+  if (Array.isArray(payload.mcp_servers)) {
+    for (const rawEntry of payload.mcp_servers) {
+      const entry = asRecord(rawEntry);
+      if (!entry) continue;
+      const name = readString(entry, 'name')?.toLowerCase();
+      const status = readString(entry, 'status')?.toLowerCase();
+      if (name && (!status || ['connected', 'ready', 'available'].includes(status))) active.add(name);
+    }
+  }
+  return active;
+}
+
+function isAuxiliaryResult(payload: Record<string, unknown>): boolean {
+  const subtype = readString(payload, 'subtype')?.toLowerCase() ?? '';
+  const origin = asRecord(payload.origin);
+  const originKind = readString(origin ?? {}, 'kind')?.toLowerCase() ?? '';
+  const auxiliary = ['task_notification', 'task-notification', 'prompt_suggestion', 'prompt-suggestion'];
+  return auxiliary.includes(subtype) || auxiliary.includes(originKind);
+}
+
+function partialUsageSnapshot(
+  steps: Map<string, UsageNumbers>,
+  model: string | null,
+  observedModels: Iterable<string>,
+  apiRetryCount: number,
+  toolCounts: Record<string, number>,
+  mcpCounts: Record<string, number>,
+  updatedAt: string,
+  protocol: { permissionDenialCount: number; unknownEventCount: number; auxiliaryResultCount: number }
+): ProviderUsage | null {
+  if (steps.size === 0) return null;
+  let accumulated = zeroUsage();
+  for (const step of steps.values()) {
+    accumulated = addUsage(accumulated, step);
+    if (Object.values(accumulated).some((count) => !Number.isSafeInteger(count) || count < 0)) return null;
+  }
+  return {
+    runtime: 'claude-cli',
+    model,
+    effective_models: [...new Set(observedModels)],
+    input_tokens: accumulated.input_tokens,
+    output_tokens: accumulated.output_tokens,
+    cache_read_tokens: accumulated.cache_read_tokens,
+    cache_creation_tokens: accumulated.cache_creation_tokens,
+    provider_turn_count: steps.size,
+    estimated_cost_usd: null,
+    source: 'claude_assistant_step',
+    status: 'partial',
+    confidence: 'provider_step',
+    api_retry_count: apiRetryCount,
+    permission_denial_count: protocol.permissionDenialCount,
+    unknown_event_count: protocol.unknownEventCount,
+    auxiliary_result_count: protocol.auxiliaryResultCount,
+    nested_session_detected: false,
+    supervised_session_coverage: 'partial',
+    tool_counts: { ...toolCounts },
+    mcp_counts: { ...mcpCounts },
+    updated_at: updatedAt,
+    missing_reason: null,
+    reconciliation_delta: null,
+    model_usage: []
+  };
+}
+
+function unobservedUsageSnapshot(params: {
+  model: string | null;
+  observedModels: Iterable<string>;
+  apiRetryCount: number;
+  permissionDenialCount: number;
+  unknownEventCount: number;
+  auxiliaryResultCount: number;
+  toolCounts: Record<string, number>;
+  mcpCounts: Record<string, number>;
+  updatedAt: string;
+  missingReason: string;
+}): ProviderUsage {
+  return {
+    runtime: 'claude-cli',
+    model: params.model,
+    effective_models: [...new Set(params.observedModels)],
+    input_tokens: null,
+    output_tokens: null,
+    cache_read_tokens: null,
+    cache_creation_tokens: null,
+    provider_turn_count: null,
+    estimated_cost_usd: null,
+    source: 'claude_invocation',
+    status: 'unobserved',
+    confidence: 'missing',
+    api_retry_count: params.apiRetryCount,
+    permission_denial_count: params.permissionDenialCount,
+    unknown_event_count: params.unknownEventCount,
+    auxiliary_result_count: params.auxiliaryResultCount,
+    nested_session_detected: false,
+    supervised_session_coverage: 'missing',
+    tool_counts: { ...params.toolCounts },
+    mcp_counts: { ...params.mcpCounts },
+    updated_at: params.updatedAt,
+    missing_reason: params.missingReason,
+    reconciliation_delta: null,
+    model_usage: []
+  };
+}
+
+function stableConfigurationHash(parts: unknown[]): string {
+  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+function buildSandboxSettings(params: {
+  executable: string;
+  workspace: string;
+  projectRoot: string;
+  projectSensitivePaths: string[];
+  home: string;
+  sessionTemp: string;
+  networkAllowedDomains: string[];
+  sshAuthSock: string | null;
+  allowedMcpServers: string[];
+}): Record<string, unknown> {
+  const protectedPaths = [
+    path.dirname(params.executable),
+    path.join(params.workspace, '.env'),
+    path.join(params.home, '.claude'),
+    path.join(params.home, '.aws'),
+    path.join(params.home, '.azure'),
+    path.join(params.home, '.claude.json'),
+    path.join(params.home, '.config', 'gh'),
+    path.join(params.home, '.config', 'gcloud'),
+    path.join(params.home, '.config', 'containers'),
+    path.join(params.home, '.config', 'pip'),
+    path.join(params.home, '.config', 'pypoetry'),
+    path.join(params.home, '.cargo'),
+    path.join(params.home, '.composer'),
+    path.join(params.home, '.docker'),
+    path.join(params.home, '.kube'),
+    path.join(params.home, '.git-credentials'),
+    path.join(params.home, '.netrc'),
+    path.join(params.home, '.authinfo'),
+    path.join(params.home, '.npmrc'),
+    path.join(params.home, '.pnpmrc'),
+    path.join(params.home, '.pypirc'),
+    path.join(params.home, '.ssh'),
+    path.join(params.home, '.terraform.d'),
+    path.join(params.home, '.yarnrc'),
+    path.join(params.home, '.yarnrc.yml'),
+    ...params.projectSensitivePaths,
+    path.join(path.dirname(params.projectRoot), '.symphony-quarantine')
+  ];
+  const absoluteReadRules = protectedPaths.flatMap((protectedPath) => {
+    const absolute = protectedPath.replace(/^\/+/, '');
+    return [`Read(//${absolute})`, `Read(//${absolute}/**)`];
+  });
+  const allowUnixSockets = params.sshAuthSock ? [params.sshAuthSock] : [];
+  return {
+    permissions: {
+      allow: params.allowedMcpServers.map((server) => `mcp__${server}__*`),
+      deny: [
+        'Read(./.env)',
+        'Read(**/.env)',
+        ...absoluteReadRules,
+        'WebFetch',
+        'WebSearch',
+        'Bash(claude *)',
+        `Bash(${params.executable} *)`
+      ]
+    },
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      autoAllowBashIfSandboxed: true,
+      filesystem: { allowWrite: [params.workspace, params.sessionTemp], denyRead: protectedPaths },
+      network: {
+        allowedDomains: params.networkAllowedDomains,
+        deniedDomains: ['localhost', '127.0.0.1', '::1'],
+        allowLocalBinding: false,
+        ...(allowUnixSockets.length > 0 ? { allowUnixSockets } : {})
+      }
+    }
+  };
+}
+
+function readGitRemoteIdentity(workspace: string, gitExecutable: string): GitRemoteIdentity {
+  const result = spawnSync(gitExecutable, ['config', '--file', path.join(workspace, '.git', 'config'), '--get', 'remote.origin.url'], {
+    cwd: workspace,
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+    encoding: 'utf8',
+    shell: false,
+    timeout: PREFLIGHT_TIMEOUT_MS,
+    maxBuffer: 64 * 1024
+  });
+  const remote = result.status === 0 ? result.stdout.trim() : '';
+  if (!remote) return { scheme: 'missing', host: null, repository: null, has_credentials: false };
+  const normalizeRepository = (value: string): string | null => {
+    const normalized = value.replace(/^\/+/, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+    return normalized && !normalized.includes('@') ? normalized : null;
+  };
+  if (remote.includes('://')) {
+    try {
+      const parsed = new URL(remote);
+      const hasCredentials = Boolean(
+        parsed.password || ((parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.username)
+      );
+      if (parsed.protocol === 'ssh:') {
+        return { scheme: 'ssh', host: parsed.hostname.toLowerCase(), repository: normalizeRepository(parsed.pathname), has_credentials: hasCredentials };
+      }
+      if (parsed.protocol === 'https:') {
+        return { scheme: 'https', host: parsed.hostname.toLowerCase(), repository: normalizeRepository(parsed.pathname), has_credentials: hasCredentials };
+      }
+      if (parsed.protocol === 'http:') {
+        return { scheme: 'http', host: parsed.hostname.toLowerCase(), repository: normalizeRepository(parsed.pathname), has_credentials: hasCredentials };
+      }
+      return { scheme: 'other', host: parsed.hostname.toLowerCase() || null, repository: null, has_credentials: hasCredentials };
+    } catch {
+      return { scheme: 'other', host: null, repository: null, has_credentials: false };
+    }
+  }
+  const scp = /^(?:[^@\s]+@)?([^:/\s]+):(.+)$/.exec(remote);
+  return scp
+    ? { scheme: 'ssh', host: scp[1]!.toLowerCase(), repository: normalizeRepository(scp[2]!), has_credentials: false }
+    : { scheme: 'other', host: null, repository: null, has_credentials: false };
+}
+
+function assertGitConfigurationSafe(workspace: string, gitExecutable: string): void {
+  const result = spawnSync(
+    gitExecutable,
+    ['config', '--file', path.join(workspace, '.git', 'config'), '--name-only', '--get-regexp', '.*'],
+    {
+      cwd: workspace,
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+      encoding: 'utf8',
+      shell: false,
+      timeout: PREFLIGHT_TIMEOUT_MS,
+      maxBuffer: 64 * 1024
+    }
+  );
+  if (result.status !== 0 && result.status !== 1) throw new Error('claude_git_config_unreadable');
+  const unsafe = result.stdout
+    .split(/\r?\n/)
+    .map((key) => key.trim().toLowerCase())
+    .filter(Boolean)
+    .some((key) =>
+      key.startsWith('credential.') ||
+      (key.startsWith('http.') && key.endsWith('.extraheader')) ||
+      key === 'core.sshcommand' ||
+      key === 'include.path' ||
+      key.startsWith('includeif.')
+    );
+  if (unsafe) throw new Error('claude_git_config_unsafe');
+}
+
+function validateSshAgent(
+  socketValue: string | undefined,
+  env: NodeJS.ProcessEnv,
+  forbiddenRoots: string[]
+): ValidatedSshAgent | null {
+  const candidate = socketValue?.trim();
+  if (!candidate) return null;
+  const socketPath = fs.realpathSync(candidate);
+  const stat = fs.statSync(socketPath);
+  if (!stat.isSocket()) throw new Error('claude_ssh_agent_not_socket');
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new Error('claude_ssh_agent_owner_mismatch');
+  }
+  const sshAddExecutable = resolveTrustedExecutable('ssh-add', env, forbiddenRoots);
+  const probe = spawnSync(sshAddExecutable, ['-l'], {
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', SSH_AUTH_SOCK: socketPath },
+    encoding: 'utf8',
+    shell: false,
+    timeout: PREFLIGHT_TIMEOUT_MS,
+    maxBuffer: 64 * 1024
+  });
+  if (probe.status === 1) throw new Error('claude_ssh_agent_no_identities');
+  if (probe.status !== 0) throw new Error('claude_ssh_agent_probe_failed');
+  return {
+    socketPath,
+    identityHash: crypto.createHash('sha256')
+      .update(`${socketPath}\0${stat.dev}\0${stat.ino}\0${stat.uid}\0${probe.stdout.trim().split(/\r?\n/).sort().join('\n')}`)
+      .digest('hex')
+  };
+}
+
+function resolveGitHubCapability(
+  remote: GitRemoteIdentity,
+  workspace: string,
+  env: NodeJS.ProcessEnv,
+  home: string,
+  command: string,
+  forbiddenRoots: string[]
+): GitHubCapability | null {
+  const host = remote.host;
+  if (!host || (host !== 'github.com' && !host.endsWith('.github.com'))) return null;
+  const executable = resolveTrustedExecutable(command, env, forbiddenRoots);
+  const result = spawnSync(executable, ['auth', 'token', '--hostname', host], {
+    cwd: workspace,
+    env: {
+      PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+      HOME: home,
+      USER: env.USER,
+      LOGNAME: env.LOGNAME
+    },
+    encoding: 'utf8',
+    shell: false,
+    timeout: PREFLIGHT_TIMEOUT_MS,
+    maxBuffer: 64 * 1024
+  });
+  const token = result.status === 0 ? result.stdout.trim() : '';
+  if (!token) throw new Error('claude_github_auth_unavailable');
+  return {
+    host,
+    token,
+    executable,
+    identityHash: crypto.createHash('sha256').update(`${host}\0${token}`).digest('hex')
+  };
+}
+
+function quoteShellArgument(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function boundedTelemetryName(value: string): string {
+  return trimUtf8(value.trim(), MAX_TELEMETRY_NAME_BYTES);
+}
+
+function retryCategory(value: unknown): string {
+  const normalized = boundedFailureSignal(value) ?? 'unknown';
+  if (/429|rate.?limit/.test(normalized)) return 'rate_limit';
+  if (/overload|529/.test(normalized)) return 'overload';
+  if (/network|connect|timeout|socket/.test(normalized)) return 'network';
+  if (/5\d\d|server|unavailable/.test(normalized)) return 'server';
+  return `unknown_sha256_${crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16)}`;
+}
+
+function createSandboxSettingsFile(
+  createSettings: (directory: string) => Record<string, unknown>,
+  approvedMcpConfiguration: Record<string, Record<string, unknown>>
+): { directory: string; file: string; mcpFile: string; sessionTemp: string; hash: string } {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-settings-'));
+  fs.chmodSync(directory, 0o700);
+  const settingsDirectory = path.join(directory, 'policy');
+  const sessionTemp = path.join(directory, 'session');
+  fs.mkdirSync(settingsDirectory, { mode: 0o700 });
+  fs.mkdirSync(sessionTemp, { mode: 0o700 });
+  const file = path.join(settingsDirectory, 'settings.json');
+  const mcpFile = path.join(settingsDirectory, 'mcp.json');
+  const settings = createSettings(sessionTemp);
+  const serialized = `${JSON.stringify(settings, null, 2)}\n`;
+  fs.writeFileSync(file, serialized, { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(mcpFile, `${JSON.stringify({ mcpServers: approvedMcpConfiguration }, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600
+  });
+  fs.chmodSync(file, 0o400);
+  fs.chmodSync(mcpFile, 0o400);
+  fs.chmodSync(settingsDirectory, 0o500);
+  return { directory, file, mcpFile, sessionTemp, hash: crypto.createHash('sha256').update(serialized).digest('hex') };
+}
+
+function removeSandboxSettings(directory: string | null): void {
+  if (!directory) return;
+  try {
+    fs.rmSync(directory, { recursive: true, force: true });
+  } catch {
+    // The private directory contains no credentials and is cleaned on the next temp sweep.
+  }
+}
+
+const SAFE_CHILD_ENV_NAMES = new Set([
+  'CI', 'COLORTERM', 'FORCE_COLOR', 'GH_HOST', 'GITHUB_HOST', 'HOME', 'LANG', 'LOGNAME',
+  'NO_COLOR', 'PATH', 'SHELL', 'SSH_AUTH_SOCK', 'TERM', 'TMPDIR', 'USER'
+]);
+
+function buildChildEnvironment(
+  base: NodeJS.ProcessEnv,
+  workspace: string,
+  home: string,
+  model: string,
+  allowNonSubscriptionAuth: boolean
+): NodeJS.ProcessEnv {
+  const output: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (value === undefined) continue;
+    if (
+      SAFE_CHILD_ENV_NAMES.has(name) ||
+      name.startsWith('LC_') ||
+      (base.NODE_ENV === 'test' && name.startsWith('MOCK_'))
+    ) {
+      output[name] = value;
+    }
+  }
+  if (allowNonSubscriptionAuth) {
+    for (const name of NON_SUBSCRIPTION_ENV_NAMES) {
+      if (base[name] !== undefined) output[name] = base[name];
+    }
+  } else {
+    for (const name of NON_SUBSCRIPTION_ENV_NAMES) delete output[name];
+  }
+  delete output.LINEAR_API_KEY;
+  output.HOME = home;
+  output.PWD = workspace;
+  output.ANTHROPIC_MODEL = model;
+  output.DISABLE_AUTOUPDATER = '1';
+  output.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
+  return output;
+}
+
+interface ProcessRow {
+  pid: number;
+  ppid: number;
+  started: string;
+  command: string;
+  args: string;
+}
+
+function processRowIdentity(row: ProcessRow): string {
+  return crypto.createHash('sha256').update(`${row.started}\0${row.command}\0${row.args}`).digest('hex');
+}
+
+function readProcessRows(): ProcessRow[] {
+  const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm=,args='], {
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+    shell: false
+  });
+  if (result.status !== 0) return [];
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line) => /^\s*(\d+)\s+(\d+)\s+(.{24})\s+(\S+)\s+(.*)$/.exec(line))
+    .filter((match): match is RegExpExecArray => Boolean(match))
+    .map((match) => ({
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+      started: match[3]!.trim(),
+      command: match[4]!,
+      args: match[5]!
+    }));
+}
+
+function descendantProcessRows(rootPid: number | undefined, rows = readProcessRows()): ProcessRow[] {
+  if (!rootPid) return [];
+  const descendants = new Set<number>([rootPid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if (descendants.has(row.ppid) && !descendants.has(row.pid)) {
+        descendants.add(row.pid);
+        changed = true;
+      }
+    }
+  }
+  return rows.filter((row) => row.pid !== rootPid && descendants.has(row.pid));
+}
+
+function findNestedClaudeDescendant(rootPid: number | undefined, executable: string, rows = readProcessRows()): number | null {
+  if (!rootPid) return null;
+  const executableName = path.basename(executable);
+  for (const row of descendantProcessRows(rootPid, rows)) {
+    if (process.platform === 'linux') {
+      try {
+        if (fs.realpathSync(`/proc/${row.pid}/exe`) === executable) return row.pid;
+      } catch {
+        // The process may have exited between ps and /proc inspection.
+      }
+    }
+    const argv = row.args.trim().split(/\s+/).slice(0, 3);
+    if (
+      path.basename(row.command) === executableName ||
+      argv.some((value, index) => index < 2 && path.basename(value) === executableName)
+    ) {
+      return row.pid;
+    }
+  }
+  return null;
 }
 
 function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals): boolean {
@@ -277,7 +1252,7 @@ function processGroupExists(pid: number | undefined): boolean {
   }
 }
 
-async function cleanupProcessGroup(pid: number | undefined): Promise<'none' | 'terminated' | 'killed'> {
+async function cleanupProcessGroup(pid: number | undefined): Promise<'none' | 'terminated' | 'killed' | 'survived'> {
   if (!processGroupExists(pid)) return 'none';
   killProcessGroup(pid, 'SIGTERM');
   const deadline = Date.now() + TERMINATION_GRACE_MS;
@@ -286,14 +1261,39 @@ async function cleanupProcessGroup(pid: number | undefined): Promise<'none' | 't
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   killProcessGroup(pid, 'SIGKILL');
-  return 'killed';
+  const killDeadline = Date.now() + 1_000;
+  while (Date.now() < killDeadline) {
+    if (!processGroupExists(pid)) return 'killed';
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return 'survived';
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+  const state = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], {
+    encoding: 'utf8',
+    shell: false,
+    maxBuffer: 8 * 1024
+  });
+  return state.status === 0 && !state.stdout.trim().toUpperCase().startsWith('Z');
 }
 
 async function writePrompt(child: ChildProcessWithoutNullStreams, prompt: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    child.stdin.once('error', reject);
+    let settled = false;
+    child.stdin.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
     child.stdin.end(prompt, 'utf8', () => {
-      child.stdin.off('error', reject);
+      if (settled) return;
+      settled = true;
       resolve();
     });
   });
@@ -316,9 +1316,22 @@ export class ClaudeCliRunner implements AgentRunner {
   private readonly capabilityFingerprintBySession = new Map<string, string>();
   private readonly bindingBySession = new Map<string, ClaudeSessionBinding>();
 
+  private retainSessionBinding(sessionId: string, binding: ClaudeSessionBinding, fingerprint: string | null): void {
+    this.bindingBySession.delete(sessionId);
+    this.bindingBySession.set(sessionId, binding);
+    this.capabilityFingerprintBySession.delete(sessionId);
+    if (fingerprint) this.capabilityFingerprintBySession.set(sessionId, fingerprint);
+    while (this.bindingBySession.size > MAX_SESSION_BINDINGS) {
+      const oldest = this.bindingBySession.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.bindingBySession.delete(oldest);
+      this.capabilityFingerprintBySession.delete(oldest);
+    }
+  }
+
   constructor(private readonly options: ClaudeCliRunnerOptions) {
     this.env = { ...process.env, ...options.env };
-    this.homedir = options.homedir ?? os.homedir;
+    this.homedir = options.homedir ?? (() => this.env.HOME?.trim() || os.homedir());
     this.platform = options.platform ?? process.platform;
     this.now = options.now ?? (() => new Date());
     this.supportedVersion = options.supportedVersion ?? CLAUDE_SUPPORTED_VERSION;
@@ -335,38 +1348,209 @@ export class ClaudeCliRunner implements AgentRunner {
   private async run(input: AgentRunnerStartInput, expectedSessionId: string | null): Promise<AgentRunResult> {
     const turnId = crypto.randomUUID();
     const startedAt = this.now();
+    let child: ChildProcessWithoutNullStreams | null = null;
+    let settingsDirectory: string | null = null;
+    let eventDeliveryError: string | null = null;
+    let deliveryFailureHandler: (() => void) | null = null;
     const emit = (
       event: Omit<
         AgentRunnerEvent,
         'agent_runtime' | 'worker_process_pid' | 'codex_app_server_pid' | 'timestamp'
       > & { timestamp?: string }
-    ) =>
-      input.onEvent?.({
-        ...event,
-        timestamp: event.timestamp ?? this.now().toISOString(),
-        agent_runtime: this.runtime,
-        worker_process_pid: child?.pid ?? null,
-        codex_app_server_pid: null
-      });
-    let child: ChildProcessWithoutNullStreams | null = null;
+    ): boolean => {
+      try {
+        input.onEvent?.({
+          ...event,
+          timestamp: event.timestamp ?? this.now().toISOString(),
+          agent_runtime: this.runtime,
+          worker_process_pid: child?.pid ?? null,
+          codex_app_server_pid: null
+        });
+        return true;
+      } catch (error) {
+        eventDeliveryError = `claude_event_delivery_failed:${boundedFailureSignal(error instanceof Error ? error.message : String(error)) ?? 'unknown'}`;
+        deliveryFailureHandler?.();
+        return false;
+      }
+    };
+
+    const cancelledBeforeSpawn = (): AgentRunResult => ({
+      runtime: this.runtime,
+      status: 'cancelled',
+      session_id: expectedSessionId,
+      thread_id: expectedSessionId ? `claude:${expectedSessionId}` : null,
+      turn_id: turnId,
+      last_event: CANONICAL_EVENT.agentRunner.turnCancelled,
+      error_code: REASON_CODES.workerCancelRequested,
+      cancellation_outcome: 'graceful_exit',
+      requested_model: this.options.model,
+      effective_model: null,
+      retryable: false
+    });
 
     try {
+      if (input.cancellationSignal?.aborted) return cancelledBeforeSpawn();
       if (input.workerHost) throw new Error('claude_remote_worker_unsupported');
       if (!['darwin', 'linux'].includes(this.platform)) throw new Error(`claude_platform_unsupported:${this.platform}`);
       if (!path.isAbsolute(input.workspaceCwd)) throw new Error('invalid_workspace_cwd');
       const workspace = fs.realpathSync(input.workspaceCwd);
       if (!fs.statSync(workspace).isDirectory()) throw new Error('invalid_workspace_cwd');
+      const workspaceSensitiveAudit = auditSensitiveWorkspaceFiles(workspace);
+      if (!workspaceSensitiveAudit.complete) throw new Error('claude_workspace_sensitive_audit_incomplete');
+      const gitMarker = path.join(workspace, '.git');
+      if (fs.existsSync(gitMarker) && fs.lstatSync(gitMarker).isFile()) {
+        throw new Error('claude_linked_worktree_metadata_unsupported');
+      }
       if (Buffer.byteLength(input.prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('claude_prompt_too_large');
       if (expectedSessionId && !SESSION_ID_PATTERN.test(expectedSessionId)) throw new Error('claude_resume_session_invalid');
       if (this.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY?.trim()) throw new Error('claude_session_persistence_disabled');
+      const home = this.homedir();
+      const projectRoot = fs.realpathSync(this.options.projectRoot);
+      if (!fs.statSync(projectRoot).isDirectory()) throw new Error('claude_project_root_invalid');
+      const executable = resolveTrustedExecutable(
+        this.options.command,
+        this.env,
+        path.isAbsolute(this.options.command) ? [] : [workspace, projectRoot]
+      );
+      const projectSensitiveAudit = auditSensitiveWorkspaceFiles(projectRoot);
+      if (!projectSensitiveAudit.complete) throw new Error('claude_project_sensitive_audit_incomplete');
+      const projectSensitivePaths = [...new Set([
+        ...projectSensitiveAudit.violations.map((violation) => violation.absolutePath),
+        ...workspaceSensitiveAudit.violations.map((violation) => violation.absolutePath)
+      ])].sort();
+      const userSettings = assessUserSettings(home);
+      if (userSettings.unsafe.length > 0) {
+        throw new Error(`claude_user_settings_unsafe:${userSettings.unsafe.join(',')}`);
+      }
+      const userCustomAgents = assessUserCustomAgents(home);
+      if (userCustomAgents.present.length > 0) {
+        throw new Error(`claude_user_custom_agents_unsupported:${userCustomAgents.present.map((value) => path.basename(value)).join(',')}`);
+      }
+      const managedPolicy = assessManagedPolicy(this.platform, home);
+      if (managedPolicy.present.length > 0) {
+        throw new Error(`claude_managed_policy_unsupported:${managedPolicy.present.map((value) => path.basename(value)).join(',')}`);
+      }
+      const userInstructionHash = hashUserInstructionSurface(home);
+      if (!this.options.allowNonSubscriptionAuth) {
+        const inheritedSelectors = NON_SUBSCRIPTION_ENV_NAMES.filter((name) => Boolean(this.env[name]?.trim()));
+        const selectors = [...new Set([...inheritedSelectors, ...userSettings.selectors])];
+        if (selectors.length > 0) throw new Error(`claude_non_subscription_auth_forbidden:${selectors.join(',')}`);
+      }
+      const networkAllowedDomains = [
+        ...new Set((this.options.networkAllowedDomains ?? []).map((value) => value.toLowerCase()))
+      ].sort();
+      if (networkAllowedDomains.some((value) => value === 'localhost' || value === '127.0.0.1' || value === '::1')) {
+        throw new Error('claude_loopback_network_forbidden');
+      }
+      const allowedMcpServers = new Set((this.options.allowedMcpServers ?? []).map((value) => value.toLowerCase()));
+      const requiredMcpServers = new Set((this.options.requiredMcpServers ?? []).map((value) => value.toLowerCase()));
+      const userMcpConfiguration = inspectClaudeUserMcpConfiguration({
+        home,
+        workspace,
+        allowedServers: allowedMcpServers,
+        requiredServers: requiredMcpServers
+      });
+      if (userMcpConfiguration.unsafe.length > 0) {
+        throw new Error(`claude_user_mcp_unsafe:${userMcpConfiguration.unsafe.join(',')}`);
+      }
+      const gitExecutable = resolveTrustedExecutable(
+        this.options.gitCommand ?? 'git',
+        this.env,
+        this.options.gitCommand ? [] : [workspace, projectRoot]
+      );
+      const gitRemote = readGitRemoteIdentity(workspace, gitExecutable);
+      assertGitConfigurationSafe(workspace, gitExecutable);
+      if (gitRemote.has_credentials) throw new Error('claude_git_remote_contains_credentials');
+      if (gitRemote.scheme === 'http') throw new Error('claude_insecure_git_remote');
+      if (gitRemote.scheme === 'ssh' && this.platform === 'linux') {
+        throw new Error('claude_linux_ssh_remote_unsupported');
+      }
+      const sshAllowed =
+        gitRemote.scheme === 'ssh' &&
+        Boolean(gitRemote.host) &&
+        networkAllowedDomains.includes(gitRemote.host!);
+      const sshAgent = sshAllowed
+        ? validateSshAgent(this.env.SSH_AUTH_SOCK, this.env, [workspace, projectRoot])
+        : null;
+      const githubCapability = resolveGitHubCapability(
+        gitRemote,
+        workspace,
+        this.env,
+        home,
+        this.options.githubCommand ?? 'gh',
+        this.options.githubCommand ? [] : [workspace, projectRoot]
+      );
+      const childEnv = buildChildEnvironment(
+        this.env,
+        workspace,
+        home,
+        this.options.model,
+        this.options.allowNonSubscriptionAuth
+      );
+      if (!sshAgent) delete childEnv.SSH_AUTH_SOCK;
+      else childEnv.SSH_AUTH_SOCK = sshAgent.socketPath;
+      if (githubCapability) {
+        childEnv.GH_TOKEN = githubCapability.token;
+        childEnv.GH_HOST = githubCapability.host;
+        childEnv.GIT_CONFIG_COUNT = '1';
+        childEnv.GIT_CONFIG_KEY_0 = `credential.https://${githubCapability.host}.helper`;
+        childEnv.GIT_CONFIG_VALUE_0 = `!${quoteShellArgument(githubCapability.executable)} auth git-credential`;
+      }
+      assertSupportedVersion(executable, workspace, childEnv, this.supportedVersion);
+      assertApprovedAuth(executable, workspace, childEnv, home, this.options.allowNonSubscriptionAuth);
+      if (input.cancellationSignal?.aborted) return cancelledBeforeSpawn();
+
+      const settingsFile = createSandboxSettingsFile(
+        (sessionTemp) => buildSandboxSettings({
+          executable,
+          workspace,
+          projectRoot,
+          projectSensitivePaths,
+          home,
+          sessionTemp,
+          networkAllowedDomains,
+          sshAuthSock: sshAgent?.socketPath ?? null,
+          allowedMcpServers: [...allowedMcpServers].sort()
+        }),
+        userMcpConfiguration.approvedServerConfiguration
+      );
+      settingsDirectory = settingsFile.directory;
+      childEnv.TMPDIR = settingsFile.sessionTemp;
+      const stableSandboxPolicy = buildSandboxSettings({
+        executable,
+        workspace,
+        projectRoot,
+        projectSensitivePaths,
+        home,
+        sessionTemp: '<session-temp>',
+        networkAllowedDomains,
+        sshAuthSock: sshAgent?.socketPath ?? null,
+        allowedMcpServers: [...allowedMcpServers].sort()
+      });
       const binding: ClaudeSessionBinding = {
         project_identity: input.runBinding?.project_identity ?? workspace,
         issue_id: input.runBinding?.issue_id ?? input.title,
         issue_identifier: input.runBinding?.issue_identifier ?? input.title,
         attempt: input.runBinding?.attempt ?? null,
         workspace_realpath: workspace,
+        project_root_realpath: projectRoot,
         model: this.options.model,
-        os_user: typeof process.getuid === 'function' ? process.getuid() : (this.env.USER ?? 'unknown')
+        os_user: typeof process.getuid === 'function' ? process.getuid() : (this.env.USER ?? 'unknown'),
+        config_hash: stableConfigurationHash([
+          userSettings.hash,
+          userCustomAgents.hash,
+          userInstructionHash,
+          managedPolicy.hash,
+          userMcpConfiguration.hash,
+          stableSandboxPolicy,
+          [...allowedMcpServers].sort(),
+          [...requiredMcpServers].sort(),
+          executable,
+          this.supportedVersion,
+          gitRemote,
+          sshAgent?.identityHash ?? null,
+          githubCapability?.identityHash ?? null
+        ])
       };
       if (expectedSessionId) {
         const previousBinding = this.bindingBySession.get(expectedSessionId);
@@ -374,16 +1558,6 @@ export class ClaudeCliRunner implements AgentRunner {
           throw new Error('claude_resume_binding_mismatch');
         }
       }
-
-      const executable = resolveExecutable(this.options.command, this.env);
-      const childEnv: NodeJS.ProcessEnv = {
-        ...this.env,
-        ANTHROPIC_MODEL: this.options.model,
-        DISABLE_AUTOUPDATER: '1',
-        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1'
-      };
-      assertSupportedVersion(executable, workspace, childEnv, this.supportedVersion);
-      assertApprovedAuth(executable, workspace, childEnv, this.homedir(), this.options.allowNonSubscriptionAuth);
 
       const args = [
         '--print',
@@ -394,11 +1568,22 @@ export class ClaudeCliRunner implements AgentRunner {
         '--verbose',
         '--setting-sources',
         'user',
+        '--settings',
+        settingsFile.file,
+        '--mcp-config',
+        settingsFile.mcpFile,
+        '--strict-mcp-config',
         '--model',
         this.options.model,
-        '--dangerously-skip-permissions'
+        '--permission-mode',
+        'acceptEdits'
       ];
       if (expectedSessionId) args.push('--resume', expectedSessionId);
+      if (input.cancellationSignal?.aborted) {
+        removeSandboxSettings(settingsDirectory);
+        settingsDirectory = null;
+        return cancelledBeforeSpawn();
+      }
 
       child = spawn(executable, args, {
         cwd: workspace,
@@ -407,21 +1592,70 @@ export class ClaudeCliRunner implements AgentRunner {
         detached: true,
         stdio: ['pipe', 'pipe', 'pipe']
       });
+      let terminationLifecycle: 'running' | 'terminating' | 'closed' = 'running';
+      let forceKillTimer: NodeJS.Timeout | null = null;
+      let closeDeadlineTimer: NodeJS.Timeout | null = null;
+      const clearTerminationTimers = () => {
+        if (forceKillTimer) clearTimeout(forceKillTimer);
+        if (closeDeadlineTimer) clearTimeout(closeDeadlineTimer);
+        forceKillTimer = null;
+        closeDeadlineTimer = null;
+      };
       const closePromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; spawnError: string | null }>((resolve) => {
         let spawnError: string | null = null;
         child?.once('error', (error) => {
           spawnError = error.message;
         });
-        child?.once('close', (code, signal) => resolve({ code, signal, spawnError }));
+        child?.once('close', (code, signal) => {
+          terminationLifecycle = 'closed';
+          clearTerminationTimers();
+          resolve({ code, signal, spawnError });
+        });
       });
-      emit({ event: CANONICAL_EVENT.agentRunner.processStarted, turn_id: turnId });
+      let committed: 'cancelled' | 'timed_out' | null = null;
+      let forcedKillSent = false;
+      let resolveCloseDeadline: ((value: { code: null; signal: NodeJS.Signals; spawnError: string }) => void) | null = null;
+      const closeDeadlinePromise = new Promise<{ code: null; signal: NodeJS.Signals; spawnError: string }>((resolve) => {
+        resolveCloseDeadline = resolve;
+      });
+      let state: ParsedProtocolState;
+      const requestTermination = (cause: string, outcome: 'cancelled' | 'timed_out' | null = null) => {
+        if (outcome && !committed) committed = outcome;
+        if (!outcome && state && !state.protocolError) state.protocolError = cause;
+        if (terminationLifecycle === 'closed' || forceKillTimer || closeDeadlineTimer) return;
+        terminationLifecycle = 'terminating';
+        killProcessGroup(child?.pid, 'SIGTERM');
+        forceKillTimer = setTimeout(() => {
+          if (terminationLifecycle === 'closed') return;
+          forcedKillSent = true;
+          killProcessGroup(child?.pid, 'SIGKILL');
+        }, TERMINATION_GRACE_MS);
+        closeDeadlineTimer = setTimeout(() => {
+          if (terminationLifecycle === 'closed') return;
+          resolveCloseDeadline?.({ code: null, signal: 'SIGKILL', spawnError: 'claude_process_close_timeout' });
+        }, TERMINATION_GRACE_MS + PROCESS_CLOSE_GRACE_MS);
+      };
+      deliveryFailureHandler = () => requestTermination(eventDeliveryError ?? 'claude_event_delivery_failed');
+      emit({
+        event: CANONICAL_EVENT.agentRunner.processStarted,
+        session_id: expectedSessionId ?? undefined,
+        thread_id: expectedSessionId ? `claude:${expectedSessionId}` : undefined,
+        turn_id: turnId
+      });
 
-      const state: ParsedProtocolState = {
+      state = {
         sessionId: null,
+        initSessionId: null,
         effectiveModel: null,
         capabilityFingerprint: null,
+        instructionFingerprint: null,
+        skillFingerprint: null,
         terminalResult: null,
         terminalResultCount: 0,
+        auxiliaryResultCount: 0,
+        initCount: 0,
+        apiRetryCount: 0,
+        permissionDenialCount: 0,
         unknownEventCount: 0,
         lastEvent: CANONICAL_EVENT.agentRunner.processStarted,
         protocolError: null
@@ -435,10 +1669,23 @@ export class ClaudeCliRunner implements AgentRunner {
 
       const decoder = new StringDecoder('utf8');
       let pending = '';
+      const assistantSteps = new Map<string, UsageNumbers>();
+      const observedModels = new Set<string>();
+      const emittedReroutes = new Set<string>();
+      const observedToolIds = new Set<string>();
+      const observedPermissionDenialIds = new Set<string>();
+      const toolCounts: Record<string, number> = {};
+      const mcpCounts: Record<string, number> = {};
+      let latestPartialUsage: ProviderUsage | null = null;
+      let firstAssistantAtMs: number | null = null;
+      const failProtocol = (code: string) => {
+        if (state.protocolError) return;
+        requestTermination(code);
+      };
       const parseLine = (line: string) => {
         if (!line.trim() || state.protocolError) return;
         if (Buffer.byteLength(line, 'utf8') > MAX_PROTOCOL_LINE_BYTES) {
-          state.protocolError = 'claude_protocol_line_too_large';
+          failProtocol('claude_protocol_line_too_large');
           return;
         }
         let payload: Record<string, unknown>;
@@ -447,7 +1694,7 @@ export class ClaudeCliRunner implements AgentRunner {
           if (!parsed) throw new Error('not_object');
           payload = parsed;
         } catch {
-          state.protocolError = 'claude_protocol_malformed_json';
+          failProtocol('claude_protocol_malformed_json');
           return;
         }
         const type = readString(payload, 'type') ?? 'unknown';
@@ -456,15 +1703,67 @@ export class ClaudeCliRunner implements AgentRunner {
         state.lastEvent = eventName;
         const sessionId = readString(payload, 'session_id');
         if (sessionId) {
-          if (!SESSION_ID_PATTERN.test(sessionId)) state.protocolError = 'claude_session_id_invalid';
-          else if (state.sessionId && state.sessionId !== sessionId) state.protocolError = 'claude_session_id_mismatch';
-          else if (expectedSessionId && expectedSessionId !== sessionId) state.protocolError = 'claude_resume_session_mismatch';
+          if (!SESSION_ID_PATTERN.test(sessionId)) failProtocol('claude_session_id_invalid');
+          else if (state.sessionId && state.sessionId !== sessionId) failProtocol('claude_session_id_mismatch');
+          else if (expectedSessionId && expectedSessionId !== sessionId) failProtocol('claude_resume_session_mismatch');
           else state.sessionId = sessionId;
+          if (state.protocolError) return;
         }
 
         if (type === 'system' && subtype === 'init') {
+          state.initCount += 1;
+          if (state.initCount > 1) {
+            failProtocol(`claude_init_count:${state.initCount}`);
+            return;
+          }
+          if (!sessionId) {
+            failProtocol('claude_init_session_missing');
+            return;
+          }
+          state.initSessionId = sessionId;
+          const activeServers = activeMcpServers(payload);
           state.effectiveModel = readString(payload, 'model');
-          state.capabilityFingerprint = buildCapabilityFingerprint(payload);
+          if (!state.effectiveModel) {
+            failProtocol('claude_init_model_missing');
+            return;
+          }
+          observedModels.add(state.effectiveModel);
+          state.instructionFingerprint = hashInitSurface(payload, [
+            'claude_md',
+            'instructions',
+            'instruction_sources',
+            'commands',
+            'slash_commands'
+          ]);
+          state.skillFingerprint = hashInitSurface(payload, ['skills', 'agents', 'plugins']);
+          state.capabilityFingerprint = stableConfigurationHash([
+            buildCapabilityFingerprint(payload, activeServers),
+            state.instructionFingerprint,
+            state.skillFingerprint
+          ]);
+          if (expectedSessionId) {
+            const previousFingerprint = this.capabilityFingerprintBySession.get(expectedSessionId);
+            if (previousFingerprint && previousFingerprint !== state.capabilityFingerprint) {
+              failProtocol('claude_capability_fingerprint_drift');
+              return;
+            }
+          } else {
+            const existingBinding = this.bindingBySession.get(sessionId);
+            if (existingBinding) {
+              failProtocol('claude_session_collision');
+              return;
+            }
+          }
+          const unexpectedServers = [...activeServers].filter((name) => !allowedMcpServers.has(name));
+          const missingServers = [...requiredMcpServers].filter((name) => !activeServers.has(name));
+          if (unexpectedServers.length > 0) {
+            failProtocol(`claude_unapproved_mcp_exposed:${unexpectedServers.sort().join(',')}`);
+            return;
+          }
+          if (missingServers.length > 0) {
+            failProtocol(`claude_required_mcp_missing:${missingServers.sort().join(',')}`);
+            return;
+          }
           emit({
             event: CANONICAL_EVENT.agentRunner.sessionStarted,
             session_id: state.sessionId ?? undefined,
@@ -476,22 +1775,174 @@ export class ClaudeCliRunner implements AgentRunner {
           return;
         }
         if (type === 'result') {
+          if (isAuxiliaryResult(payload)) {
+            state.auxiliaryResultCount += 1;
+            return;
+          }
+          if (state.initCount !== 1 || !state.initSessionId) {
+            failProtocol('claude_result_before_init');
+            return;
+          }
           state.terminalResultCount += 1;
+          if (state.terminalResultCount > 1) {
+            failProtocol(`claude_terminal_result_count:${state.terminalResultCount}`);
+            return;
+          }
           state.terminalResult = payload;
           return;
         }
         if (type === 'system' && subtype === 'api_retry') {
+          state.apiRetryCount += 1;
           emit({
             event: CANONICAL_EVENT.agentRunner.activity,
             session_id: state.sessionId ?? undefined,
             turn_id: turnId,
             detail: 'claude_api_retry',
-            reason_code: readString(payload, 'error') ?? undefined,
+            reason_code: retryCategory(payload.error),
             process_liveness_only: true
           });
           return;
         }
-        if (type === 'assistant' || type === 'user' || type === 'system') {
+        if (type === 'system' && subtype === 'permission_denied') {
+          const rawToolUseId = readString(payload, 'tool_use_id') ?? readString(payload, 'toolUseId');
+          const denialId = rawToolUseId ?? crypto.createHash('sha256').update(line).digest('hex');
+          if (!observedPermissionDenialIds.has(denialId)) {
+            observedPermissionDenialIds.add(denialId);
+            state.permissionDenialCount += 1;
+          }
+          const deniedTool = boundedTelemetryName(readString(payload, 'tool_name') ?? 'unknown');
+          emit({
+            event: CANONICAL_EVENT.agentRunner.activity,
+            session_id: state.sessionId ?? undefined,
+            turn_id: turnId,
+            detail: `claude_permission_denied:${deniedTool}`,
+            reason_code: REASON_CODES.claudePermissionDenied
+          });
+          return;
+        }
+        if (type === 'assistant') {
+          if (state.terminalResult) {
+            failProtocol('claude_activity_after_terminal_result');
+            return;
+          }
+          if (firstAssistantAtMs === null) firstAssistantAtMs = this.now().getTime();
+          const message = asRecord(payload.message);
+          const rawMessageId = message ? readString(message, 'id') : null;
+          const messageId = rawMessageId
+            ? crypto.createHash('sha256').update(rawMessageId).digest('hex')
+            : null;
+          const stepUsage = message ? usageNumbers(message.usage) : null;
+          if (messageId && stepUsage) {
+            if (!assistantSteps.has(messageId) && assistantSteps.size >= MAX_TELEMETRY_IDENTITIES) {
+              state.unknownEventCount += 1;
+            } else {
+            const previous = assistantSteps.get(messageId);
+            const next = maxUsage(previous, stepUsage);
+            assistantSteps.set(messageId, next);
+            const messageModel = message ? readString(message, 'model') : null;
+            if (messageModel) {
+              state.effectiveModel = messageModel;
+              observedModels.add(messageModel);
+              if (messageModel !== this.options.model && !emittedReroutes.has(messageModel)) {
+                emittedReroutes.add(messageModel);
+                emit({
+                  event: CANONICAL_EVENT.agentRunner.activity,
+                  session_id: state.sessionId ?? undefined,
+                  turn_id: turnId,
+                  detail: REASON_CODES.claudeModelObserved,
+                  requested_model: this.options.model,
+                  effective_model: messageModel,
+                  model_reroute: {
+                    requested_model: this.options.model,
+                    effective_model: messageModel,
+                    reason_code: REASON_CODES.claudeModelObserved,
+                    source: 'claude_assistant_step'
+                  }
+                });
+              }
+            }
+            const observedAt = this.now().toISOString();
+            latestPartialUsage = partialUsageSnapshot(
+              assistantSteps,
+              state.effectiveModel,
+              observedModels,
+              state.apiRetryCount,
+              toolCounts,
+              mcpCounts,
+              observedAt,
+              {
+                permissionDenialCount: state.permissionDenialCount,
+                unknownEventCount: state.unknownEventCount,
+                auxiliaryResultCount: state.auxiliaryResultCount
+              }
+            );
+            if (!previous || JSON.stringify(previous) !== JSON.stringify(next)) {
+              emit({
+                event: CANONICAL_EVENT.agentRunner.activity,
+                session_id: state.sessionId ?? undefined,
+                turn_id: turnId,
+                detail: 'claude_usage_partial',
+                provider_usage: latestPartialUsage ?? undefined,
+                provider_usage_step_facts: [
+                  {
+                    message_id_hash: messageId,
+                    model: messageModel ?? state.effectiveModel,
+                    input_tokens: next.input_tokens,
+                    output_tokens: next.output_tokens,
+                    cache_read_tokens: next.cache_read_tokens,
+                    cache_creation_tokens: next.cache_creation_tokens,
+                    observed_at: observedAt
+                  }
+                ]
+              });
+            }
+            }
+          }
+          if (message && Array.isArray(message.content)) {
+            for (const rawBlock of message.content) {
+              const block = asRecord(rawBlock);
+              if (!block || readString(block, 'type') !== 'tool_use') continue;
+              const toolName = readString(block, 'name');
+              const rawToolId = readString(block, 'id');
+              const toolId = rawToolId
+                ? crypto.createHash('sha256').update(rawToolId).digest('hex')
+                : null;
+              if (!toolName || !toolId || observedToolIds.has(toolId)) continue;
+              if (observedToolIds.size >= MAX_TELEMETRY_IDENTITIES) {
+                state.unknownEventCount += 1;
+                continue;
+              }
+              observedToolIds.add(toolId);
+              const boundedToolName = boundedTelemetryName(toolName);
+              toolCounts[boundedToolName] = (toolCounts[boundedToolName] ?? 0) + 1;
+              const mcpServer = mcpServerFromToolName(boundedToolName);
+              if (mcpServer) mcpCounts[mcpServer] = (mcpCounts[mcpServer] ?? 0) + 1;
+              const toolInput = asRecord(block.input);
+              const command = toolName === 'Bash' && toolInput ? readString(toolInput, 'command') : null;
+              if (command && /(^|[;&|()\s])(?:claude|[^\s/]*\/claude)(?:\s|$)/i.test(command)) {
+                failProtocol('claude_nested_runtime_detected');
+                return;
+              }
+            }
+          }
+          if (latestPartialUsage) {
+            latestPartialUsage = {
+              ...latestPartialUsage,
+              tool_counts: { ...toolCounts },
+              mcp_counts: { ...mcpCounts }
+            };
+          }
+          emit({
+            event: CANONICAL_EVENT.agentRunner.activity,
+            session_id: state.sessionId ?? undefined,
+            turn_id: turnId,
+            detail: eventName,
+            provider_usage: latestPartialUsage ?? undefined
+          });
+          return;
+        }
+        if (type === 'user' || type === 'system') {
+          if (type === 'system') state.unknownEventCount += 1;
           emit({
             event: CANONICAL_EVENT.agentRunner.activity,
             session_id: state.sessionId ?? undefined,
@@ -506,7 +1957,8 @@ export class ClaudeCliRunner implements AgentRunner {
       child.stdout.on('data', (chunk: Buffer) => {
         pending += decoder.write(chunk);
         if (Buffer.byteLength(pending, 'utf8') > MAX_PROTOCOL_LINE_BYTES && !pending.includes('\n')) {
-          state.protocolError = 'claude_protocol_line_too_large';
+          failProtocol('claude_protocol_line_too_large');
+          pending = '';
           return;
         }
         let newline = pending.indexOf('\n');
@@ -518,7 +1970,14 @@ export class ClaudeCliRunner implements AgentRunner {
         }
       });
 
-      emit({ event: CANONICAL_EVENT.agentRunner.turnStarted, turn_id: turnId });
+      emit({
+        event: CANONICAL_EVENT.agentRunner.turnStarted,
+        session_id: expectedSessionId ?? undefined,
+        thread_id: expectedSessionId ? `claude:${expectedSessionId}` : undefined,
+        turn_id: turnId,
+        requested_model: this.options.model,
+        effective_model: state.effectiveModel
+      });
       const heartbeat = setInterval(() => {
         emit({
           event: CANONICAL_EVENT.agentRunner.activity,
@@ -528,48 +1987,162 @@ export class ClaudeCliRunner implements AgentRunner {
           process_liveness_only: true
         });
       }, HEARTBEAT_MS);
+      const observedDescendantPids = new Map<number, string>();
+      const nestedProcessMonitor = setInterval(() => {
+        const processRows = readProcessRows();
+        for (const descendant of descendantProcessRows(child?.pid, processRows)) {
+          if (!observedDescendantPids.has(descendant.pid) && observedDescendantPids.size < MAX_TELEMETRY_IDENTITIES) {
+            observedDescendantPids.set(descendant.pid, processRowIdentity(descendant));
+          }
+        }
+        const nestedPid = findNestedClaudeDescendant(child?.pid, executable, processRows);
+        if (nestedPid && !state.protocolError) {
+          failProtocol('claude_nested_runtime_detected');
+        }
+      }, NESTED_PROCESS_SCAN_MS);
 
-      let committed: 'cancelled' | 'timed_out' | null = null;
-      let forcedKillSent = false;
-      let forceKillTimer: NodeJS.Timeout | null = null;
       const terminate = (outcome: 'cancelled' | 'timed_out') => {
         if (committed) return;
-        committed = outcome;
-        killProcessGroup(child?.pid, 'SIGTERM');
-        forceKillTimer = setTimeout(() => {
-          forcedKillSent = true;
-          killProcessGroup(child?.pid, 'SIGKILL');
-        }, TERMINATION_GRACE_MS);
+        requestTermination(outcome, outcome);
       };
       const abortListener = () => terminate('cancelled');
       input.cancellationSignal?.addEventListener('abort', abortListener, { once: true });
+      if (input.cancellationSignal?.aborted) terminate('cancelled');
       const timeout = setTimeout(() => terminate('timed_out'), input.turnTimeoutMs);
 
       try {
         await writePrompt(child, input.prompt);
       } catch {
-        state.protocolError = 'claude_stdin_write_failed';
-        killProcessGroup(child.pid, 'SIGTERM');
-        forceKillTimer = setTimeout(() => {
-          forcedKillSent = true;
-          killProcessGroup(child?.pid, 'SIGKILL');
-        }, TERMINATION_GRACE_MS);
+        failProtocol('claude_stdin_write_failed');
       }
 
-      const close = await closePromise;
+      const close = await Promise.race([closePromise, closeDeadlinePromise]);
 
       clearInterval(heartbeat);
+      clearInterval(nestedProcessMonitor);
       clearTimeout(timeout);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
+      clearTerminationTimers();
       input.cancellationSignal?.removeEventListener('abort', abortListener);
       pending += decoder.end();
       if (pending.trim()) parseLine(pending.replace(/\r$/, ''));
-      await cleanupProcessGroup(child.pid);
+      const cleanupOutcome = await cleanupProcessGroup(child.pid);
+      terminationLifecycle = 'closed';
+      clearTerminationTimers();
+      if (cleanupOutcome === 'killed' || cleanupOutcome === 'survived') forcedKillSent = true;
+      if (cleanupOutcome === 'survived') {
+        failProtocol('claude_process_group_cleanup_failed');
+      }
+      const finalProcessRows = new Map(readProcessRows().map((row) => [row.pid, row]));
+      const escapedDescendants = [...observedDescendantPids.entries()]
+        .filter(([pid, identity]) => {
+          const current = finalProcessRows.get(pid);
+          return Boolean(current && processRowIdentity(current) === identity && processExists(pid));
+        })
+        .map(([pid]) => pid);
+      if (escapedDescendants.length > 0) {
+        for (const pid of escapedDescendants) {
+          try {
+            process.kill(-pid, 'SIGKILL');
+          } catch {
+            try {
+              process.kill(pid, 'SIGKILL');
+            } catch {
+              // The final liveness check below determines whether cleanup succeeded.
+            }
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        failProtocol(
+          escapedDescendants.some(processExists)
+            ? 'claude_escaped_descendant_cleanup_failed'
+            : 'claude_escaped_descendant_detected'
+        );
+      }
       const stderrDigest = stderrBytes > 0 ? stderrHash.digest('hex') : null;
+      const terminal = state.terminalResult;
+      const terminalPermissionDenials = terminal && Array.isArray(terminal.permission_denials)
+        ? terminal.permission_denials.length
+        : 0;
+      const permissionDenials = Math.max(state.permissionDenialCount, terminalPermissionDenials);
+      const usageObservedAt = this.now().toISOString();
+      const refreshedPartialUsage = partialUsageSnapshot(
+        assistantSteps,
+        state.effectiveModel,
+        observedModels,
+        state.apiRetryCount,
+        toolCounts,
+        mcpCounts,
+        usageObservedAt,
+        {
+          permissionDenialCount: permissionDenials,
+          unknownEventCount: state.unknownEventCount,
+          auxiliaryResultCount: state.auxiliaryResultCount
+        }
+      );
+      let finalUsage = terminal
+        ? usageFromResult(
+            terminal,
+            state.effectiveModel,
+            refreshedPartialUsage,
+            state.apiRetryCount,
+            toolCounts,
+            mcpCounts,
+            usageObservedAt,
+            {
+              timeToFirstTokenMs: firstAssistantAtMs === null ? null : Math.max(0, firstAssistantAtMs - startedAt.getTime()),
+              permissionDenialCount: permissionDenials,
+              unknownEventCount: state.unknownEventCount,
+              auxiliaryResultCount: state.auxiliaryResultCount
+            }
+          )
+        : refreshedPartialUsage ?? unobservedUsageSnapshot({
+            model: state.effectiveModel,
+            observedModels,
+            apiRetryCount: state.apiRetryCount,
+            permissionDenialCount: permissionDenials,
+            unknownEventCount: state.unknownEventCount,
+            auxiliaryResultCount: state.auxiliaryResultCount,
+            toolCounts,
+            mcpCounts,
+            updatedAt: usageObservedAt,
+            missingReason: state.protocolError ?? 'claude_terminal_missing'
+          });
+      if (finalUsage) {
+        finalUsage = {
+          ...finalUsage,
+          effective_models: [...new Set([...(finalUsage.effective_models ?? []), ...observedModels])]
+        };
+      }
+      if (state.protocolError === 'claude_nested_runtime_detected') {
+        finalUsage = finalUsage
+          ? {
+              ...finalUsage,
+              nested_session_detected: true,
+              supervised_session_coverage:
+                finalUsage.status === 'final' ? 'complete' : finalUsage.status === 'partial' ? 'partial' : 'missing'
+            }
+          : {
+              ...unobservedUsageSnapshot({
+              model: state.effectiveModel,
+              observedModels,
+              apiRetryCount: state.apiRetryCount,
+              permissionDenialCount: permissionDenials,
+              unknownEventCount: state.unknownEventCount,
+              auxiliaryResultCount: state.auxiliaryResultCount,
+              toolCounts,
+              mcpCounts,
+              updatedAt: usageObservedAt,
+              missingReason: 'claude_nested_runtime_detected'
+              }),
+              nested_session_detected: true
+            };
+      }
+      removeSandboxSettings(settingsDirectory);
+      settingsDirectory = null;
 
       if (committed) {
         const event = committed === 'timed_out' ? CANONICAL_EVENT.agentRunner.turnTimedOut : CANONICAL_EVENT.agentRunner.turnCancelled;
-        emit({ event, session_id: state.sessionId ?? undefined, turn_id: turnId });
+        emit({ event, session_id: state.sessionId ?? undefined, turn_id: turnId, provider_usage: finalUsage ?? undefined });
         return {
           runtime: this.runtime,
           status: committed,
@@ -577,36 +2150,56 @@ export class ClaudeCliRunner implements AgentRunner {
           thread_id: state.sessionId ? `claude:${state.sessionId}` : null,
           turn_id: turnId,
           last_event: event,
-          error_code: committed === 'timed_out' ? REASON_CODES.turnTimeout : REASON_CODES.workerCancelRequested,
-          error_detail: stderrDigest ? `stderr_bytes=${stderrBytes};stderr_sha256=${stderrDigest}` : undefined,
-          cancellation_outcome: committed === 'cancelled' ? (forcedKillSent ? 'forced_kill_exited' : 'graceful_exit') : undefined,
+          error_code: state.protocolError ?? (committed === 'timed_out' ? REASON_CODES.turnTimeout : REASON_CODES.workerCancelRequested),
+          error_detail: [
+            state.protocolError ? `containment_failure=${state.protocolError}` : null,
+            stderrDigest ? `stderr_bytes=${stderrBytes};stderr_sha256=${stderrDigest}` : null
+          ].filter(Boolean).join(';') || undefined,
+          cancellation_outcome: committed === 'cancelled'
+            ? state.protocolError === 'claude_process_group_cleanup_failed' || state.protocolError === 'claude_escaped_descendant_cleanup_failed'
+              ? 'forced_kill_requested'
+              : forcedKillSent ? 'forced_kill_exited' : 'graceful_exit'
+            : undefined,
+          provider_usage: finalUsage ?? undefined,
           retryable: committed === 'timed_out'
         };
       }
 
-      const terminal = state.terminalResult;
       const terminalSubtype = terminal ? readString(terminal, 'subtype') : null;
-      const isError = terminal?.is_error === true;
+      const apiErrorStatus = terminal ? boundedFailureSignal(terminal.api_error_status) : null;
+      const terminalReason = terminal ? boundedFailureSignal(terminal.terminal_reason ?? terminal.stop_reason) : null;
+      const terminalFailure = terminalSubtype !== 'success'
+        ? `claude_terminal_${terminalSubtype ?? 'unknown'}${apiErrorStatus ? `:api_status=${apiErrorStatus}` : ''}${terminalReason ? `:reason=${terminalReason}` : ''}`
+        : null;
+      const isError = terminal?.is_error !== false;
       const terminalSession = terminal ? readString(terminal, 'session_id') : null;
-      const permissionDenials = terminal && Array.isArray(terminal.permission_denials) ? terminal.permission_denials.length : 0;
+      const processCrash = close.spawnError || close.code !== 0
+        ? `claude_process_exit:${close.code ?? close.signal ?? 'unknown'}`
+        : null;
       const failure =
         close.spawnError ||
+        eventDeliveryError ||
         state.protocolError ||
         (state.terminalResultCount !== 1 ? `claude_terminal_result_count:${state.terminalResultCount}` : null) ||
+        (state.initCount !== 1 ? `claude_init_count:${state.initCount}` : null) ||
         (!state.capabilityFingerprint ? 'claude_init_missing' : null) ||
         (!state.sessionId ? 'claude_session_id_missing' : null) ||
-        (terminalSession && terminalSession !== state.sessionId ? 'claude_terminal_session_mismatch' : null) ||
-        (terminalSubtype !== 'success' ? `claude_terminal_${terminalSubtype ?? 'unknown'}` : null) ||
+        (!state.initSessionId ? 'claude_init_session_missing' : null) ||
+        (state.initSessionId !== state.sessionId ? 'claude_init_session_mismatch' : null) ||
+        (!terminalSession ? 'claude_terminal_session_missing' : null) ||
+        (terminalSession !== state.sessionId ? 'claude_terminal_session_mismatch' : null) ||
+        terminalFailure ||
         (isError ? 'claude_terminal_is_error' : null) ||
-        (permissionDenials > 0 ? 'claude_permission_denied_under_bypass' : null) ||
-        (close.code !== 0 ? `claude_process_exit:${close.code ?? close.signal ?? 'unknown'}` : null);
+        (permissionDenials > 0 ? 'claude_permission_denied_under_sandbox' : null) ||
+        processCrash;
 
       if (failure || !terminal) {
         emit({
           event: CANONICAL_EVENT.agentRunner.turnFailed,
           session_id: state.sessionId ?? undefined,
           turn_id: turnId,
-          detail: failure ?? 'claude_terminal_missing'
+          detail: failure ?? 'claude_terminal_missing',
+          provider_usage: finalUsage ?? undefined
         });
         return {
           runtime: this.runtime,
@@ -619,45 +2212,50 @@ export class ClaudeCliRunner implements AgentRunner {
           error_detail: stderrDigest ? `stderr_bytes=${stderrBytes};stderr_sha256=${stderrDigest}` : undefined,
           requested_model: this.options.model,
           effective_model: state.effectiveModel,
-          retryable: isRetryableClaudeFailure(failure ?? 'claude_terminal_missing')
+          provider_usage: finalUsage ?? undefined,
+          retryable: Boolean(processCrash) && !state.protocolError
+            ? true
+            : isRetryableClaudeFailure(failure ?? 'claude_terminal_missing')
         };
       }
 
       const sessionId = state.sessionId!;
       const fingerprint = state.capabilityFingerprint;
-      if (expectedSessionId && fingerprint) {
-        const previous = this.capabilityFingerprintBySession.get(expectedSessionId);
-        if (previous && previous !== fingerprint) {
-          return {
-            runtime: this.runtime,
-            status: 'failed',
-            session_id: sessionId,
-            thread_id: `claude:${sessionId}`,
-            turn_id: turnId,
-            last_event: CANONICAL_EVENT.agentRunner.turnFailed,
-            error_code: 'claude_capability_fingerprint_drift',
-            retryable: false
-          };
-        }
-      }
-      if (fingerprint) this.capabilityFingerprintBySession.set(sessionId, fingerprint);
-      this.bindingBySession.set(sessionId, binding);
+      this.retainSessionBinding(sessionId, binding, fingerprint);
 
-      const providerUsage = usageFromResult(terminal, state.effectiveModel);
-      for (const observedModel of effectiveModelsFromResult(terminal, state.effectiveModel)) {
-        if (observedModel === state.effectiveModel) continue;
+      const providerUsage = finalUsage!;
+      const reconciliation = providerUsage.reconciliation_delta;
+      if (reconciliation && Object.values(reconciliation).some((value) => value !== 0)) {
         emit({
           event: CANONICAL_EVENT.agentRunner.activity,
           session_id: sessionId,
           thread_id: `claude:${sessionId}`,
           turn_id: turnId,
-          detail: 'claude_model_observed',
+          detail: 'claude_usage_reconciliation_mismatch',
+          provider_usage: providerUsage
+        });
+      }
+      for (const observedModel of effectiveModelsFromResult(terminal, state.effectiveModel)) {
+        if (observedModel === this.options.model) continue;
+        if (emittedReroutes.has(observedModel)) continue;
+        emit({
+          event: CANONICAL_EVENT.agentRunner.activity,
+          session_id: sessionId,
+          thread_id: `claude:${sessionId}`,
+          turn_id: turnId,
+          detail: REASON_CODES.claudeModelObserved,
           requested_model: this.options.model,
-          effective_model: observedModel
+          effective_model: observedModel,
+          model_reroute: {
+            requested_model: this.options.model,
+            effective_model: observedModel,
+            reason_code: REASON_CODES.claudeModelObserved,
+            source: 'claude_stream_result'
+          }
         });
       }
       const resultText = readString(terminal, 'result');
-      emit({
+      const completionDelivered = emit({
         event: CANONICAL_EVENT.agentRunner.turnCompleted,
         session_id: sessionId,
         thread_id: `claude:${sessionId}`,
@@ -667,6 +2265,21 @@ export class ClaudeCliRunner implements AgentRunner {
         requested_model: this.options.model,
         effective_model: state.effectiveModel
       });
+      if (!completionDelivered || eventDeliveryError) {
+        return {
+          runtime: this.runtime,
+          status: 'failed',
+          session_id: sessionId,
+          thread_id: `claude:${sessionId}`,
+          turn_id: turnId,
+          last_event: CANONICAL_EVENT.agentRunner.turnFailed,
+          error_code: eventDeliveryError ?? 'claude_event_delivery_failed',
+          provider_usage: providerUsage,
+          requested_model: this.options.model,
+          effective_model: state.effectiveModel,
+          retryable: false
+        };
+      }
       return {
         runtime: this.runtime,
         status: 'completed',
@@ -681,8 +2294,10 @@ export class ClaudeCliRunner implements AgentRunner {
         retryable: false
       };
     } catch (error) {
-      if (child?.pid) killProcessGroup(child.pid, 'SIGKILL');
+      const emergencyCleanup = child?.pid ? await cleanupProcessGroup(child.pid) : 'none';
+      removeSandboxSettings(settingsDirectory);
       const detail = error instanceof Error ? error.message : String(error);
+      const errorCode = emergencyCleanup === 'survived' ? 'claude_process_group_cleanup_failed' : detail;
       emit({ event: CANONICAL_EVENT.agentRunner.turnFailed, turn_id: turnId, detail });
       return {
         runtime: this.runtime,
@@ -691,8 +2306,8 @@ export class ClaudeCliRunner implements AgentRunner {
         thread_id: expectedSessionId ? `claude:${expectedSessionId}` : null,
         turn_id: turnId,
         last_event: CANONICAL_EVENT.agentRunner.turnFailed,
-        error_code: detail,
-        error_detail: `started_at=${startedAt.toISOString()}`,
+        error_code: errorCode,
+        error_detail: `started_at=${startedAt.toISOString()};emergency_cleanup=${emergencyCleanup};cause=${detail}`,
         requested_model: this.options.model,
         effective_model: null,
         retryable: false

@@ -30,6 +30,7 @@ interface RootCauseDiagnostic {
 }
 
 export interface RunCompletionCoordinatorHooks {
+  drainExecutionGraphPersistence: (runningEntry: RunningEntry) => Promise<void>;
   recordHistoryWriteFailure: (operation: string, reasonCode: string, error: unknown) => Promise<void>;
   persistExecutionGraphStateTransition: (
     runningEntry: RunningEntry,
@@ -102,6 +103,7 @@ export async function terminateRunningIssue(
     worker_handle: runningEntry.worker_handle,
     worker_instance_id: runningEntry.worker_instance_id ?? null,
     codex_app_server_pid: runningEntry.codex_app_server_pid ?? null,
+    worker_process_pid: runningEntry.worker_process_pid ?? null,
     thread_id: runningEntry.thread_id ?? null,
     turn_id: runningEntry.turn_id ?? null,
     session_id: runningEntry.session_id ?? null
@@ -119,7 +121,8 @@ export async function terminateRunningIssue(
       reason,
       termination_state: 'requested',
       worker_instance_id: runningEntry.worker_instance_id ?? null,
-      worker_process_identity_known: Boolean(runningEntry.codex_app_server_pid),
+      worker_process_identity_known: Boolean(runningEntry.worker_process_pid ?? runningEntry.codex_app_server_pid),
+      worker_process_pid: runningEntry.worker_process_pid ?? null,
       codex_app_server_pid: runningEntry.codex_app_server_pid,
       thread_id: runningEntry.thread_id,
       turn_id: runningEntry.turn_id
@@ -158,7 +161,8 @@ export async function terminateRunningIssue(
         termination_state: 'failed',
         error: failureDetail,
         worker_instance_id: runningEntry.worker_instance_id ?? null,
-        worker_process_identity_known: Boolean(runningEntry.codex_app_server_pid),
+        worker_process_identity_known: Boolean(runningEntry.worker_process_pid ?? runningEntry.codex_app_server_pid),
+        worker_process_pid: runningEntry.worker_process_pid ?? null,
         codex_app_server_pid: runningEntry.codex_app_server_pid,
         thread_id: runningEntry.thread_id,
         turn_id: runningEntry.turn_id
@@ -220,7 +224,8 @@ export async function terminateRunningIssue(
       termination_exit_observed: Boolean(runningEntry.termination.exit_observed_at_ms),
       ...workerTerminationResultContext(terminationResult),
       worker_termination_requested: true,
-      worker_process_identity_known: Boolean(runningEntry.codex_app_server_pid),
+      worker_process_identity_known: Boolean(runningEntry.worker_process_pid ?? runningEntry.codex_app_server_pid),
+      worker_process_pid: runningEntry.worker_process_pid ?? null,
       codex_app_server_pid: runningEntry.codex_app_server_pid,
       same_issue_process_cleanup_verified: false
     }
@@ -245,7 +250,19 @@ export async function completeRunRecord(
     return;
   }
 
+  runningEntry.history_terminalizing = true;
+  await context.hooks.drainExecutionGraphPersistence(runningEntry);
   const rootCause = extractRootCauseDiagnostic(runningEntry, error_code);
+  if (!context.persistence.completeRunIncludesTerminalEvidence) {
+    await persistTicketTerminalOutcome(
+      context,
+      runningEntry,
+      terminal_status,
+      error_code,
+      terminalReasonDetail,
+      rootCause
+    );
+  }
   try {
     await context.persistence.completeRun({
       run_id: runningEntry.run_id,
@@ -278,7 +295,6 @@ export async function completeRunRecord(
     });
   }
 
-  await persistTicketTerminalOutcome(context, runningEntry, terminal_status, error_code, terminalReasonDetail, rootCause);
 }
 
 export async function persistTicketTerminalOutcome(

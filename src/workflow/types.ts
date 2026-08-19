@@ -31,6 +31,8 @@ export type ValidationErrorCode =
   | 'invalid_agent_runtime'
   | 'invalid_claude_command'
   | 'invalid_claude_model'
+  | 'invalid_claude_network_allowed_domains'
+  | 'invalid_claude_allowed_mcp_servers'
   | 'invalid_agent_max_retry_backoff_ms'
   | 'invalid_agent_respawn_window_minutes'
   | 'invalid_agent_respawn_max_attempts_without_progress'
@@ -118,6 +120,8 @@ export interface AgentRuntimeConfig {
   claude_command: string;
   claude_model: string | null;
   claude_allow_non_subscription_auth: boolean;
+  claude_network_allowed_domains: string[];
+  claude_allowed_mcp_servers: string[];
   claude_supported_version: '2.1.224';
 }
 

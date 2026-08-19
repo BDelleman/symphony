@@ -157,7 +157,11 @@ function resolveClaudeModel(env: NodeJS.ProcessEnv, runtime: 'codex' | 'claude-c
   }
   if (
     value &&
-    (Buffer.byteLength(value, 'utf8') > 256 || !/^claude-[a-z0-9][a-z0-9.-]*\d[a-z0-9.-]*$/i.test(value))
+    (
+      Buffer.byteLength(value, 'utf8') > 256 ||
+      !/^claude-[a-z0-9][a-z0-9.-]*\d[a-z0-9.-]*$/i.test(value) ||
+      /(?:^|[.-])latest(?:$|[.-])/i.test(value)
+    )
   ) {
     throw new WorkflowConfigError(
       'invalid_claude_model',
@@ -165,6 +169,37 @@ function resolveClaudeModel(env: NodeJS.ProcessEnv, runtime: 'codex' | 'claude-c
     );
   }
   return value;
+}
+
+const DEFAULT_CLAUDE_NETWORK_ALLOWED_DOMAINS = [
+  'api.github.com',
+  'codeload.github.com',
+  'github.com',
+  'mcp.linear.app',
+  'objects.githubusercontent.com',
+  'raw.githubusercontent.com',
+  'registry.npmjs.org',
+  'uploads.github.com'
+] as const;
+
+function resolveClaudeList(
+  value: string | undefined,
+  fallback: readonly string[],
+  kind: 'domain' | 'mcp'
+): string[] {
+  const entries = value === undefined ? [...fallback] : value.split(',').map((entry) => entry.trim()).filter(Boolean);
+  const pattern = kind === 'domain'
+    ? /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)$/i
+    : /^[a-z0-9][a-z0-9._-]{0,127}$/i;
+  if (entries.length === 0 || entries.some((entry) => !pattern.test(entry) || entry.includes('*'))) {
+    throw new WorkflowConfigError(
+      kind === 'domain' ? 'invalid_claude_network_allowed_domains' : 'invalid_claude_allowed_mcp_servers',
+      kind === 'domain'
+        ? 'SYMPHONY_CLAUDE_NETWORK_ALLOWED_DOMAINS must contain comma-separated exact non-loopback hostnames without wildcards'
+        : 'SYMPHONY_CLAUDE_ALLOWED_MCP_SERVERS must contain comma-separated MCP server names'
+    );
+  }
+  return [...new Set(entries.map((entry) => entry.toLowerCase()))].sort();
 }
 
 function readBoolean(value: unknown, fallback: boolean): boolean {
@@ -658,6 +693,17 @@ export class ConfigResolver {
         claude_allow_non_subscription_auth: readTruthyEnvironmentFlag(
           this.env.SYMPHONY_CLAUDE_ALLOW_NON_SUBSCRIPTION_AUTH
         ),
+        claude_network_allowed_domains: resolveClaudeList(
+          this.env.SYMPHONY_CLAUDE_NETWORK_ALLOWED_DOMAINS,
+          DEFAULT_CLAUDE_NETWORK_ALLOWED_DOMAINS,
+          'domain'
+        ),
+        claude_allowed_mcp_servers: [
+          ...new Set([
+            'linear-server',
+            ...resolveClaudeList(this.env.SYMPHONY_CLAUDE_ALLOWED_MCP_SERVERS, ['linear-server'], 'mcp')
+          ])
+        ].sort(),
         claude_supported_version: '2.1.224'
       },
       budget: {

@@ -80,7 +80,7 @@ export interface CodexModelRerouteEvidence {
   requested_model: string | null;
   effective_model: string;
   reason_code: string;
-  source: 'app_server_protocol';
+  source: 'app_server_protocol' | 'claude_assistant_step' | 'claude_stream_result';
 }
 
 export interface CodexInputRequestOption {

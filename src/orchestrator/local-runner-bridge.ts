@@ -393,6 +393,7 @@ export class LocalRunnerBridge {
         attempt: attempt ?? 0
       }
     });
+    let workerProcessPid: number | null = null;
     const result = await runLocalWorkerAttempt({
       issue,
       attempt,
@@ -407,6 +408,9 @@ export class LocalRunnerBridge {
       issueStateFetcher: this.issueStateFetcher,
       cancellationSignal,
       onAgentEvent: (event) => {
+        if (event.worker_process_pid !== undefined && event.worker_process_pid !== null) {
+          workerProcessPid = event.worker_process_pid;
+        }
         this.onWorkerEvent?.({ issue_id: issue.id, event: { ...event, worker_instance_id: workerInstanceId } });
       }
     });
@@ -446,6 +450,7 @@ export class LocalRunnerBridge {
       completion_reason: result.completion_reason,
       refreshed_state: result.refreshed_state,
       session_id: result.session_id,
+      worker_process_pid: workerProcessPid,
       retryable: result.retryable
     });
   }
@@ -477,6 +482,7 @@ export class LocalRunnerBridge {
         previous_turn_id: params.previous_turn_id
       }
     });
+    let workerProcessPid: number | null = null;
     const result = await runLocalWorkerRecoveryAttempt({
       issue: params.issue,
       attempt: params.attempt,
@@ -493,6 +499,9 @@ export class LocalRunnerBridge {
       recoveryPrompt: params.recovery_prompt,
       cancellationSignal,
       onCodexEvent: (event) => {
+        if (event.codex_app_server_pid !== null) {
+          workerProcessPid = event.codex_app_server_pid;
+        }
         this.onWorkerEvent?.({
           issue_id: params.issue.id,
           event: {
@@ -512,7 +521,8 @@ export class LocalRunnerBridge {
       worker_instance_id: workerInstanceId,
       completion_reason: result.completion_reason,
       refreshed_state: result.refreshed_state,
-      session_id: result.session_id
+      session_id: result.session_id,
+      worker_process_pid: workerProcessPid
     });
   }
 

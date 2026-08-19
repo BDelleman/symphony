@@ -185,6 +185,8 @@ export const CANONICAL_EVENT = {
     recordSessionFailed: 'persistence.session.record_failed',
     recordEventFailed: 'persistence.event.record_failed',
     startRunFailed: 'persistence.run.start_failed',
-    completeRunFailed: 'persistence.run.complete_failed'
+    completeRunFailed: 'persistence.run.complete_failed',
+    startupReconciled: 'persistence.startup.reconciled',
+    startupReconciliationAmbiguous: 'persistence.startup.reconciliation_ambiguous'
   }
 } as const;

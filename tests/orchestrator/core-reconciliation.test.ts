@@ -2161,6 +2161,100 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     ).toBe(false);
   });
 
+  it('accepts provider-neutral continuation turns and quarantines only stale prior-process activity', async () => {
+    const harness = createHarness();
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-claude-continuation', identifier: 'ABC-CLAUDE-CONTINUE' })
+    ]);
+    await harness.orchestrator.tick('interval');
+
+    harness.orchestrator.onWorkerEvent('i-claude-continuation', {
+      timestamp_ms: harness.now.value,
+      event: CANONICAL_EVENT.agentRunner.turnStarted,
+      agent_runtime: 'claude-cli',
+      worker_process_pid: 4001,
+      thread_id: 'claude:session-current',
+      turn_id: 'claude-turn-1',
+      session_id: 'session-current',
+      requested_model: 'claude-sonnet-4-6'
+    });
+    harness.orchestrator.onWorkerEvent('i-claude-continuation', {
+      timestamp_ms: harness.now.value + 100,
+      event: CANONICAL_EVENT.agentRunner.turnCompleted,
+      agent_runtime: 'claude-cli',
+      worker_process_pid: 4001,
+      thread_id: 'claude:session-current',
+      turn_id: 'claude-turn-1',
+      session_id: 'session-current',
+      provider_usage: {
+        runtime: 'claude-cli',
+        model: 'claude-sonnet-4-6',
+        effective_models: ['claude-sonnet-4-6'],
+        input_tokens: 10,
+        output_tokens: 4,
+        cache_read_tokens: 2,
+        cache_creation_tokens: 1,
+        provider_turn_count: 1,
+        estimated_cost_usd: 0.01,
+        source: 'claude_stream_result',
+        status: 'final',
+        confidence: 'provider_result'
+      }
+    });
+    harness.orchestrator.onWorkerEvent('i-claude-continuation', {
+      timestamp_ms: harness.now.value + 200,
+      event: CANONICAL_EVENT.agentRunner.turnStarted,
+      agent_runtime: 'claude-cli',
+      worker_process_pid: 4002,
+      thread_id: 'claude:session-current',
+      turn_id: 'claude-turn-2',
+      session_id: 'session-current',
+      requested_model: 'claude-sonnet-4-6'
+    });
+
+    const running = harness.orchestrator.getStateSnapshot().running.get('i-claude-continuation');
+    expect(running).toMatchObject({
+      last_event: CANONICAL_EVENT.agentRunner.turnStarted,
+      agent_runtime: 'claude-cli',
+      worker_process_pid: '4002',
+      turn_id: 'claude-turn-2',
+      session_id: 'session-current',
+      turn_count: 2,
+      provider_usage: {
+        status: 'awaiting',
+        input_tokens: null,
+        output_tokens: null,
+        estimated_cost_usd: null
+      },
+      quarantined_event_count: 0
+    });
+
+    harness.orchestrator.onWorkerEvent('i-claude-continuation', {
+      timestamp_ms: harness.now.value + 300,
+      event: CANONICAL_EVENT.agentRunner.activity,
+      agent_runtime: 'claude-cli',
+      worker_process_pid: 4001,
+      thread_id: 'claude:session-current',
+      turn_id: 'claude-turn-1',
+      session_id: 'session-current',
+      detail: 'late prior invocation event'
+    });
+    expect(harness.orchestrator.getStateSnapshot().running.get('i-claude-continuation')).toMatchObject({
+      worker_process_pid: '4002',
+      turn_id: 'claude-turn-2',
+      quarantined_event_count: 1,
+      quarantined_events: [
+        expect.objectContaining({
+          worker_process_pid: '4001',
+          active_worker_process_pid: '4002',
+          turn_id: 'claude-turn-1',
+          active_turn_id: 'claude-turn-2',
+          reason: 'worker_identity_mismatch'
+        })
+      ]
+    });
+  });
+
   it('ignores stale turn started events from an old turn after a newer turn completed', async () => {
     const harness = createHarness();
     harness.tracker.fetch_candidate_issues.mockResolvedValue([
