@@ -233,6 +233,8 @@ Notes:
   - `SYMPHONY_CODEX_REASONING` (override reasoning effort)
   - `SYMPHONY_CODEX_FLAGS` (append extra Codex CLI flags as a JSON string array, for example `["--config","shell_environment_policy.inherit=all"]`)
 - `.env` is loaded automatically for startup scripts (or `SYMPHONY_ENV_FILE` for a custom file path).
+- Startup settings are read from the project `.env` when the process boots, so
+  `.env` changes take effect only after restarting Symphony.
 - An opt-in local Claude CLI runtime can be selected entirely from the project `.env`:
 
   ```dotenv
