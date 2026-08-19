@@ -14,7 +14,7 @@
  *    "unavailable" fallback — never silent green.
  */
 
-import { listActionRequiredReasonCodes } from '../observability/reason-codes';
+import { listActionRequiredReasonCodes, REASON_CODES } from '../observability/reason-codes';
 import type {
   ApiAvailableOperatorAction,
   ApiStateResponse,
@@ -236,7 +236,7 @@ function buildGravityRow(active: AnyActiveEntry, now: number, missing: MissingCa
     reasons.push({ code: 'blocked', label: 'Blocked awaiting operator', weight: 0.6, evidence_ref: active.entry.stop_reason_code });
     score += 0.6;
     if (active.entry.requires_manual_resume) {
-      reasons.push({ code: 'manual_resume', label: 'Requires manual resume', weight: 0.05, evidence_ref: null });
+      reasons.push({ code: REASON_CODES.manualResume, label: 'Requires manual resume', weight: 0.05, evidence_ref: null });
       score += 0.05;
     }
     if (active.entry.breaker_active) {

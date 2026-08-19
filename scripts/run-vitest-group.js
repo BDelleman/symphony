@@ -118,6 +118,7 @@ function run(argv = process.argv.slice(2), options = {}) {
   const result = spawnSync(vitestBin, vitestArgs, {
     cwd,
     env: process.env,
+    shell: process.platform === 'win32',
     stdio: 'inherit'
   });
 

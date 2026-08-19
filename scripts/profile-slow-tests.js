@@ -265,7 +265,12 @@ function runVitest(args) {
   const vitestBin = resolveLocalVitestBin(process.cwd());
   const vitestArgs = ['run', '--reporter=json', `--outputFile=${outputFile}`, ...args.vitestArgs];
   const startedAt = process.hrtime.bigint();
-  const result = spawnSync(vitestBin, vitestArgs, { cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const result = spawnSync(vitestBin, vitestArgs, {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
   const endedAt = process.hrtime.bigint();
   const wallClockMs = Number(endedAt - startedAt) / 1_000_000;
 

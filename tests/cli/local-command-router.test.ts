@@ -889,6 +889,10 @@ describe('local symphony command router', () => {
       { encoding: 'utf8', mode: 0o755 }
     );
     await writeFakeCodexAppServer(binDir, ['commit', 'pull', 'push', 'land']);
+    await writeExecutable(path.join(binDir, 'gh'));
+    await writeExecutable(path.join(binDir, 'uv'));
+    await writeExecutable(path.join(binDir, 'python'));
+    await writeExecutable(path.join(binDir, 'python3'));
     const stateHome = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-init-clone-state-')));
     const cliEnv = {
       ...process.env,
@@ -917,7 +921,7 @@ describe('local symphony command router', () => {
       checks?: Array<{ id: string; status: string; reason: string; details?: Record<string, unknown> }>;
     };
     const findings = payload.findings ?? payload.checks ?? [];
-    expect(doctor.status).toBe(0);
+    expect(doctor.status, `${doctor.stdout}\n${doctor.stderr}`).toBe(0);
     expect(payload.status).toBe('ok');
     expect(findings.find((finding) => finding.id === 'workflow.effective_config')).toMatchObject({
       status: 'ok',

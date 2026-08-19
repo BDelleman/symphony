@@ -144,6 +144,7 @@ function runProfile(commandName, cwd) {
   const result = spawnSync(vitestBin, vitestArgs, {
     cwd,
     encoding: 'utf8',
+    shell: process.platform === 'win32',
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env
   });
