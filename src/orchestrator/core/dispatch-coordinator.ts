@@ -586,7 +586,8 @@ export async function coordinateDispatchIssue(
       } else {
         runningEntry.run_id = await context.persistence.startRun({
           issue_id: issue.id,
-          issue_identifier: issue.identifier
+          issue_identifier: issue.identifier,
+          issue_run_id: graphContext.issue_run_id ?? null
         });
         runningEntry.issue_run_id =
           graphContext.issue_run_id ??

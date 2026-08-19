@@ -96,7 +96,13 @@ export class RunHistoryStore {
     this.executionGraphWriter = dependencies.executionGraphWriter;
   }
 
-  startRun(params: { issue_id: string; issue_identifier: string; identity: DurableIdentity; started_at?: string }): string {
+  startRun(params: {
+    issue_id: string;
+    issue_identifier: string;
+    identity: DurableIdentity;
+    started_at?: string;
+    issue_run_id?: string | null;
+  }): string {
     const runId = randomUUID();
     this.identityProjection.upsertHistoryIdentity(params.identity);
     this.db
@@ -108,7 +114,7 @@ export class RunHistoryStore {
       source_table: 'runs',
       source_id: runId,
       run_id: runId,
-      issue_run_id: null,
+      issue_run_id: params.issue_run_id ?? null,
       issue_id: params.issue_id,
       issue_identifier: params.issue_identifier,
       projection_status: 'projected',

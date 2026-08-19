@@ -243,6 +243,68 @@ describe('SqlitePersistenceStore execution graph', () => {
     });
   });
 
+  it('repairs a pre-init failure from its terminal runner event', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-execution-graph-terminal-event-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'runtime.sqlite');
+    const durableIdentity = identity({ issue_id: 'i-terminal-event', issue_identifier: 'ABC-TERMINAL-EVENT' });
+    const store = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(store);
+    const started = store.recordRunStarted({
+      issue_id: 'i-terminal-event',
+      issue_identifier: 'ABC-TERMINAL-EVENT',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    store.recordEvent({
+      run_id: started.run_id,
+      event: 'agent_runner.turn.failed',
+      message: 'provider failed before init',
+      timestamp_ms: Date.parse('2026-04-11T10:05:00.000Z')
+    });
+
+    expect(store.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 1, ambiguous: 0 });
+    expect(store.reconstructTicketTimeline(durableIdentity).issue_runs[0]).toMatchObject({
+      ended_at: '2026-04-11T10:05:00.000Z',
+      status: 'failed',
+      reason_code: 'recovered_after_restart'
+    });
+  });
+
+  it('does not use an earlier terminal event when the latest run has no terminal evidence', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-execution-graph-stale-terminal-event-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'runtime.sqlite');
+    const durableIdentity = identity({ issue_id: 'i-stale-event', issue_identifier: 'ABC-STALE-EVENT' });
+    const store = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(store);
+    const started = store.recordRunStarted({
+      issue_id: 'i-stale-event',
+      issue_identifier: 'ABC-STALE-EVENT',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    store.recordEvent({
+      run_id: started.run_id,
+      event: 'agent_runner.turn.failed',
+      message: 'first attempt failed',
+      timestamp_ms: Date.parse('2026-04-11T10:05:00.000Z')
+    });
+    store.startRun({
+      issue_id: 'i-stale-event',
+      issue_identifier: 'ABC-STALE-EVENT',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:10:00.000Z',
+      issue_run_id: started.issue_run_id
+    });
+
+    expect(store.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 0, ambiguous: 1 });
+  });
+
   it('repairs an inactive issue run superseded by a later terminal run for the same issue', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-execution-graph-superseded-'));
     dirs.push(dir);

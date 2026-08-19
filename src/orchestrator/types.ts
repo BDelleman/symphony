@@ -925,7 +925,7 @@ export interface PhaseMarkerSettings {
 }
 
 export interface OrchestratorPersistencePort {
-  startRun: (params: { issue_id: string; issue_identifier: string }) => Promise<string>;
+  startRun: (params: { issue_id: string; issue_identifier: string; issue_run_id?: string | null }) => Promise<string>;
   recordRunStarted?: (params: {
     issue_id: string;
     issue_identifier: string;

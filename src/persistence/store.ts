@@ -1,6 +1,7 @@
 import { REASON_CODES } from '../observability/reason-codes';
 import { redactUnknown } from '../security/redaction';
 import { AppServerLedgerStore } from './app-server-ledger-store';
+import { findLatestTerminalRunEventEvidence } from './execution-graph-reconciliation';
 import {
   ExecutionGraphWriter,
   type AppendDrainAuditHistoryParams,
@@ -190,10 +191,15 @@ export class SqlitePersistenceStore {
         `SELECT issue_run.issue_run_id, issue_run.issue_id, issue_run.started_at,
           runs.completed_at, runs.terminal_status, runs.terminal_reason_code, runs.terminal_reason_detail
          FROM issue_run
-         LEFT JOIN history_identity_projection
-           ON history_identity_projection.source_table = 'runs'
-          AND history_identity_projection.issue_run_id = issue_run.issue_run_id
-         LEFT JOIN runs ON runs.run_id = history_identity_projection.source_id
+         LEFT JOIN runs ON runs.run_id = (
+           SELECT projected_run.run_id
+           FROM history_identity_projection
+           JOIN runs AS projected_run ON projected_run.run_id = history_identity_projection.source_id
+           WHERE history_identity_projection.source_table = 'runs'
+             AND history_identity_projection.issue_run_id = issue_run.issue_run_id
+           ORDER BY projected_run.started_at DESC, projected_run.run_id DESC
+           LIMIT 1
+         )
          WHERE issue_run.ended_at IS NULL
          ORDER BY issue_run.started_at ASC`
       )
@@ -212,6 +218,14 @@ export class SqlitePersistenceStore {
       let recoveryAt = row.completed_at;
       let recoveryStatus = row.terminal_status;
       let recoveryDetail = 'Closed from the provably terminal parent run during startup reconciliation.';
+      if (!recoveryAt || !recoveryStatus) {
+        const terminalEvent = findLatestTerminalRunEventEvidence(this.db, row.issue_run_id, row.issue_id, row.started_at);
+        if (terminalEvent) {
+          recoveryAt = terminalEvent.at;
+          recoveryStatus = terminalEvent.status;
+          recoveryDetail = `Closed from terminal runner event ${terminalEvent.event} on run ${terminalEvent.run_id}.`;
+        }
+      }
       if (!recoveryAt || !recoveryStatus) {
         const supersedingRun = this.db
           .prepare(
@@ -373,7 +387,13 @@ export class SqlitePersistenceStore {
       .all(limit) as HistoryWriteFailureRecord[];
   }
 
-  startRun(params: { issue_id: string; issue_identifier: string; identity: DurableIdentity; started_at?: string }): string {
+  startRun(params: {
+    issue_id: string;
+    issue_identifier: string;
+    identity: DurableIdentity;
+    started_at?: string;
+    issue_run_id?: string | null;
+  }): string {
     return this.runHistoryStore.startRun(params);
   }
 

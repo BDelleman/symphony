@@ -51,7 +51,7 @@ import {
   resolveTrustedExecutable
 } from '../agent';
 import { auditSensitiveWorkspaceFiles, type SensitiveWorkspaceFileViolation } from '../workspace';
-import { SqlitePersistenceStore } from '../persistence';
+import { findLatestTerminalRunEventEvidence, SqlitePersistenceStore } from '../persistence';
 import { REASON_CODES } from '../observability';
 
 const CLAUDE_NON_SUBSCRIPTION_ENV_NAMES = [
@@ -2042,10 +2042,15 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
       `SELECT issue_run.issue_run_id, issue_run.issue_id, issue_run.started_at,
         runs.completed_at, runs.terminal_status
        FROM issue_run
-       LEFT JOIN history_identity_projection
-         ON history_identity_projection.source_table = 'runs'
-        AND history_identity_projection.issue_run_id = issue_run.issue_run_id
-       LEFT JOIN runs ON runs.run_id = history_identity_projection.source_id
+       LEFT JOIN runs ON runs.run_id = (
+         SELECT projected_run.run_id
+         FROM history_identity_projection
+         JOIN runs AS projected_run ON projected_run.run_id = history_identity_projection.source_id
+         WHERE history_identity_projection.source_table = 'runs'
+           AND history_identity_projection.issue_run_id = issue_run.issue_run_id
+         ORDER BY projected_run.started_at DESC, projected_run.run_id DESC
+         LIMIT 1
+       )
        WHERE issue_run.ended_at IS NULL`
     ).all() as Array<{
       issue_run_id: string;
@@ -2067,20 +2072,23 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
     let ambiguous = 0;
     for (const row of rows) {
       if (!row.completed_at || !row.terminal_status) {
-        const supersedingRun = db!.prepare(
-          `SELECT issue_run_id
-           FROM issue_run
-           WHERE issue_id = ?
-             AND issue_run_id <> ?
-             AND started_at > ?
-             AND ended_at IS NOT NULL
-             AND status <> 'running'
-           ORDER BY started_at ASC
-           LIMIT 1`
-        ).get(row.issue_id, row.issue_run_id, row.started_at);
-        if (!supersedingRun) {
-          ambiguous += 1;
-          continue;
+        const terminalEvent = findLatestTerminalRunEventEvidence(db!, row.issue_run_id, row.issue_id, row.started_at);
+        if (!terminalEvent) {
+          const supersedingRun = db!.prepare(
+            `SELECT issue_run_id
+             FROM issue_run
+             WHERE issue_id = ?
+               AND issue_run_id <> ?
+               AND started_at > ?
+               AND ended_at IS NOT NULL
+               AND status <> 'running'
+             ORDER BY started_at ASC
+             LIMIT 1`
+          ).get(row.issue_id, row.issue_run_id, row.started_at);
+          if (!supersedingRun) {
+            ambiguous += 1;
+            continue;
+          }
         }
       }
       const owners = db!.prepare(
