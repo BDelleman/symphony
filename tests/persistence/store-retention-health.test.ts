@@ -105,6 +105,19 @@ describe('SqlitePersistenceStore retention and health', () => {
       raw_payload: { message: 'old protocol evidence' },
       summary: 'old protocol evidence'
     });
+    store.appendProviderUsageStepFact({
+      issue_run_id: expiredGraph.issue_run_id,
+      attempt_id: expiredGraph.attempt_id,
+      thread_id: expiredThreadId,
+      turn_id: expiredTurnId,
+      message_id_hash: 'a'.repeat(64),
+      model: 'claude-sonnet-4-6',
+      input_tokens: 4,
+      output_tokens: 2,
+      cache_read_tokens: 1,
+      cache_creation_tokens: 0,
+      observed_at: '2026-04-10T10:00:04.500Z'
+    });
     store.appendDrainAuditHistory({
       issue_run_id: expiredGraph.issue_run_id,
       project_identity: identity({ issue_id: 'expired-issue-run', issue_identifier: 'EXP-ISSUE-1' }).project,
@@ -157,6 +170,19 @@ describe('SqlitePersistenceStore retention and health', () => {
       payload_class: 'protocol_request_response',
       raw_payload: { message: 'active protocol evidence' },
       summary: 'active protocol evidence'
+    });
+    store.appendProviderUsageStepFact({
+      issue_run_id: activeIssueRunId,
+      attempt_id: activeAttemptId,
+      thread_id: activeThreadId,
+      turn_id: activeTurnId,
+      message_id_hash: 'b'.repeat(64),
+      model: 'claude-sonnet-4-6',
+      input_tokens: 5,
+      output_tokens: 3,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 1,
+      observed_at: '2026-04-10T09:00:04.500Z'
     });
     const activeIdentity = identity({ issue_id: 'active-issue-run', issue_identifier: 'ACTIVE-ISSUE-1' });
     store.appendDrainAuditHistory({
@@ -213,10 +239,16 @@ describe('SqlitePersistenceStore retention and health', () => {
             source_table: 'issue_run',
             source_id: expiredGraph.issue_run_id,
             reason_code: 'retention_policy_expired_completed_history',
-            pruned_record_count: 7
+            pruned_record_count: 10
           })
         ])
       );
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM history_provider_usage_step_fact WHERE issue_run_id = ?').get(expiredGraph.issue_run_id)
+      ).toEqual({ count: 0 });
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM history_provider_usage_step_fact WHERE issue_run_id = ?').get(activeIssueRunId)
+      ).toEqual({ count: 1 });
     } finally {
       db.close();
     }

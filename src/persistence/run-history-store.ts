@@ -1,17 +1,21 @@
 import { randomUUID } from 'node:crypto';
 
+import { REASON_CODES } from '../observability/reason-codes';
 import { redactUnknown } from '../security/redaction';
 import type {
   AppendAttemptParams,
   AppendIssueRunParams,
+  AppendTicketTerminalOutcomeParams,
   AppendStateTransitionParams,
   CompleteAttemptRowParams,
   CompleteIssueRunRowParams
 } from './execution-graph-writer';
 import { parseDurableIdentity, serializeDurableIdentity } from './identity-projection-store';
 import type { PersistenceDatabase } from './store-context';
+import { hydrateTokenModelFact, type TokenModelFactDatabaseRecord } from './types';
 import type {
   AppServerEventLedgerRecord,
+  CompletedProviderUsageTotal,
   DurableIdentity,
   DurableRunHistoryRecord,
   ExecutionGraphEntityStatus,
@@ -24,6 +28,7 @@ export interface RunHistoryExecutionGraphWriter {
   appendIssueRun(params: AppendIssueRunParams): string;
   appendAttempt(params: AppendAttemptParams): string;
   appendStateTransition(params: AppendStateTransitionParams): string;
+  appendTicketTerminalOutcome(params: AppendTicketTerminalOutcomeParams): string;
   completeIssueRunRow(params: CompleteIssueRunRowParams): void;
   completeAttemptRow(params: CompleteAttemptRowParams): void;
 }
@@ -240,14 +245,50 @@ export class RunHistoryStore {
     const redactedRootCauseDetail = redactUnknown(params.root_cause_reason_detail ?? null) as string | null;
     const redactedRecovery = params.missing_tool_output_recovery ? JSON.stringify(redactUnknown(params.missing_tool_output_recovery)) : null;
     const terminalReasonCode = params.terminal_reason_code ?? params.error_code ?? null;
+    const handoffReached =
+      terminalReasonCode === REASON_CODES.handoffStateReached ||
+      terminalReasonCode === REASON_CODES.handoffRelease;
+    const processStatus: RunTerminalStatus = handoffReached ? 'cancelled' : params.terminal_status;
+    const workflowOutcome = handoffReached ? 'handoff_reached' : params.terminal_status;
     const completedAt = asIso(this.nowMs());
+    const issueRunId = params.issue_run_id ?? this.identityProjection.lookupIssueRunIdForRun(params.run_id);
     this.transaction(() => {
+      const attemptId = issueRunId ? (params.attempt_id ?? this.lookupActiveAttemptId(issueRunId)) : null;
+      if (issueRunId) {
+        const terminalScope = attemptId ?? params.run_id;
+        this.executionGraphWriter.appendTicketTerminalOutcome({
+          terminal_outcome_id: `terminal_outcome:${terminalScope}`,
+          issue_run_id: issueRunId,
+          attempt_id: attemptId,
+          thread_id: params.thread_id ?? null,
+          turn_id: params.turn_id ?? null,
+          outcome: params.terminal_status,
+          reason_code: terminalReasonCode,
+          reason_detail: redactedTerminalDetail,
+          recorded_at: completedAt
+        });
+        this.executionGraphWriter.appendStateTransition({
+          state_transition_id: `terminal_transition:${terminalScope}`,
+          issue_run_id: issueRunId,
+          attempt_id: attemptId,
+          thread_id: params.thread_id ?? null,
+          turn_id: params.turn_id ?? null,
+          from_status: null,
+          to_status: workflowOutcome,
+          transitioned_at: completedAt,
+          status: params.terminal_status,
+          reason_code: terminalReasonCode,
+          reason_detail: redactedTerminalDetail
+        });
+      }
       this.db
         .prepare(
           `UPDATE runs SET
             ended_at = ?,
             completed_at = ?,
             terminal_status = ?,
+            process_status = ?,
+            workflow_outcome = ?,
             error_code = ?,
             terminal_reason_code = ?,
             terminal_reason_detail = ?,
@@ -265,6 +306,8 @@ export class RunHistoryStore {
           completedAt,
           completedAt,
           params.terminal_status,
+          processStatus,
+          workflowOutcome,
           redactedError,
           terminalReasonCode,
           redactedTerminalDetail,
@@ -279,16 +322,16 @@ export class RunHistoryStore {
           params.run_id
         );
 
-      const issueRunId = params.issue_run_id ?? this.identityProjection.lookupIssueRunIdForRun(params.run_id);
       if (!issueRunId) {
         return;
       }
-      const attemptId = params.attempt_id ?? this.lookupActiveAttemptId(issueRunId);
       if (attemptId) {
         this.executionGraphWriter.completeAttemptRow({
           attempt_id: attemptId,
           ended_at: completedAt,
           status: params.terminal_status,
+          process_status: processStatus,
+          workflow_outcome: workflowOutcome,
           reason_code: terminalReasonCode,
           reason_detail: redactedTerminalDetail
         });
@@ -297,6 +340,8 @@ export class RunHistoryStore {
         issue_run_id: issueRunId,
         ended_at: completedAt,
         status: params.terminal_status,
+        process_status: processStatus,
+        workflow_outcome: workflowOutcome,
         reason_code: terminalReasonCode,
         reason_detail: redactedTerminalDetail
       });
@@ -306,7 +351,8 @@ export class RunHistoryStore {
   listRunHistory(limit = 50): DurableRunHistoryRecord[] {
     const rows = this.db
       .prepare(
-        `SELECT run_id, issue_id, issue_identifier, identity, started_at, ended_at, completed_at, terminal_status, error_code,
+        `SELECT run_id, issue_id, issue_identifier, identity, started_at, ended_at, completed_at, terminal_status,
+          process_status, workflow_outcome, error_code,
           terminal_reason_code, terminal_reason_detail, root_cause_status, root_cause_reason_code,
           root_cause_reason_detail, root_cause_at, session_id, thread_id, turn_id, missing_tool_output_recovery
         FROM runs ORDER BY started_at DESC LIMIT ?`
@@ -320,6 +366,8 @@ export class RunHistoryStore {
       ended_at: string | null;
       completed_at: string | null;
       terminal_status: RunTerminalStatus | null;
+      process_status: RunTerminalStatus | null;
+      workflow_outcome: string | null;
       error_code: string | null;
       terminal_reason_code: string | null;
       terminal_reason_detail: string | null;
@@ -393,6 +441,8 @@ export class RunHistoryStore {
         ended_at: row.ended_at,
         completed_at: row.completed_at,
         terminal_status: row.terminal_status,
+        process_status: row.process_status,
+        workflow_outcome: row.workflow_outcome,
         error_code: row.error_code,
         terminal_reason_code: row.terminal_reason_code ?? row.error_code,
         terminal_reason_detail: row.terminal_reason_detail,
@@ -406,11 +456,183 @@ export class RunHistoryStore {
         session_ids: sessions.map((entry) => entry.session_id),
         app_server_events: appServerEvents,
         missing_tool_output_recovery: parseNullableJsonObject(row.missing_tool_output_recovery),
-        token_model_facts: issueRunId ? (tokenModelFactStmt.all(issueRunId) as TokenModelFactRecord[]) : []
+        token_model_facts: issueRunId
+          ? (tokenModelFactStmt.all(issueRunId) as TokenModelFactDatabaseRecord[]).map(hydrateTokenModelFact)
+          : []
       };
 
       return redactUnknown(record) as DurableRunHistoryRecord;
     });
+  }
+
+  listCompletedProviderUsageTotals(excludeIssueRunIds: string[] = []): CompletedProviderUsageTotal[] {
+    if (!hasTable(this.db, 'history_token_model_fact')) return [];
+    const excluded = new Set(excludeIssueRunIds);
+    const facts = (this.db
+      .prepare(
+        `SELECT history_token_model_fact.*
+         FROM history_token_model_fact
+         JOIN issue_run ON issue_run.issue_run_id = history_token_model_fact.issue_run_id
+         WHERE issue_run.ended_at IS NOT NULL
+          AND history_token_model_fact.runtime_provider = 'claude-cli'
+         ORDER BY history_token_model_fact.observed_at ASC, history_token_model_fact.token_model_fact_id ASC`
+      )
+      .all() as TokenModelFactDatabaseRecord[])
+      .filter((fact) => !excluded.has(fact.issue_run_id))
+      .map(hydrateTokenModelFact);
+    const invocationFacts = new Map<string, TokenModelFactRecord>();
+    const modelFacts = new Map<string, TokenModelFactRecord>();
+    const rank = (fact: TokenModelFactRecord) =>
+      fact.provider_usage_status === 'final' || fact.telemetry_confidence === 'provider_result'
+        ? 2
+        : 1;
+    const prefer = (current: TokenModelFactRecord | undefined, candidate: TokenModelFactRecord) =>
+      !current || rank(candidate) > rank(current) || (rank(candidate) === rank(current) && candidate.observed_at >= current.observed_at)
+        ? candidate
+        : current;
+    for (const fact of facts) {
+      const invocationKey = fact.turn_id ?? fact.token_model_fact_id;
+      if (fact.model_source === 'claude_model_usage') {
+        const key = `${invocationKey}\0${fact.effective_model ?? 'unknown'}`;
+        modelFacts.set(key, prefer(modelFacts.get(key), fact));
+      } else {
+        invocationFacts.set(invocationKey, prefer(invocationFacts.get(invocationKey), fact));
+      }
+    }
+
+    type Aggregate = CompletedProviderUsageTotal & {
+      invocationKeys: Set<string>;
+      seenInput: boolean;
+      seenOutput: boolean;
+      seenCacheRead: boolean;
+      seenCacheCreation: boolean;
+      seenTurns: boolean;
+      seenCost: boolean;
+    };
+    const groups = new Map<string, Aggregate>();
+    const add = (params: {
+      invocationKey: string;
+      model: string | null;
+      status: string | null;
+      input: number | null;
+      output: number | null;
+      cacheRead: number | null;
+      cacheCreation: number | null;
+      turns: number | null;
+      cost: number | null;
+      updatedAt: string;
+    }) => {
+      const key = params.model ?? '';
+      const group = groups.get(key) ?? {
+        runtime_provider: 'claude-cli' as const,
+        effective_model: params.model,
+        invocation_count: 0,
+        final_invocation_count: 0,
+        partial_invocation_count: 0,
+        unobserved_invocation_count: 0,
+        missing_invocation_count: 0,
+        input_tokens: null,
+        output_tokens: null,
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+        provider_turn_count: null,
+        estimated_cost_usd: null,
+        updated_at: null,
+        invocationKeys: new Set<string>(),
+        seenInput: false,
+        seenOutput: false,
+        seenCacheRead: false,
+        seenCacheCreation: false,
+        seenTurns: false,
+        seenCost: false
+      };
+      if (!group.invocationKeys.has(params.invocationKey)) {
+        group.invocationKeys.add(params.invocationKey);
+        group.invocation_count += 1;
+        if (params.status === 'final') group.final_invocation_count += 1;
+        else if (params.status === 'partial' || params.status === 'legacy_partial') group.partial_invocation_count += 1;
+        else if (params.status === 'unobserved') group.unobserved_invocation_count += 1;
+        else group.missing_invocation_count += 1;
+      }
+      const accumulate = (value: number | null, current: number | null) => value === null ? current : (current ?? 0) + value;
+      group.input_tokens = accumulate(params.input, group.input_tokens);
+      group.output_tokens = accumulate(params.output, group.output_tokens);
+      group.cache_read_tokens = accumulate(params.cacheRead, group.cache_read_tokens);
+      group.cache_creation_tokens = accumulate(params.cacheCreation, group.cache_creation_tokens);
+      group.provider_turn_count = accumulate(params.turns, group.provider_turn_count);
+      group.estimated_cost_usd = accumulate(params.cost, group.estimated_cost_usd);
+      group.seenInput ||= params.input !== null;
+      group.seenOutput ||= params.output !== null;
+      group.seenCacheRead ||= params.cacheRead !== null;
+      group.seenCacheCreation ||= params.cacheCreation !== null;
+      group.seenTurns ||= params.turns !== null;
+      group.seenCost ||= params.cost !== null;
+      group.updated_at = !group.updated_at || params.updatedAt > group.updated_at ? params.updatedAt : group.updated_at;
+      groups.set(key, group);
+    };
+
+    for (const [invocationKey, invocation] of invocationFacts) {
+      const models = [...modelFacts.entries()]
+        .filter(([key]) => key.startsWith(`${invocationKey}\0`))
+        .map(([, fact]) => fact)
+        .filter((fact) => [fact.input_tokens, fact.output_tokens, fact.cached_input_tokens, fact.cache_creation_input_tokens]
+          .some((value) => typeof value === 'number' && value > 0));
+      if (models.length > 0) {
+        for (const model of models) {
+          add({
+            invocationKey,
+            model: model.effective_model,
+            status: invocation.provider_usage_status ?? null,
+            input: model.input_tokens,
+            output: model.output_tokens,
+            cacheRead: model.cached_input_tokens,
+            cacheCreation: model.cache_creation_input_tokens ?? null,
+            turns: models.length === 1 ? invocation.provider_turn_count ?? null : null,
+            cost: model.estimated_cost_usd ?? null,
+            updatedAt: invocation.observed_at
+          });
+        }
+        if (models.length > 1 && invocation.provider_turn_count !== null && invocation.provider_turn_count !== undefined) {
+          add({
+            invocationKey,
+            model: null,
+            status: invocation.provider_usage_status ?? null,
+            input: null,
+            output: null,
+            cacheRead: null,
+            cacheCreation: null,
+            turns: invocation.provider_turn_count,
+            cost: null,
+            updatedAt: invocation.observed_at
+          });
+        }
+        continue;
+      }
+      add({
+        invocationKey,
+        model: invocation.effective_model ?? invocation.requested_model,
+        status: invocation.provider_usage_status ?? null,
+        input: invocation.input_tokens,
+        output: invocation.output_tokens,
+        cacheRead: invocation.cached_input_tokens,
+        cacheCreation: invocation.cache_creation_input_tokens ?? null,
+        turns: invocation.provider_turn_count ?? null,
+        cost: invocation.estimated_cost_usd ?? null,
+        updatedAt: invocation.observed_at
+      });
+    }
+
+    return [...groups.values()]
+      .map(({ invocationKeys: _keys, seenInput, seenOutput, seenCacheRead, seenCacheCreation, seenTurns, seenCost, ...group }) => ({
+        ...group,
+        input_tokens: seenInput ? group.input_tokens : null,
+        output_tokens: seenOutput ? group.output_tokens : null,
+        cache_read_tokens: seenCacheRead ? group.cache_read_tokens : null,
+        cache_creation_tokens: seenCacheCreation ? group.cache_creation_tokens : null,
+        provider_turn_count: seenTurns ? group.provider_turn_count : null,
+        estimated_cost_usd: seenCost ? group.estimated_cost_usd : null
+      }))
+      .sort((left, right) => (left.effective_model ?? '').localeCompare(right.effective_model ?? ''));
   }
 
   private lookupActiveAttemptId(issueRunId: string): string | null {

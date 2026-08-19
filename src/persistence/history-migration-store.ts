@@ -120,6 +120,44 @@ export class HistoryMigrationStore {
       }
     }
 
+    // Version 14 remained unreleased while its additive shape was developed. A local
+    // database may therefore already carry an applied v14 marker from an earlier
+    // development build. Reassert the idempotent shape so such databases cannot run
+    // with a partially applied provider-usage contract.
+    const providerUsageV2 = this.db
+      .prepare(
+        'SELECT status FROM history_schema_migrations WHERE schema_name = ? AND version = 14'
+      )
+      .get(HISTORY_SCHEMA_NAME) as { status: string } | undefined;
+    if (providerUsageV2?.status === 'applied') {
+      try {
+        this.db.exec('BEGIN;');
+        ensureProviderUsageObservabilityV2(this.db, () => undefined);
+        this.db.exec('COMMIT;');
+        const currentHealth = this.schemaHealthStore.readHistorySchemaHealth();
+        if (currentHealth.degraded_reason_code === 'history_provider_usage_shape_repair_failed') {
+          this.schemaHealthStore.recordHistorySchemaState({
+            appliedVersion: 14,
+            status: 'healthy',
+            degradedReasonCode: null,
+            degradedDetail: null
+          });
+        }
+      } catch (error) {
+        try {
+          this.db.exec('ROLLBACK;');
+        } catch {
+          // The repair may have failed before BEGIN was accepted.
+        }
+        this.schemaHealthStore.recordHistorySchemaState({
+          appliedVersion: 14,
+          status: 'degraded',
+          degradedReasonCode: 'history_provider_usage_shape_repair_failed',
+          degradedDetail: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+
     ensureHistoryWriteFailureTable(this.db);
 
     const state = this.db
@@ -257,8 +295,102 @@ function historyMigrations(): HistoryMigration[] {
       apply: (context) => {
         ensureTokenModelFactColumns(context.db, context.recordHistoryHealthMetadata);
       }
+    },
+    {
+      version: 14,
+      name: 'provider_usage_observability_v2',
+      apply: (context) => {
+        ensureProviderUsageObservabilityV2(context.db, context.recordHistoryHealthMetadata);
+      }
     }
   ];
+}
+
+function ensureProviderUsageObservabilityV2(
+  db: PersistenceDatabase,
+  recordHistoryHealthMetadata: (status: 'healthy' | 'degraded', reasonCode: string | null, detail: string | null) => void
+): void {
+  ensureTokenModelFactColumns(db, recordHistoryHealthMetadata);
+  const columns = db.prepare('PRAGMA table_info(history_token_model_fact)').all() as Array<{ name: string }>;
+  const existing = new Set(columns.map((column) => column.name));
+  const migrations: Array<[string, string]> = [
+    ['cache_creation_input_tokens', 'ALTER TABLE history_token_model_fact ADD COLUMN cache_creation_input_tokens INTEGER'],
+    ['provider_usage_status', 'ALTER TABLE history_token_model_fact ADD COLUMN provider_usage_status TEXT'],
+    ['provider_usage_source', 'ALTER TABLE history_token_model_fact ADD COLUMN provider_usage_source TEXT'],
+    ['api_retry_count', 'ALTER TABLE history_token_model_fact ADD COLUMN api_retry_count INTEGER'],
+    ['api_error_status', 'ALTER TABLE history_token_model_fact ADD COLUMN api_error_status TEXT'],
+    ['terminal_reason', 'ALTER TABLE history_token_model_fact ADD COLUMN terminal_reason TEXT'],
+    ['stop_reason', 'ALTER TABLE history_token_model_fact ADD COLUMN stop_reason TEXT'],
+    ['duration_ms', 'ALTER TABLE history_token_model_fact ADD COLUMN duration_ms INTEGER'],
+    ['duration_api_ms', 'ALTER TABLE history_token_model_fact ADD COLUMN duration_api_ms INTEGER'],
+    ['time_to_first_token_ms', 'ALTER TABLE history_token_model_fact ADD COLUMN time_to_first_token_ms INTEGER'],
+    ['permission_denial_count', 'ALTER TABLE history_token_model_fact ADD COLUMN permission_denial_count INTEGER'],
+    ['unknown_event_count', 'ALTER TABLE history_token_model_fact ADD COLUMN unknown_event_count INTEGER'],
+    ['auxiliary_result_count', 'ALTER TABLE history_token_model_fact ADD COLUMN auxiliary_result_count INTEGER'],
+    ['effective_models', 'ALTER TABLE history_token_model_fact ADD COLUMN effective_models TEXT'],
+    ['tool_counts', 'ALTER TABLE history_token_model_fact ADD COLUMN tool_counts TEXT'],
+    ['mcp_counts', 'ALTER TABLE history_token_model_fact ADD COLUMN mcp_counts TEXT'],
+    ['missing_reason', 'ALTER TABLE history_token_model_fact ADD COLUMN missing_reason TEXT'],
+    ['reconciliation_delta', 'ALTER TABLE history_token_model_fact ADD COLUMN reconciliation_delta TEXT'],
+    ['model_usage', 'ALTER TABLE history_token_model_fact ADD COLUMN model_usage TEXT'],
+    ['nested_session_detected', 'ALTER TABLE history_token_model_fact ADD COLUMN nested_session_detected INTEGER'],
+    ['supervised_session_coverage', 'ALTER TABLE history_token_model_fact ADD COLUMN supervised_session_coverage TEXT']
+  ];
+  for (const [column, sql] of migrations) {
+    if (!existing.has(column)) db.exec(`${sql};`);
+  }
+  for (const table of ['runs', 'issue_run', 'attempt']) {
+    const lifecycleColumns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    const lifecycleExisting = new Set(lifecycleColumns.map((column) => column.name));
+    if (!lifecycleExisting.has('process_status')) db.exec(`ALTER TABLE ${table} ADD COLUMN process_status TEXT;`);
+    if (!lifecycleExisting.has('workflow_outcome')) db.exec(`ALTER TABLE ${table} ADD COLUMN workflow_outcome TEXT;`);
+  }
+  const threadColumns = db.prepare('PRAGMA table_info(thread)').all() as Array<{ name: string }>;
+  const threadExisting = new Set(threadColumns.map((column) => column.name));
+  const threadMigrations: Array<[string, string]> = [
+    ['session_id', 'ALTER TABLE thread ADD COLUMN session_id TEXT'],
+    ['agent_runtime', 'ALTER TABLE thread ADD COLUMN agent_runtime TEXT'],
+    ['worker_instance_id', 'ALTER TABLE thread ADD COLUMN worker_instance_id TEXT'],
+    ['worker_process_pid', 'ALTER TABLE thread ADD COLUMN worker_process_pid INTEGER']
+  ];
+  for (const [column, sql] of threadMigrations) {
+    if (!threadExisting.has(column)) db.exec(`${sql};`);
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS history_provider_usage_step_fact (
+      provider_usage_step_fact_id TEXT PRIMARY KEY,
+      issue_run_id TEXT NOT NULL,
+      attempt_id TEXT,
+      thread_id TEXT,
+      turn_id TEXT NOT NULL,
+      message_id_hash TEXT NOT NULL,
+      model TEXT,
+      input_tokens INTEGER NOT NULL,
+      output_tokens INTEGER NOT NULL,
+      cache_read_tokens INTEGER NOT NULL,
+      cache_creation_tokens INTEGER NOT NULL,
+      runtime_provider TEXT NOT NULL,
+      source TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (issue_run_id) REFERENCES issue_run(issue_run_id) ON DELETE RESTRICT,
+      FOREIGN KEY (attempt_id) REFERENCES attempt(attempt_id) ON DELETE RESTRICT,
+      FOREIGN KEY (thread_id) REFERENCES thread(thread_id) ON DELETE RESTRICT,
+      FOREIGN KEY (turn_id) REFERENCES turn(turn_id) ON DELETE RESTRICT,
+      UNIQUE (issue_run_id, turn_id, message_id_hash)
+    );
+    CREATE INDEX IF NOT EXISTS history_provider_usage_step_fact_turn_idx
+      ON history_provider_usage_step_fact(turn_id, observed_at ASC);
+    UPDATE history_token_model_fact
+       SET provider_usage_status = COALESCE(provider_usage_status, 'partial'),
+           provider_usage_source = COALESCE(provider_usage_source, 'legacy_partial'),
+           telemetry_confidence = CASE
+             WHEN telemetry_confidence IN ('observed_live', 'backfilled') THEN 'legacy_partial'
+             ELSE telemetry_confidence
+           END
+     WHERE runtime_provider = 'claude-cli';
+  `);
+  recordHistoryHealthMetadata('healthy', null, null);
 }
 
 function ensureRuntimeUpdateDrainAuditEventTypes(db: PersistenceDatabase): void {

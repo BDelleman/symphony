@@ -44,6 +44,7 @@ describe('SqlitePersistenceStore migrations', () => {
         'history_retention_metadata',
         'history_retention_prune_record',
         'history_health_metadata',
+        'history_provider_usage_step_fact',
         'issue_run',
         'attempt',
         'thread',
@@ -55,8 +56,8 @@ describe('SqlitePersistenceStore migrations', () => {
     );
     expect(store.historySchemaHealth()).toMatchObject({
       schema_name: 'project_execution_history',
-      target_version: 13,
-      applied_version: 13,
+      target_version: 14,
+      applied_version: 14,
       status: 'healthy',
       degraded_reason_code: null
     });
@@ -73,7 +74,8 @@ describe('SqlitePersistenceStore migrations', () => {
       expect.objectContaining({ version: 10, name: 'drain_audit_history_v1', status: 'applied' }),
       expect.objectContaining({ version: 11, name: 'runtime_update_drain_audit_events_v1', status: 'applied' }),
       expect.objectContaining({ version: 12, name: 'runtime_restart_drain_audit_events_v1', status: 'applied' }),
-      expect.objectContaining({ version: 13, name: 'provider_usage_dimensions_v1', status: 'applied' })
+      expect.objectContaining({ version: 13, name: 'provider_usage_dimensions_v1', status: 'applied' }),
+      expect.objectContaining({ version: 14, name: 'provider_usage_observability_v2', status: 'applied' })
     ]);
   });
 
@@ -84,14 +86,14 @@ describe('SqlitePersistenceStore migrations', () => {
 
     const storeA = new SqlitePersistenceStore({ dbPath, retentionDays: 14, nowMs: () => Date.parse('2026-04-11T10:00:00.000Z') });
     stores.push(storeA);
-    expect(storeA.historySchemaHealth().migrations).toHaveLength(13);
+    expect(storeA.historySchemaHealth().migrations).toHaveLength(14);
     storeA.close();
     stores.pop();
 
     const storeB = new SqlitePersistenceStore({ dbPath, retentionDays: 14, nowMs: () => Date.parse('2026-04-11T10:10:00.000Z') });
     stores.push(storeB);
 
-    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 13, status: 'healthy' });
+    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
     expect(storeB.historySchemaHealth().migrations).toEqual([
       expect.objectContaining({ version: 1, status: 'applied' }),
       expect.objectContaining({ version: 2, status: 'applied' }),
@@ -105,8 +107,92 @@ describe('SqlitePersistenceStore migrations', () => {
       expect.objectContaining({ version: 10, status: 'applied' }),
       expect.objectContaining({ version: 11, status: 'applied' }),
       expect.objectContaining({ version: 12, status: 'applied' }),
-      expect.objectContaining({ version: 13, status: 'applied' })
+      expect.objectContaining({ version: 13, status: 'applied' }),
+      expect.objectContaining({ version: 14, status: 'applied' })
     ]);
+  });
+
+  it('repairs an already-marked v14 database with a partial additive shape', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-history-v14-repair-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'runtime.sqlite');
+
+    const storeA = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(storeA);
+    storeA.close();
+    stores.pop();
+
+    const db = openDatabase(dbPath);
+    try {
+      db.exec('ALTER TABLE history_token_model_fact DROP COLUMN terminal_reason;');
+      expect(
+        (db.prepare('PRAGMA table_info(history_token_model_fact)').all() as Array<{ name: string }>).some(
+          (column) => column.name === 'terminal_reason'
+        )
+      ).toBe(false);
+    } finally {
+      db.close();
+    }
+
+    const storeB = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(storeB);
+    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
+    const repaired = openDatabase(dbPath);
+    try {
+      expect(
+        (repaired.prepare('PRAGMA table_info(history_token_model_fact)').all() as Array<{ name: string }>).map(
+          (column) => column.name
+        )
+      ).toContain('terminal_reason');
+    } finally {
+      repaired.close();
+    }
+  });
+
+  it('marks the canonical schema degraded when the v14 shape repair fails and clears it after repair', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-history-v14-repair-failure-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'runtime.sqlite');
+
+    const storeA = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(storeA);
+    storeA.close();
+    stores.pop();
+
+    const db = openDatabase(dbPath);
+    try {
+      db.exec(`
+        DROP TABLE history_provider_usage_step_fact;
+        CREATE VIEW history_provider_usage_step_fact AS SELECT 1 AS invalid_shape;
+      `);
+    } finally {
+      db.close();
+    }
+
+    const degradedStore = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(degradedStore);
+    expect(degradedStore.historySchemaHealth()).toMatchObject({
+      applied_version: 14,
+      status: 'degraded',
+      degraded_reason_code: 'history_provider_usage_shape_repair_failed'
+    });
+    degradedStore.close();
+    stores.pop();
+
+    const repairDb = openDatabase(dbPath);
+    try {
+      repairDb.exec('DROP VIEW history_provider_usage_step_fact;');
+    } finally {
+      repairDb.close();
+    }
+
+    const repairedStore = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(repairedStore);
+    expect(repairedStore.historySchemaHealth()).toMatchObject({
+      applied_version: 14,
+      status: 'healthy',
+      degraded_reason_code: null
+    });
   });
 
   it('adds provider usage dimensions when upgrading an existing version 12 history database', async () => {
@@ -123,7 +209,7 @@ describe('SqlitePersistenceStore migrations', () => {
       db.exec('ALTER TABLE history_token_model_fact DROP COLUMN runtime_provider;');
       db.exec('ALTER TABLE history_token_model_fact DROP COLUMN provider_turn_count;');
       db.exec('ALTER TABLE history_token_model_fact DROP COLUMN estimated_cost_usd;');
-      db.prepare("DELETE FROM history_schema_migrations WHERE schema_name = 'project_execution_history' AND version = 13").run();
+      db.prepare("DELETE FROM history_schema_migrations WHERE schema_name = 'project_execution_history' AND version IN (13, 14)").run();
       db.prepare("UPDATE history_schema_state SET applied_version = 12 WHERE schema_name = 'project_execution_history'").run();
     } finally {
       db.close();
@@ -131,7 +217,7 @@ describe('SqlitePersistenceStore migrations', () => {
 
     const storeB = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
     stores.push(storeB);
-    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 13, status: 'healthy' });
+    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
     const migrated = openDatabase(dbPath);
     try {
       const columns = (migrated.prepare('PRAGMA table_info(history_token_model_fact)').all() as Array<{ name: string }>).map(
@@ -215,7 +301,7 @@ describe('SqlitePersistenceStore migrations', () => {
           ON history_drain_audit_event(project_key, ticket_key, occurred_at DESC);
         CREATE INDEX IF NOT EXISTS history_drain_audit_event_issue_run_idx
           ON history_drain_audit_event(issue_run_id);
-        DELETE FROM history_schema_migrations WHERE schema_name = 'project_execution_history' AND version IN (11, 12, 13);
+        DELETE FROM history_schema_migrations WHERE schema_name = 'project_execution_history' AND version IN (11, 12, 13, 14);
         UPDATE history_schema_state
           SET applied_version = 10, status = 'healthy', degraded_reason_code = NULL, degraded_detail = NULL
           WHERE schema_name = 'project_execution_history';
@@ -239,7 +325,7 @@ describe('SqlitePersistenceStore migrations', () => {
       observed_at: '2026-05-21T10:01:00.000Z'
     });
 
-    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 13, status: 'healthy' });
+    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
     expect((storeB as any).listProjectDrainAuditEvents(durableIdentity.project.key, { limit: 10 }).items.map((entry: any) => entry.event_type)).toEqual([
       'update-detected',
       'drain-entered'
@@ -311,7 +397,7 @@ describe('SqlitePersistenceStore migrations', () => {
            VALUES (?, ?, 'linear', 'present', 'symphony', NULL, ?, ?, '2026-04-11T11:00:00.000Z', '2026-04-11T11:00:00.000Z')`
         )
         .run(projectB.ticket.key, projectB.project.key, projectB.ticket.remote_issue_id, projectB.ticket.human_issue_identifier);
-      dbA.prepare("DELETE FROM history_schema_migrations WHERE schema_name = 'project_execution_history' AND version IN (9, 10, 11, 12, 13)").run();
+      dbA.prepare("DELETE FROM history_schema_migrations WHERE schema_name = 'project_execution_history' AND version IN (9, 10, 11, 12, 13, 14)").run();
       dbA
         .prepare(
           `UPDATE history_schema_state
@@ -325,7 +411,7 @@ describe('SqlitePersistenceStore migrations', () => {
 
     const storeB = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
     stores.push(storeB);
-    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 13, status: 'healthy' });
+    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
     expect(storeB.listProjectTicketIdentities(projectA.project.key).items).toEqual([projectA]);
     expect(storeB.listProjectTicketIdentities(projectB.project.key).items).toEqual([projectB]);
     expect(storeB.reconstructTicketTimeline(projectA).issue_runs.map((run) => run.issue_run_id)).toEqual(['legacy-project-a-run']);
@@ -461,7 +547,7 @@ describe('SqlitePersistenceStore migrations', () => {
         terminal_reason_code: 'legacy_error'
       })
     ]);
-    expect(store.historySchemaHealth()).toMatchObject({ applied_version: 13, status: 'healthy' });
+    expect(store.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
     expect(tableNames(dbPath)).toEqual(
       expect.arrayContaining([
         'history_token_model_fact',

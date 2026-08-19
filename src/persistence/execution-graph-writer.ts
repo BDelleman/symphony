@@ -51,6 +51,10 @@ export interface AppendAttemptParams {
 
 export interface AppendThreadParams {
   attempt_id: string;
+  session_id?: string | null;
+  agent_runtime?: string | null;
+  worker_instance_id?: string | null;
+  worker_process_pid?: number | null;
   started_at: string;
   ended_at?: string | null;
   status: ExecutionGraphEntityStatus;
@@ -246,9 +250,44 @@ export interface AppendTokenModelFactParams {
   runtime_provider?: string | null;
   provider_turn_count?: number | null;
   estimated_cost_usd?: number | null;
+  cache_creation_input_tokens?: number | null;
+  provider_usage_status?: string | null;
+  provider_usage_source?: string | null;
+  api_retry_count?: number | null;
+  api_error_status?: number | string | null;
+  terminal_reason?: string | null;
+  stop_reason?: string | null;
+  duration_ms?: number | null;
+  duration_api_ms?: number | null;
+  time_to_first_token_ms?: number | null;
+  permission_denial_count?: number | null;
+  unknown_event_count?: number | null;
+  auxiliary_result_count?: number | null;
+  effective_models?: string[] | null;
+  tool_counts?: Record<string, number> | null;
+  mcp_counts?: Record<string, number> | null;
+  missing_reason?: string | null;
+  reconciliation_delta?: Record<string, number> | null;
+  model_usage?: unknown[] | null;
+  nested_session_detected?: boolean | null;
+  supervised_session_coverage?: string | null;
   telemetry_confidence: TokenModelTelemetryConfidence;
   observed_at: string;
   token_model_fact_id?: string;
+}
+
+export interface AppendProviderUsageStepFactParams {
+  issue_run_id: string;
+  attempt_id?: string | null;
+  thread_id?: string | null;
+  turn_id: string;
+  message_id_hash: string;
+  model?: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  observed_at: string;
 }
 
 export interface AppendDrainAuditHistoryParams {
@@ -274,6 +313,8 @@ export interface CompleteIssueRunRowParams {
   issue_run_id: string;
   ended_at: string;
   status: RunTerminalStatus;
+  process_status?: RunTerminalStatus | null;
+  workflow_outcome?: string | null;
   reason_code: string | null;
   reason_detail: string | null;
 }
@@ -282,6 +323,8 @@ export interface CompleteAttemptRowParams {
   attempt_id: string;
   ended_at: string;
   status: RunTerminalStatus;
+  process_status?: RunTerminalStatus | null;
+  workflow_outcome?: string | null;
   reason_code: string | null;
   reason_detail: string | null;
 }
@@ -331,8 +374,8 @@ function validateOptionalTokenCount(value: number | null | undefined, label: str
 }
 
 function normalizeTelemetryConfidence(value: TokenModelTelemetryConfidence): TokenModelTelemetryConfidence {
-  if (value !== 'observed_live' && value !== 'backfilled' && value !== 'missing') {
-    throw new Error('telemetry_confidence must be observed_live, backfilled, or missing');
+  if (!['observed_live', 'backfilled', 'provider_step', 'provider_result', 'legacy_partial', 'missing'].includes(value)) {
+    throw new Error('telemetry_confidence is invalid');
   }
   return value;
 }
@@ -483,12 +526,26 @@ export class ExecutionGraphWriter {
     this.db
       .prepare(
         `INSERT INTO thread
-        (thread_id, attempt_id, started_at, ended_at, status, reason_code, reason_detail)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`
+        (thread_id, attempt_id, session_id, agent_runtime, worker_instance_id, worker_process_pid,
+         started_at, ended_at, status, reason_code, reason_detail)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+          session_id = COALESCE(excluded.session_id, thread.session_id),
+          agent_runtime = COALESCE(excluded.agent_runtime, thread.agent_runtime),
+          worker_instance_id = COALESCE(excluded.worker_instance_id, thread.worker_instance_id),
+          worker_process_pid = COALESCE(excluded.worker_process_pid, thread.worker_process_pid),
+          ended_at = COALESCE(excluded.ended_at, thread.ended_at),
+          status = excluded.status,
+          reason_code = excluded.reason_code,
+          reason_detail = excluded.reason_detail`
       )
       .run(
         threadId,
         params.attempt_id,
+        params.session_id ?? null,
+        params.agent_runtime ?? null,
+        params.worker_instance_id ?? null,
+        params.worker_process_pid ?? null,
         params.started_at,
         params.ended_at ?? null,
         params.status,
@@ -595,7 +652,18 @@ export class ExecutionGraphWriter {
       .prepare(
         `INSERT INTO state_transition
         (state_transition_id, issue_run_id, attempt_id, thread_id, turn_id, from_status, to_status, transitioned_at, status, reason_code, reason_detail)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(state_transition_id) DO UPDATE SET
+          issue_run_id = excluded.issue_run_id,
+          attempt_id = excluded.attempt_id,
+          thread_id = excluded.thread_id,
+          turn_id = excluded.turn_id,
+          from_status = excluded.from_status,
+          to_status = excluded.to_status,
+          transitioned_at = excluded.transitioned_at,
+          status = excluded.status,
+          reason_code = excluded.reason_code,
+          reason_detail = excluded.reason_detail`
       )
       .run(
         stateTransitionId,
@@ -637,7 +705,16 @@ export class ExecutionGraphWriter {
       .prepare(
         `INSERT INTO history_ticket_terminal_outcome
         (terminal_outcome_id, issue_run_id, attempt_id, thread_id, turn_id, outcome, reason_code, reason_detail, recorded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(terminal_outcome_id) DO UPDATE SET
+          issue_run_id = excluded.issue_run_id,
+          attempt_id = excluded.attempt_id,
+          thread_id = excluded.thread_id,
+          turn_id = excluded.turn_id,
+          outcome = excluded.outcome,
+          reason_code = excluded.reason_code,
+          reason_detail = excluded.reason_detail,
+          recorded_at = excluded.recorded_at`
       )
       .run(
         terminalOutcomeId,
@@ -1037,6 +1114,34 @@ export class ExecutionGraphWriter {
     const modelContextWindow = validateOptionalTokenCount(params.model_context_window, 'model_context_window');
     const runtimeProvider = normalizeOptionalText(params.runtime_provider);
     const providerTurnCount = validateOptionalTokenCount(params.provider_turn_count, 'provider_turn_count');
+    const cacheCreationInputTokens = validateOptionalTokenCount(
+      params.cache_creation_input_tokens,
+      'cache_creation_input_tokens'
+    );
+    const providerUsageStatus = normalizeOptionalText(params.provider_usage_status);
+    const providerUsageSource = normalizeOptionalText(params.provider_usage_source);
+    const apiRetryCount = validateOptionalTokenCount(params.api_retry_count, 'api_retry_count');
+    const apiErrorStatus = params.api_error_status === null || params.api_error_status === undefined
+      ? null
+      : normalizeOptionalText(String(params.api_error_status));
+    const terminalReason = normalizeOptionalText(params.terminal_reason);
+    const stopReason = normalizeOptionalText(params.stop_reason);
+    const durationMs = validateOptionalTokenCount(params.duration_ms, 'duration_ms');
+    const durationApiMs = validateOptionalTokenCount(params.duration_api_ms, 'duration_api_ms');
+    const timeToFirstTokenMs = validateOptionalTokenCount(params.time_to_first_token_ms, 'time_to_first_token_ms');
+    const permissionDenialCount = validateOptionalTokenCount(params.permission_denial_count, 'permission_denial_count');
+    const unknownEventCount = validateOptionalTokenCount(params.unknown_event_count, 'unknown_event_count');
+    const auxiliaryResultCount = validateOptionalTokenCount(params.auxiliary_result_count, 'auxiliary_result_count');
+    const effectiveModels = params.effective_models ? JSON.stringify(normalizeIdentifierArray(params.effective_models)) : null;
+    const toolCounts = params.tool_counts ? JSON.stringify(redactUnknown(params.tool_counts)) : null;
+    const mcpCounts = params.mcp_counts ? JSON.stringify(redactUnknown(params.mcp_counts)) : null;
+    const missingReason = normalizeOptionalText(params.missing_reason);
+    const reconciliationDelta = params.reconciliation_delta
+      ? JSON.stringify(redactUnknown(params.reconciliation_delta))
+      : null;
+    const modelUsage = params.model_usage ? JSON.stringify(redactUnknown(params.model_usage)) : null;
+    const nestedSessionDetected = params.nested_session_detected === true ? 1 : params.nested_session_detected === false ? 0 : null;
+    const supervisedSessionCoverage = normalizeOptionalText(params.supervised_session_coverage);
     const estimatedCostUsd =
       params.estimated_cost_usd === undefined || params.estimated_cost_usd === null
         ? null
@@ -1065,6 +1170,27 @@ export class ExecutionGraphWriter {
         runtimeProvider,
         providerTurnCount,
         estimatedCostUsd,
+        cacheCreationInputTokens,
+        providerUsageStatus,
+        providerUsageSource,
+        apiRetryCount,
+        apiErrorStatus,
+        terminalReason,
+        stopReason,
+        durationMs,
+        durationApiMs,
+        timeToFirstTokenMs,
+        permissionDenialCount,
+        unknownEventCount,
+        auxiliaryResultCount,
+        effectiveModels,
+        toolCounts,
+        mcpCounts,
+        missingReason,
+        reconciliationDelta,
+        modelUsage,
+        nestedSessionDetected,
+        supervisedSessionCoverage,
         telemetryConfidence,
         params.observed_at
       ]);
@@ -1074,8 +1200,49 @@ export class ExecutionGraphWriter {
         `INSERT INTO history_token_model_fact
         (token_model_fact_id, issue_run_id, attempt_id, thread_id, turn_id, requested_model, effective_model,
          model_source, input_tokens, output_tokens, cached_input_tokens, reasoning_output_tokens, total_tokens,
-         model_context_window, runtime_provider, provider_turn_count, estimated_cost_usd, telemetry_confidence, observed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         model_context_window, runtime_provider, provider_turn_count, estimated_cost_usd, cache_creation_input_tokens,
+         provider_usage_status, provider_usage_source, api_retry_count, api_error_status, terminal_reason, stop_reason,
+         duration_ms, duration_api_ms, time_to_first_token_ms, permission_denial_count, unknown_event_count,
+         auxiliary_result_count, effective_models, tool_counts, mcp_counts,
+         missing_reason, reconciliation_delta, model_usage, nested_session_detected, supervised_session_coverage,
+         telemetry_confidence, observed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(token_model_fact_id) DO UPDATE SET
+          requested_model = excluded.requested_model,
+          effective_model = excluded.effective_model,
+          model_source = excluded.model_source,
+          input_tokens = excluded.input_tokens,
+          output_tokens = excluded.output_tokens,
+          cached_input_tokens = excluded.cached_input_tokens,
+          reasoning_output_tokens = excluded.reasoning_output_tokens,
+          total_tokens = excluded.total_tokens,
+          model_context_window = excluded.model_context_window,
+          runtime_provider = excluded.runtime_provider,
+          cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+          provider_turn_count = excluded.provider_turn_count,
+          estimated_cost_usd = excluded.estimated_cost_usd,
+          provider_usage_status = excluded.provider_usage_status,
+          provider_usage_source = excluded.provider_usage_source,
+          api_retry_count = excluded.api_retry_count,
+          api_error_status = excluded.api_error_status,
+          terminal_reason = excluded.terminal_reason,
+          stop_reason = excluded.stop_reason,
+          duration_ms = excluded.duration_ms,
+          duration_api_ms = excluded.duration_api_ms,
+          time_to_first_token_ms = excluded.time_to_first_token_ms,
+          permission_denial_count = excluded.permission_denial_count,
+          unknown_event_count = excluded.unknown_event_count,
+          auxiliary_result_count = excluded.auxiliary_result_count,
+          effective_models = excluded.effective_models,
+          tool_counts = excluded.tool_counts,
+          mcp_counts = excluded.mcp_counts,
+          missing_reason = excluded.missing_reason,
+          reconciliation_delta = excluded.reconciliation_delta,
+          model_usage = excluded.model_usage,
+          nested_session_detected = excluded.nested_session_detected,
+          supervised_session_coverage = excluded.supervised_session_coverage,
+          telemetry_confidence = excluded.telemetry_confidence,
+          observed_at = excluded.observed_at`
       )
       .run(
         tokenModelFactId,
@@ -1095,10 +1262,86 @@ export class ExecutionGraphWriter {
         runtimeProvider,
         providerTurnCount,
         estimatedCostUsd,
+        cacheCreationInputTokens,
+        providerUsageStatus,
+        providerUsageSource,
+        apiRetryCount,
+        apiErrorStatus,
+        terminalReason,
+        stopReason,
+        durationMs,
+        durationApiMs,
+        timeToFirstTokenMs,
+        permissionDenialCount,
+        unknownEventCount,
+        auxiliaryResultCount,
+        effectiveModels,
+        toolCounts,
+        mcpCounts,
+        missingReason,
+        reconciliationDelta,
+        modelUsage,
+        nestedSessionDetected,
+        supervisedSessionCoverage,
         telemetryConfidence,
         params.observed_at
       );
     return tokenModelFactId;
+  }
+
+  appendProviderUsageStepFact(params: AppendProviderUsageStepFactParams): string {
+    this.ensureTimelineFactReferences({
+      issue_run_id: params.issue_run_id,
+      attempt_id: params.attempt_id,
+      thread_id: params.thread_id,
+      turn_id: params.turn_id,
+      timestamp: params.observed_at,
+      label: 'provider_usage_step_fact'
+    });
+    if (!/^[0-9a-f]{64}$/i.test(params.message_id_hash)) {
+      throw new Error('message_id_hash must be a SHA-256 hex digest');
+    }
+    const inputTokens = validateOptionalTokenCount(params.input_tokens, 'input_tokens')!;
+    const outputTokens = validateOptionalTokenCount(params.output_tokens, 'output_tokens')!;
+    const cacheReadTokens = validateOptionalTokenCount(params.cache_read_tokens, 'cache_read_tokens')!;
+    const cacheCreationTokens = validateOptionalTokenCount(params.cache_creation_tokens, 'cache_creation_tokens')!;
+    const model = normalizeOptionalText(params.model);
+    const factId = asExecutionGraphId('provider_usage_step_fact', [
+      params.issue_run_id,
+      params.turn_id,
+      params.message_id_hash
+    ]);
+    this.db
+      .prepare(
+        `INSERT INTO history_provider_usage_step_fact
+          (provider_usage_step_fact_id, issue_run_id, attempt_id, thread_id, turn_id, message_id_hash, model,
+           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, runtime_provider, source,
+           observed_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claude-cli', 'claude_assistant_step', ?, ?)
+         ON CONFLICT(issue_run_id, turn_id, message_id_hash) DO UPDATE SET
+           model = COALESCE(excluded.model, history_provider_usage_step_fact.model),
+           input_tokens = MAX(history_provider_usage_step_fact.input_tokens, excluded.input_tokens),
+           output_tokens = MAX(history_provider_usage_step_fact.output_tokens, excluded.output_tokens),
+           cache_read_tokens = MAX(history_provider_usage_step_fact.cache_read_tokens, excluded.cache_read_tokens),
+           cache_creation_tokens = MAX(history_provider_usage_step_fact.cache_creation_tokens, excluded.cache_creation_tokens),
+           updated_at = excluded.updated_at`
+      )
+      .run(
+        factId,
+        params.issue_run_id,
+        params.attempt_id ?? null,
+        params.thread_id ?? null,
+        params.turn_id,
+        params.message_id_hash.toLowerCase(),
+        model,
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheCreationTokens,
+        params.observed_at,
+        params.observed_at
+      );
+    return factId;
   }
 
   completeIssueRunRow(params: CompleteIssueRunRowParams): void {
@@ -1114,11 +1357,21 @@ export class ExecutionGraphWriter {
         `UPDATE issue_run SET
           ended_at = ?,
           status = ?,
+          process_status = ?,
+          workflow_outcome = ?,
           reason_code = ?,
           reason_detail = ?
         WHERE issue_run_id = ?`
       )
-      .run(params.ended_at, params.status, params.reason_code, params.reason_detail, params.issue_run_id);
+      .run(
+        params.ended_at,
+        params.status,
+        params.process_status ?? params.status,
+        params.workflow_outcome ?? params.status,
+        params.reason_code,
+        params.reason_detail,
+        params.issue_run_id
+      );
   }
 
   completeAttemptRow(params: CompleteAttemptRowParams): void {
@@ -1131,14 +1384,64 @@ export class ExecutionGraphWriter {
     ensureEndedAfterStarted(row.started_at, params.ended_at, 'attempt');
     this.db
       .prepare(
+        `UPDATE phase_span SET
+          ended_at = COALESCE(ended_at, ?),
+          status = CASE WHEN ended_at IS NULL THEN ? ELSE status END,
+          reason_code = COALESCE(reason_code, ?),
+          reason_detail = COALESCE(reason_detail, ?)
+        WHERE turn_id IN (
+          SELECT turn.turn_id FROM turn
+          JOIN thread ON thread.thread_id = turn.thread_id
+          WHERE thread.attempt_id = ?
+        ) AND ended_at IS NULL`
+      )
+      .run(params.ended_at, params.status, params.reason_code, params.reason_detail, params.attempt_id);
+    this.db
+      .prepare(
+        `UPDATE tool_span SET
+          ended_at = COALESCE(ended_at, ?),
+          status = CASE WHEN ended_at IS NULL THEN ? ELSE status END,
+          reason_code = COALESCE(reason_code, ?),
+          reason_detail = COALESCE(reason_detail, ?)
+        WHERE turn_id IN (
+          SELECT turn.turn_id FROM turn
+          JOIN thread ON thread.thread_id = turn.thread_id
+          WHERE thread.attempt_id = ?
+        ) AND ended_at IS NULL`
+      )
+      .run(params.ended_at, params.status, params.reason_code, params.reason_detail, params.attempt_id);
+    this.db
+      .prepare(
+        `UPDATE turn SET ended_at = ?, status = ?, reason_code = ?, reason_detail = ?
+         WHERE thread_id IN (SELECT thread_id FROM thread WHERE attempt_id = ?) AND ended_at IS NULL`
+      )
+      .run(params.ended_at, params.status, params.reason_code, params.reason_detail, params.attempt_id);
+    this.db
+      .prepare(
+        `UPDATE thread SET ended_at = ?, status = ?, reason_code = ?, reason_detail = ?
+         WHERE attempt_id = ? AND ended_at IS NULL`
+      )
+      .run(params.ended_at, params.status, params.reason_code, params.reason_detail, params.attempt_id);
+    this.db
+      .prepare(
         `UPDATE attempt SET
           ended_at = ?,
           status = ?,
+          process_status = ?,
+          workflow_outcome = ?,
           reason_code = ?,
           reason_detail = ?
         WHERE attempt_id = ?`
       )
-      .run(params.ended_at, params.status, params.reason_code, params.reason_detail, params.attempt_id);
+      .run(
+        params.ended_at,
+        params.status,
+        params.process_status ?? params.status,
+        params.workflow_outcome ?? params.status,
+        params.reason_code,
+        params.reason_detail,
+        params.attempt_id
+      );
   }
 
   private ensureTurnTimestamp(turnId: string, timestamp: string, label: string): void {

@@ -134,6 +134,7 @@ export class RetentionHealthStore {
                 'history_app_server_event',
                 'history_protocol_summary',
                 'history_token_model_fact',
+                'history_provider_usage_step_fact',
                 'history_ticket_evidence_reference',
                 'history_ticket_blocker',
                 'history_ticket_terminal_outcome',
@@ -346,6 +347,7 @@ export class RetentionHealthStore {
             + (SELECT COUNT(*) FROM history_blocked_input_event WHERE history_blocked_input_event.issue_run_id = issue_run.issue_run_id)
             + (SELECT COUNT(*) FROM history_protocol_summary WHERE history_protocol_summary.issue_run_id = issue_run.issue_run_id)
             + (SELECT COUNT(*) FROM history_token_model_fact WHERE history_token_model_fact.issue_run_id = issue_run.issue_run_id)
+            + (SELECT COUNT(*) FROM history_provider_usage_step_fact WHERE history_provider_usage_step_fact.issue_run_id = issue_run.issue_run_id)
             + (SELECT COUNT(*) FROM history_app_server_event WHERE history_app_server_event.issue_run_id = issue_run.issue_run_id)
           ) AS pruned_record_count
          FROM issue_run
@@ -421,6 +423,7 @@ export class RetentionHealthStore {
   private deleteIssueRunHistory(issueRunId: string): void {
     this.db.prepare('DELETE FROM history_app_server_event WHERE issue_run_id = ?').run(issueRunId);
     this.db.prepare('DELETE FROM history_protocol_summary WHERE issue_run_id = ?').run(issueRunId);
+    this.db.prepare('DELETE FROM history_provider_usage_step_fact WHERE issue_run_id = ?').run(issueRunId);
     this.db.prepare('DELETE FROM history_token_model_fact WHERE issue_run_id = ?').run(issueRunId);
     this.db.prepare('DELETE FROM history_ticket_evidence_reference WHERE issue_run_id = ?').run(issueRunId);
     this.db.prepare('DELETE FROM history_ticket_blocker WHERE issue_run_id = ?').run(issueRunId);
