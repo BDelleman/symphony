@@ -874,6 +874,7 @@ function buildSandboxSettings(params: {
   networkAllowedDomains: string[];
   sshAuthSock: string | null;
   allowedMcpServers: string[];
+  enableWeakerNetworkIsolation: boolean;
 }): Record<string, unknown> {
   const protectedPaths = [
     path.dirname(params.executable),
@@ -927,6 +928,7 @@ function buildSandboxSettings(params: {
       failIfUnavailable: true,
       allowUnsandboxedCommands: false,
       autoAllowBashIfSandboxed: true,
+      ...(params.enableWeakerNetworkIsolation ? { enableWeakerNetworkIsolation: true } : {}),
       filesystem: { allowWrite: [params.workspace, params.sessionTemp], denyRead: protectedPaths },
       network: {
         allowedDomains: params.networkAllowedDomains,
@@ -1462,16 +1464,6 @@ export class ClaudeCliRunner implements AgentRunner {
       assertGitConfigurationSafe(workspace, gitExecutable);
       if (gitRemote.has_credentials) throw new Error('claude_git_remote_contains_credentials');
       if (gitRemote.scheme === 'http') throw new Error('claude_insecure_git_remote');
-      if (gitRemote.scheme === 'ssh' && this.platform === 'linux') {
-        throw new Error('claude_linux_ssh_remote_unsupported');
-      }
-      const sshAllowed =
-        gitRemote.scheme === 'ssh' &&
-        Boolean(gitRemote.host) &&
-        networkAllowedDomains.includes(gitRemote.host!);
-      const sshAgent = sshAllowed
-        ? validateSshAgent(this.env.SSH_AUTH_SOCK, this.env, [workspace, projectRoot])
-        : null;
       const githubCapability = resolveGitHubCapability(
         gitRemote,
         workspace,
@@ -1480,6 +1472,17 @@ export class ClaudeCliRunner implements AgentRunner {
         this.options.githubCommand ?? 'gh',
         this.options.githubCommand ? [] : [workspace, projectRoot]
       );
+      if (gitRemote.scheme === 'ssh' && !githubCapability && this.platform === 'linux') {
+        throw new Error('claude_linux_ssh_remote_unsupported');
+      }
+      const sshAllowed =
+        gitRemote.scheme === 'ssh' &&
+        !githubCapability &&
+        Boolean(gitRemote.host) &&
+        networkAllowedDomains.includes(gitRemote.host!);
+      const sshAgent = sshAllowed
+        ? validateSshAgent(this.env.SSH_AUTH_SOCK, this.env, [workspace, projectRoot])
+        : null;
       const childEnv = buildChildEnvironment(
         this.env,
         workspace,
@@ -1492,9 +1495,21 @@ export class ClaudeCliRunner implements AgentRunner {
       if (githubCapability) {
         childEnv.GH_TOKEN = githubCapability.token;
         childEnv.GH_HOST = githubCapability.host;
-        childEnv.GIT_CONFIG_COUNT = '1';
-        childEnv.GIT_CONFIG_KEY_0 = `credential.https://${githubCapability.host}.helper`;
-        childEnv.GIT_CONFIG_VALUE_0 = `!${quoteShellArgument(githubCapability.executable)} auth git-credential`;
+        const gitConfiguration = [
+          ['credential.helper', ''],
+          [`credential.https://${githubCapability.host}.helper`, `!${quoteShellArgument(githubCapability.executable)} auth git-credential`]
+        ];
+        if (gitRemote.scheme === 'ssh') {
+          gitConfiguration.push(
+            [`url.https://${githubCapability.host}/.insteadOf`, `git@${githubCapability.host}:`],
+            [`url.https://${githubCapability.host}/.insteadOf`, `ssh://git@${githubCapability.host}/`]
+          );
+        }
+        childEnv.GIT_CONFIG_COUNT = String(gitConfiguration.length);
+        gitConfiguration.forEach(([key, value], index) => {
+          childEnv[`GIT_CONFIG_KEY_${index}`] = key;
+          childEnv[`GIT_CONFIG_VALUE_${index}`] = value;
+        });
       }
       assertSupportedVersion(executable, workspace, childEnv, this.supportedVersion);
       assertApprovedAuth(executable, workspace, childEnv, home, this.options.allowNonSubscriptionAuth);
@@ -1510,12 +1525,21 @@ export class ClaudeCliRunner implements AgentRunner {
           sessionTemp,
           networkAllowedDomains,
           sshAuthSock: sshAgent?.socketPath ?? null,
-          allowedMcpServers: [...allowedMcpServers].sort()
+          allowedMcpServers: [...allowedMcpServers].sort(),
+          enableWeakerNetworkIsolation: this.platform === 'darwin'
         }),
         userMcpConfiguration.approvedServerConfiguration
       );
       settingsDirectory = settingsFile.directory;
       childEnv.TMPDIR = settingsFile.sessionTemp;
+      const npmCacheDirectory = path.join(settingsFile.sessionTemp, 'npm-cache');
+      fs.mkdirSync(npmCacheDirectory, { mode: 0o700 });
+      childEnv.npm_config_cache = npmCacheDirectory;
+      if (githubCapability) {
+        const githubConfigDirectory = path.join(settingsFile.sessionTemp, 'gh-config');
+        fs.mkdirSync(githubConfigDirectory, { mode: 0o700 });
+        childEnv.GH_CONFIG_DIR = githubConfigDirectory;
+      }
       const stableSandboxPolicy = buildSandboxSettings({
         executable,
         workspace,
@@ -1525,7 +1549,8 @@ export class ClaudeCliRunner implements AgentRunner {
         sessionTemp: '<session-temp>',
         networkAllowedDomains,
         sshAuthSock: sshAgent?.socketPath ?? null,
-        allowedMcpServers: [...allowedMcpServers].sort()
+        allowedMcpServers: [...allowedMcpServers].sort(),
+        enableWeakerNetworkIsolation: this.platform === 'darwin'
       });
       const binding: ClaudeSessionBinding = {
         project_identity: input.runBinding?.project_identity ?? workspace,
@@ -1576,7 +1601,7 @@ export class ClaudeCliRunner implements AgentRunner {
         '--model',
         this.options.model,
         '--permission-mode',
-        'acceptEdits'
+        'bypassPermissions'
       ];
       if (expectedSessionId) args.push('--resume', expectedSessionId);
       if (input.cancellationSignal?.aborted) {

@@ -62,9 +62,17 @@ if (process.env.MOCK_ENV_FILE) {
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY || null,
     GH_TOKEN: process.env.GH_TOKEN || null,
     GH_HOST: process.env.GH_HOST || null,
+    GH_CONFIG_DIR: process.env.GH_CONFIG_DIR || null,
+    npm_config_cache: process.env.npm_config_cache || null,
     GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT || null,
     GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0 || null,
-    GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0 || null
+    GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0 || null,
+    GIT_CONFIG_KEY_1: process.env.GIT_CONFIG_KEY_1 || null,
+    GIT_CONFIG_VALUE_1: process.env.GIT_CONFIG_VALUE_1 || null,
+    GIT_CONFIG_KEY_2: process.env.GIT_CONFIG_KEY_2 || null,
+    GIT_CONFIG_VALUE_2: process.env.GIT_CONFIG_VALUE_2 || null,
+    GIT_CONFIG_KEY_3: process.env.GIT_CONFIG_KEY_3 || null,
+    GIT_CONFIG_VALUE_3: process.env.GIT_CONFIG_VALUE_3 || null
   }));
 }
 const settingsIndex = args.indexOf('--settings');
@@ -256,7 +264,7 @@ describe('ClaudeCliRunner', () => {
     ]);
     expect(firstArgs[firstArgs.indexOf('--setting-sources') + 1]).toBe('user');
     expect(firstArgs[firstArgs.indexOf('--model') + 1]).toBe('claude-sonnet-4-6');
-    expect(firstArgs[firstArgs.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    expect(firstArgs[firstArgs.indexOf('--permission-mode') + 1]).toBe('bypassPermissions');
     expect(firstArgs[firstArgs.indexOf('--settings') + 1]).toMatch(/symphony-claude-settings-.+\/settings\.json$/);
     expect(firstArgs.join(' ')).not.toMatch(/dangerously-skip-permissions|allowedTools|max-turns|max-budget|--bare|fallback/);
     expect(JSON.parse(fs.readFileSync(fixture.settingsFile, 'utf8'))).toMatchObject({
@@ -274,6 +282,11 @@ describe('ClaudeCliRunner', () => {
         }
       }
     });
+    if (process.platform === 'darwin') {
+      expect(JSON.parse(fs.readFileSync(fixture.settingsFile, 'utf8'))).toMatchObject({
+        sandbox: { enableWeakerNetworkIsolation: true }
+      });
+    }
 
     const resumed = await runner.resumeSessionAndRunTurn({
       ...startInput(fixture.root, 'continue'),
@@ -820,7 +833,8 @@ describe('ClaudeCliRunner', () => {
         homedir: () => fixture.root
       }).startSessionAndRunTurn(startInput(fixture.root));
       expect(result.status).toBe('completed');
-      expect(JSON.parse(fs.readFileSync(fixture.envFile, 'utf8'))).toEqual({
+      const childEnv = JSON.parse(fs.readFileSync(fixture.envFile, 'utf8')) as Record<string, string | null>;
+      expect(childEnv).toMatchObject({
         LINEAR_API_KEY: null,
         UNRELATED_SECRET: null,
         SSH_AUTH_SOCK: null,
@@ -828,10 +842,18 @@ describe('ClaudeCliRunner', () => {
         CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
         GH_TOKEN: null,
         GH_HOST: null,
+        GH_CONFIG_DIR: null,
         GIT_CONFIG_COUNT: null,
         GIT_CONFIG_KEY_0: null,
-        GIT_CONFIG_VALUE_0: null
+        GIT_CONFIG_VALUE_0: null,
+        GIT_CONFIG_KEY_1: null,
+        GIT_CONFIG_VALUE_1: null,
+        GIT_CONFIG_KEY_2: null,
+        GIT_CONFIG_VALUE_2: null,
+        GIT_CONFIG_KEY_3: null,
+        GIT_CONFIG_VALUE_3: null
       });
+      expect(childEnv.npm_config_cache).toMatch(/symphony-claude-settings-.+\/session\/npm-cache$/);
     } finally {
       if (previousLinear === undefined) delete process.env.LINEAR_API_KEY;
       else process.env.LINEAR_API_KEY = previousLinear;
@@ -860,11 +882,52 @@ describe('ClaudeCliRunner', () => {
     expect(JSON.parse(fs.readFileSync(fixture.envFile, 'utf8'))).toMatchObject({
       GH_TOKEN: token,
       GH_HOST: 'github.com',
-      GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: 'credential.https://github.com.helper',
-      GIT_CONFIG_VALUE_0: `!'${path.join(fixture.root, 'gh')}' auth git-credential`
+      GH_CONFIG_DIR: expect.stringMatching(/symphony-claude-settings-.+\/session\/gh-config$/),
+      npm_config_cache: expect.stringMatching(/symphony-claude-settings-.+\/session\/npm-cache$/),
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'credential.helper',
+      GIT_CONFIG_VALUE_0: null,
+      GIT_CONFIG_KEY_1: 'credential.https://github.com.helper',
+      GIT_CONFIG_VALUE_1: `!'${path.join(fixture.root, 'gh')}' auth git-credential`,
+      GIT_CONFIG_KEY_2: null,
+      GIT_CONFIG_VALUE_2: null,
+      GIT_CONFIG_KEY_3: null,
+      GIT_CONFIG_VALUE_3: null
     });
     expect(JSON.stringify({ result, events })).not.toContain(token);
+  });
+
+  it('rewrites GitHub SSH remotes to scoped HTTPS auth without exposing the SSH agent', async () => {
+    const fixture = createFixture();
+    const token = 'test-github-capability-token';
+    fs.writeFileSync(path.join(fixture.root, 'mock-gh-token'), `${token}\n`);
+    configureOrigin(fixture.root, 'git@github.com:example/project.git');
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      githubCommand: path.join(fixture.root, 'gh'),
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { SSH_AUTH_SOCK: '/not-used-for-github' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result.status).toBe('completed');
+    expect(JSON.parse(fs.readFileSync(fixture.envFile, 'utf8'))).toMatchObject({
+      SSH_AUTH_SOCK: null,
+      GH_TOKEN: token,
+      GH_HOST: 'github.com',
+      GH_CONFIG_DIR: expect.stringMatching(/symphony-claude-settings-.+\/session\/gh-config$/),
+      GIT_CONFIG_COUNT: '4',
+      GIT_CONFIG_KEY_0: 'credential.helper',
+      GIT_CONFIG_VALUE_0: null,
+      GIT_CONFIG_KEY_1: 'credential.https://github.com.helper',
+      GIT_CONFIG_VALUE_1: `!'${path.join(fixture.root, 'gh')}' auth git-credential`,
+      GIT_CONFIG_KEY_2: 'url.https://github.com/.insteadOf',
+      GIT_CONFIG_VALUE_2: 'git@github.com:',
+      GIT_CONFIG_KEY_3: 'url.https://github.com/.insteadOf',
+      GIT_CONFIG_VALUE_3: 'ssh://git@github.com/'
+    });
   });
 
   it('fails before spawn when a GitHub remote has no scoped gh token', async () => {
