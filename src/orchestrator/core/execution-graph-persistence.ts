@@ -132,6 +132,9 @@ function appServerLiteSourceEventId(workerEvent: WorkerObservabilityEvent): stri
 }
 
 function appServerLiteSummaryForWorkerEvent(workerEvent: WorkerObservabilityEvent): AppServerLiteSummary | null {
+  if (workerEvent.provider_usage?.status === 'partial' && workerEvent.provider_usage_step_facts?.length) {
+    return null;
+  }
   const baseFields: Record<string, unknown> = {
     event: workerEvent.event,
     reason_code: workerEvent.reason_code ?? null,

@@ -906,8 +906,14 @@ function buildProjectHistoryTicketRowFromSummary(
 
 function buildProjectHistoryTicketSummary(timeline: TicketTimelineRecord): ProjectHistoryTicketSummaryProjection {
   const latestIssueRun = latestBy(timeline.issue_runs, (run) => run.started_at);
-  const latestAttempt = latestBy(timeline.attempts, (attempt) => attempt.started_at);
-  const latestOutcome = latestBy(timeline.terminal_outcomes, (outcome) => outcome.recorded_at);
+  const latestAttempt = latestBy(
+    timeline.attempts.filter((attempt) => attempt.issue_run_id === latestIssueRun?.issue_run_id),
+    (attempt) => attempt.started_at
+  );
+  const latestOutcome = latestBy(
+    timeline.terminal_outcomes.filter((outcome) => outcome.issue_run_id === latestIssueRun?.issue_run_id),
+    (outcome) => outcome.recorded_at
+  );
   const latestTrackerSnapshot = latestBy(timeline.tracker_snapshots, (snapshot) => snapshot.last_observed_at);
   const latestTransition = latestBy(timeline.state_transitions, (transition) => transition.transitioned_at);
   const lastKnownStatus = latestTrackerSnapshot?.tracker_status ?? latestTransition?.to_status ?? latestIssueRun?.status ?? 'unknown';
@@ -978,7 +984,7 @@ function summaryFacts(
       summary.summary.thread_count + summary.summary.turn_count,
       REASON_CODES.projectHistoryThreadTurnReferencesMissing
     ),
-    presenceFact('evidence_references', summary.summary.evidence_reference_count, REASON_CODES.projectHistoryEvidenceReferencesMissing),
+    optionalFact('evidence_references', summary.summary.evidence_reference_count, REASON_CODES.projectHistoryEvidenceReferencesMissing),
     presenceFact(
       'tracker_pr_operator_facts',
       summary.summary.tracker_snapshot_count + summary.summary.ticket_reference_count + summary.summary.operator_action_count,
@@ -1137,6 +1143,7 @@ function buildCompletedProviderTotals(timeline: TicketTimelineRecord): ProjectHi
     provider_turn_count: number | null;
     estimated_cost_usd: number | null;
     updated_at: string;
+    count_invocation: boolean;
   };
 
   const phaseByTurn = new Map<string, { phase: string; started_at: string }>();
@@ -1163,6 +1170,21 @@ function buildCompletedProviderTotals(timeline: TicketTimelineRecord): ProjectHi
   const rows: UsageRow[] = [];
   for (const [invocationKey, invocation] of invocationFacts) {
     const ticketPhase = invocation.turn_id ? phaseByTurn.get(invocation.turn_id)?.phase ?? null : null;
+    rows.push({
+      runtime_provider: 'claude-cli',
+      effective_model: null,
+      ticket_phase: ticketPhase,
+      invocation_key: invocationKey,
+      status: invocation.provider_usage_status ?? null,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      provider_turn_count: invocation.provider_turn_count ?? null,
+      estimated_cost_usd: null,
+      updated_at: invocation.observed_at,
+      count_invocation: true
+    });
     const persistedModels = [...modelFacts.entries()]
       .filter(([key]) => key.startsWith(`${invocationKey}\0`))
       .map(([, fact]) => fact)
@@ -1194,25 +1216,10 @@ function buildCompletedProviderTotals(timeline: TicketTimelineRecord): ProjectHi
           output_tokens: model.output_tokens,
           cache_read_tokens: model.cached_input_tokens,
           cache_creation_tokens: model.cache_creation_input_tokens ?? null,
-          provider_turn_count: persistedModels.length === 1 ? invocation.provider_turn_count ?? null : null,
+          provider_turn_count: null,
           estimated_cost_usd: model.estimated_cost_usd ?? null,
-          updated_at: invocation.observed_at
-        });
-      }
-      if (persistedModels.length > 1 && invocation.provider_turn_count !== null && invocation.provider_turn_count !== undefined) {
-        rows.push({
-          runtime_provider: 'claude-cli',
-          effective_model: null,
-          ticket_phase: ticketPhase,
-          invocation_key: invocationKey,
-          status: invocation.provider_usage_status ?? null,
-          input_tokens: null,
-          output_tokens: null,
-          cache_read_tokens: null,
-          cache_creation_tokens: null,
-          provider_turn_count: invocation.provider_turn_count,
-          estimated_cost_usd: null,
-          updated_at: invocation.observed_at
+          updated_at: invocation.observed_at,
+          count_invocation: false
         });
       }
       continue;
@@ -1229,25 +1236,10 @@ function buildCompletedProviderTotals(timeline: TicketTimelineRecord): ProjectHi
           output_tokens: model.output,
           cache_read_tokens: model.cacheRead,
           cache_creation_tokens: model.cacheCreation,
-          provider_turn_count: embeddedModels.length === 1 ? invocation.provider_turn_count ?? null : null,
+          provider_turn_count: null,
           estimated_cost_usd: model.cost,
-          updated_at: invocation.observed_at
-        });
-      }
-      if (embeddedModels.length > 1 && invocation.provider_turn_count !== null && invocation.provider_turn_count !== undefined) {
-        rows.push({
-          runtime_provider: 'claude-cli',
-          effective_model: null,
-          ticket_phase: ticketPhase,
-          invocation_key: invocationKey,
-          status: invocation.provider_usage_status ?? null,
-          input_tokens: null,
-          output_tokens: null,
-          cache_read_tokens: null,
-          cache_creation_tokens: null,
-          provider_turn_count: invocation.provider_turn_count,
-          estimated_cost_usd: null,
-          updated_at: invocation.observed_at
+          updated_at: invocation.observed_at,
+          count_invocation: false
         });
       }
       continue;
@@ -1262,9 +1254,10 @@ function buildCompletedProviderTotals(timeline: TicketTimelineRecord): ProjectHi
       output_tokens: invocation.output_tokens,
       cache_read_tokens: invocation.cached_input_tokens,
       cache_creation_tokens: invocation.cache_creation_input_tokens ?? null,
-      provider_turn_count: invocation.provider_turn_count ?? null,
+      provider_turn_count: null,
       estimated_cost_usd: invocation.estimated_cost_usd ?? null,
-      updated_at: invocation.observed_at
+      updated_at: invocation.observed_at,
+      count_invocation: false
     });
   }
 
@@ -1303,7 +1296,7 @@ function buildCompletedProviderTotals(timeline: TicketTimelineRecord): ProjectHi
       turn_values: [],
       cost_values: []
     };
-    if (!group.invocation_keys.has(row.invocation_key)) {
+    if (row.count_invocation && !group.invocation_keys.has(row.invocation_key)) {
       group.invocation_keys.add(row.invocation_key);
       group.invocation_count += 1;
       if (row.status === 'final') group.final_invocation_count += 1;

@@ -529,6 +529,7 @@ export class RunHistoryStore {
       turns: number | null;
       cost: number | null;
       updatedAt: string;
+      countInvocation: boolean;
     }) => {
       const key = params.model ?? '';
       const group = groups.get(key) ?? {
@@ -554,7 +555,7 @@ export class RunHistoryStore {
         seenTurns: false,
         seenCost: false
       };
-      if (!group.invocationKeys.has(params.invocationKey)) {
+      if (params.countInvocation && !group.invocationKeys.has(params.invocationKey)) {
         group.invocationKeys.add(params.invocationKey);
         group.invocation_count += 1;
         if (params.status === 'final') group.final_invocation_count += 1;
@@ -580,6 +581,19 @@ export class RunHistoryStore {
     };
 
     for (const [invocationKey, invocation] of invocationFacts) {
+      add({
+        invocationKey,
+        model: null,
+        status: invocation.provider_usage_status ?? null,
+        input: null,
+        output: null,
+        cacheRead: null,
+        cacheCreation: null,
+        turns: invocation.provider_turn_count ?? null,
+        cost: null,
+        updatedAt: invocation.observed_at,
+        countInvocation: true
+      });
       const models = [...modelFacts.entries()]
         .filter(([key]) => key.startsWith(`${invocationKey}\0`))
         .map(([, fact]) => fact)
@@ -595,23 +609,10 @@ export class RunHistoryStore {
             output: model.output_tokens,
             cacheRead: model.cached_input_tokens,
             cacheCreation: model.cache_creation_input_tokens ?? null,
-            turns: models.length === 1 ? invocation.provider_turn_count ?? null : null,
+            turns: null,
             cost: model.estimated_cost_usd ?? null,
-            updatedAt: invocation.observed_at
-          });
-        }
-        if (models.length > 1 && invocation.provider_turn_count !== null && invocation.provider_turn_count !== undefined) {
-          add({
-            invocationKey,
-            model: null,
-            status: invocation.provider_usage_status ?? null,
-            input: null,
-            output: null,
-            cacheRead: null,
-            cacheCreation: null,
-            turns: invocation.provider_turn_count,
-            cost: null,
-            updatedAt: invocation.observed_at
+            updatedAt: invocation.observed_at,
+            countInvocation: false
           });
         }
         continue;
@@ -624,9 +625,10 @@ export class RunHistoryStore {
         output: invocation.output_tokens,
         cacheRead: invocation.cached_input_tokens,
         cacheCreation: invocation.cache_creation_input_tokens ?? null,
-        turns: invocation.provider_turn_count ?? null,
+        turns: null,
         cost: invocation.estimated_cost_usd ?? null,
-        updatedAt: invocation.observed_at
+        updatedAt: invocation.observed_at,
+        countInvocation: false
       });
     }
 

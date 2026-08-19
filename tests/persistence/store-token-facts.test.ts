@@ -495,12 +495,19 @@ describe('SqlitePersistenceStore token facts', () => {
 
     expect(store.listCompletedProviderUsageTotals()).toEqual([
       expect.objectContaining({
-        effective_model: 'claude-sonnet-4-6',
+        effective_model: null,
         invocation_count: 2,
         final_invocation_count: 1,
         partial_invocation_count: 0,
         unobserved_invocation_count: 1,
         missing_invocation_count: 0,
+        input_tokens: null
+      }),
+      expect.objectContaining({
+        effective_model: 'claude-sonnet-4-6',
+        invocation_count: 0,
+        final_invocation_count: 0,
+        unobserved_invocation_count: 0,
         input_tokens: 12
       })
     ]);

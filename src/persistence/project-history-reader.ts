@@ -434,8 +434,9 @@ export class ProjectHistoryReader {
       .all(identity.project.key, identity.ticket.key) as Array<Omit<IssueRunRecord, 'identity'> & { identity: string | null }>;
     const issueRunIds = issueRuns.map((run) => run.issue_run_id);
     const latestIssueRun = issueRuns.at(-1) ?? null;
-    const latestAttempt = this.latestSummaryAttempt(issueRunIds);
-    const latestOutcome = this.latestSummaryOutcome(issueRunIds);
+    const latestRunIds = latestIssueRun ? [latestIssueRun.issue_run_id] : [];
+    const latestAttempt = this.latestSummaryAttempt(latestRunIds);
+    const latestOutcome = this.latestSummaryOutcome(latestRunIds);
     const latestTrackerSnapshot = this.latestSummaryTrackerSnapshot(issueRunIds);
     const latestTransition = this.latestSummaryTransition(issueRunIds);
     const lastKnownStatus = latestTrackerSnapshot?.tracker_status ?? latestTransition?.to_status ?? latestIssueRun?.status ?? 'unknown';

@@ -331,16 +331,26 @@ describe('Project History consumer summary', () => {
     expect(detail.provider_totals).toEqual([
       expect.objectContaining({
         runtime_provider: 'claude-cli',
-        effective_model: 'claude-sonnet-4-6',
+        effective_model: null,
         ticket_phase: 'implementation',
         invocation_count: 1,
         final_invocation_count: 1,
+        provider_turn_count: 2,
+        input_tokens: null,
+        estimated_cost_usd: null
+      }),
+      expect.objectContaining({
+        runtime_provider: 'claude-cli',
+        effective_model: 'claude-sonnet-4-6',
+        ticket_phase: 'implementation',
+        invocation_count: 0,
+        final_invocation_count: 0,
         partial_invocation_count: 0,
         input_tokens: 12,
         output_tokens: 5,
         cache_read_tokens: 3,
         cache_creation_tokens: 1,
-        provider_turn_count: 2,
+        provider_turn_count: null,
         estimated_cost_usd: 0.03
       })
     ]);
@@ -349,12 +359,39 @@ describe('Project History consumer summary', () => {
       expect.objectContaining({
         runtime_provider: 'claude-cli',
         effective_model: 'claude-sonnet-4-6',
-        fact_count: 1,
+        fact_count: 0,
         total_tokens: null,
-        provider_turn_count: 2,
+        provider_turn_count: null,
         estimated_cost_usd: 0.03
+      }),
+      expect.objectContaining({
+        runtime_provider: 'claude-cli',
+        effective_model: 'unallocated-provider-turns',
+        fact_count: 1,
+        provider_turn_count: 2,
+        estimated_cost_usd: null
       })
     ]);
+  });
+
+  it('does not attach a prior run outcome to the latest running attempt', () => {
+    const activeTimeline = timeline({
+      issue_runs: [
+        ...timeline().issue_runs,
+        { ...timeline().issue_runs[0], issue_run_id: 'issue-run-2', started_at: '2026-04-10T11:00:00.000Z', ended_at: null, status: 'running' }
+      ],
+      attempts: [
+        ...timeline().attempts,
+        { ...timeline().attempts[0], attempt_id: 'attempt-2', issue_run_id: 'issue-run-2', started_at: '2026-04-10T11:00:01.000Z', ended_at: null, status: 'running' }
+      ]
+    });
+
+    expect(buildProjectHistoryConsumerSummaryResponse(activeTimeline).attempts.latest).toMatchObject({
+      attempt_id: 'attempt-2',
+      status: 'running',
+      outcome: null,
+      outcome_reason_code: null
+    });
   });
 
   it('projects drain audit events in project lists and ticket timelines', () => {
@@ -530,7 +567,7 @@ describe('Project History consumer summary', () => {
         },
         recent_write_failures: []
       },
-      timelines: [timeline()],
+      timelines: [timeline({ evidence_references: [] })],
       ticketCount: 1
     });
 
@@ -546,6 +583,9 @@ describe('Project History consumer summary', () => {
       app_server_lite: { status: 'healthy' }
     });
     expect(JSON.stringify(health)).not.toContain('raw transcript');
+    expect(health.diagnostics).toEqual(
+      expect.arrayContaining([expect.objectContaining({ fact: 'evidence_references', status: 'optional_unavailable' })])
+    );
   });
 
   it('keeps active ticket health healthy while terminal outcome is lifecycle-pending', () => {
