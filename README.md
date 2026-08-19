@@ -31,6 +31,8 @@ implements the base contract in `SPEC.md` plus documented local extensions in
 	npm run build
 	```
 
+	This builds the dashboard client and the TypeScript project.
+
 3. Run tests:
 
 	```bash
