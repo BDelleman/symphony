@@ -150,6 +150,8 @@ Exit codes are stable for automation:
 - `1`: warning-only findings.
 - `2`: blocker findings.
 
+`symphony doctor --ci` uses this documented doctor exit-code contract for automation.
+
 Use `--fix` for bounded local-adoption remediation. It can invoke local link
 refresh for link-related findings and can record setup consent only when paired
 with explicit approval (`--fix --yes`). It does not silently change project
