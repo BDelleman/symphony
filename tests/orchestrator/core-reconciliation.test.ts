@@ -2281,6 +2281,75 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     ).toBe(false);
   });
 
+  it('rotates Codex process lineage for a new outer-loop session on the same worker attempt', async () => {
+    const harness = createHarness();
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-codex-session-continuation', identifier: 'ABC-CODEX-CONTINUE' })
+    ]);
+    await harness.orchestrator.tick('interval');
+    const workerInstanceId = harness.orchestrator.getStateSnapshot().running.get('i-codex-session-continuation')?.worker_instance_id;
+    expect(workerInstanceId).toBeTruthy();
+
+    harness.orchestrator.onWorkerEvent('i-codex-session-continuation', {
+      timestamp_ms: harness.now.value,
+      event: CANONICAL_EVENT.codex.turnStarted,
+      worker_instance_id: workerInstanceId,
+      codex_app_server_pid: 1001,
+      thread_id: 'thread-1',
+      turn_id: 'turn-1',
+      session_id: 'session-1'
+    });
+    harness.orchestrator.onWorkerEvent('i-codex-session-continuation', {
+      timestamp_ms: harness.now.value + 100,
+      event: CANONICAL_EVENT.codex.turnCompleted,
+      worker_instance_id: workerInstanceId,
+      codex_app_server_pid: 1001,
+      thread_id: 'thread-1',
+      turn_id: 'turn-1',
+      session_id: 'session-1'
+    });
+    harness.orchestrator.onWorkerEvent('i-codex-session-continuation', {
+      timestamp_ms: harness.now.value + 200,
+      event: CANONICAL_EVENT.codex.sessionStarted,
+      worker_instance_id: workerInstanceId,
+      codex_app_server_pid: 2002,
+      thread_id: 'thread-2'
+    });
+    harness.orchestrator.onWorkerEvent('i-codex-session-continuation', {
+      timestamp_ms: harness.now.value + 250,
+      event: CANONICAL_EVENT.codex.sideOutput,
+      worker_instance_id: workerInstanceId,
+      codex_app_server_pid: 1001,
+      detail: 'late prior-process output'
+    });
+    harness.orchestrator.onWorkerEvent('i-codex-session-continuation', {
+      timestamp_ms: harness.now.value + 300,
+      event: CANONICAL_EVENT.codex.turnStarted,
+      worker_instance_id: workerInstanceId,
+      codex_app_server_pid: 2002,
+      thread_id: 'thread-2',
+      turn_id: 'turn-2',
+      session_id: 'session-2'
+    });
+
+    expect(harness.orchestrator.getStateSnapshot().running.get('i-codex-session-continuation')).toMatchObject({
+      codex_app_server_pid: '2002',
+      worker_process_pid: null,
+      thread_id: 'thread-2',
+      turn_id: 'turn-2',
+      session_id: 'session-2',
+      turn_count: 2,
+      quarantined_event_count: 1,
+      quarantined_events: [
+        expect.objectContaining({
+          codex_app_server_pid: '1001',
+          active_codex_app_server_pid: '2002',
+          reason: 'worker_identity_mismatch'
+        })
+      ]
+    });
+  });
+
   it('accepts provider-neutral continuation turns and quarantines only stale prior-process activity', async () => {
     const harness = createHarness();
     harness.tracker.fetch_candidate_issues.mockResolvedValue([
