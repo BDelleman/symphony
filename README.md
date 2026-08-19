@@ -37,6 +37,9 @@ implements the base contract in `SPEC.md` plus documented local extensions in
 	npm test
 	```
 
+	Run `npm run test:integration` when changing git, worktree, or
+	process-heavy behavior.
+
 	Use `npm run test:full` for release or Agent Review evidence.
 
 ## Workflow Learning Path
