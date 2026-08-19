@@ -1216,7 +1216,10 @@ Error mapping (recommended normalized categories):
 
 ### 10.7 Agent Runner Contract
 
-The `Agent Runner` wraps workspace + prompt + app-server client.
+The `Agent Runner` wraps workspace + prompt + a provider-specific client. The
+default implementation is the Codex app-server adapter. A startup-only
+`claude-cli` adapter may be selected with `SYMPHONY_AGENT_RUNTIME=claude-cli`;
+unknown runtime names must fail configuration validation.
 
 Behavior:
 
@@ -1231,6 +1234,39 @@ Behavior:
 Note:
 
 - Workspaces are intentionally preserved after successful runs.
+
+### 10.8 Claude CLI Adapter
+
+The opt-in Claude adapter is local-only on macOS and Linux and must not
+impersonate the Codex app-server protocol. It spawns a directly resolved
+executable with `shell: false`, writes prompts to stdin, parses `stream-json`,
+and requires one successful terminal result, a zero exit, matching session
+identity, stream EOF, and process close. The supported CLI version is pinned to
+`2.1.224`; upgrades require fixture and live contract evidence.
+
+The fixed command contract is `--print --input-format text --output-format
+stream-json --verbose --setting-sources user --model <pinned-model>
+--dangerously-skip-permissions`, plus exact `--resume <uuid>` only for later
+outer-loop turns in the same worker attempt. The adapter does not accept tool,
+turn, budget, bare-mode, fallback, or arbitrary extra flags. Prompts and
+protocol lines are limited to 8 MiB. `DISABLE_AUTOUPDATER=1` and
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` are injected into every child.
+
+By default, doctor and runtime require first-party Claude Team/Enterprise
+subscription authentication and reject API key, token, base URL,
+`apiKeyHelper`, and cloud-provider selectors. Non-subscription routing requires
+the explicit `SYMPHONY_CLAUDE_ALLOW_NON_SUBSCRIPTION_AUTH=true` override.
+Authentication diagnostics retain only login status, auth method, API provider,
+and subscription type.
+
+Claude token, turn, cache, effective-model, and estimated-cost values are
+passive provider telemetry. They must never populate Codex enforcement totals
+or activate budget enforcement. Prompts, raw NDJSON, tool payloads, raw stderr,
+and reconstructed transcripts are not persisted. Configuration and protocol
+violations fail without retry; provider rate limits, overloads, transient
+network/server failures, crashes, and absolute timeouts remain eligible for the
+existing bounded Symphony retry policy. No cross-runtime fallback or
+cross-attempt native resume is allowed.
 
 ## 11. Issue Tracker Integration Contract (Linear-Compatible)
 

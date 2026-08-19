@@ -1,5 +1,5 @@
 import type { CodexRunner } from '../codex';
-import type { CodexRunnerEvent } from '../codex';
+import { CodexAgentRunner, type AgentRunner, type AgentRunnerEvent } from '../agent';
 import type { CodexCancellationOutcome } from '../codex/types';
 import type { StructuredLogger } from '../observability';
 import { CANONICAL_EVENT } from '../observability/events';
@@ -34,6 +34,7 @@ interface WorkerCancellationAttemptResult {
 export interface LocalRunnerBridgeOptions {
   workspaceManager: WorkspaceManager;
   codexRunner: CodexRunner;
+  agentRunner?: AgentRunner;
   config: EffectiveConfig;
   promptTemplate: string;
   renderPrompt?: (params: { issue: Issue; attempt: number | null }) => Promise<string>;
@@ -42,12 +43,13 @@ export interface LocalRunnerBridgeOptions {
   onWorkerExit?: (
     params: { issue_id: string; reason: 'normal' | 'abnormal'; error?: string; worker_handle?: unknown } & WorkerExitDetails
   ) => Promise<void> | void;
-  onWorkerEvent?: (params: { issue_id: string; event: CodexRunnerEvent }) => void;
+  onWorkerEvent?: (params: { issue_id: string; event: AgentRunnerEvent }) => void;
 }
 
 export class LocalRunnerBridge {
   private readonly workspaceManager: WorkspaceManager;
   private readonly codexRunner: CodexRunner;
+  private readonly agentRunner: AgentRunner;
   private config: EffectiveConfig;
   private renderPrompt: (params: { issue: Issue; attempt: number | null }) => Promise<string>;
   private readonly logger?: StructuredLogger;
@@ -59,6 +61,7 @@ export class LocalRunnerBridge {
   constructor(options: LocalRunnerBridgeOptions) {
     this.workspaceManager = options.workspaceManager;
     this.codexRunner = options.codexRunner;
+    this.agentRunner = options.agentRunner ?? new CodexAgentRunner(options.codexRunner);
     this.config = options.config;
     if (options.renderPrompt) {
       this.renderPrompt = options.renderPrompt;
@@ -90,6 +93,9 @@ export class LocalRunnerBridge {
     recover_workspace_attempt_residue?: boolean;
   }): Promise<SpawnWorkerResult> {
     const workerHost = params.worker_host ?? null;
+    if (workerHost && !this.agentRunner.capabilities.remote_worker) {
+      return { ok: false, error: 'claude_remote_worker_unsupported' };
+    }
     let workspace;
     try {
       workspace = await this.workspaceManager.ensureWorkspace(params.issue.identifier);
@@ -162,6 +168,9 @@ export class LocalRunnerBridge {
     previous_session_id: string | null;
     recovery_prompt: string;
   }): Promise<SpawnWorkerResult> {
+    if (!this.agentRunner.capabilities.missing_tool_output_recovery) {
+      return { ok: false, error: 'claude_missing_tool_output_recovery_unsupported' };
+    }
     const workerHost = params.worker_host ?? null;
     let workspace;
     try {
@@ -390,13 +399,14 @@ export class LocalRunnerBridge {
       worker_host: worker_host ?? undefined,
       workspaceManager: this.workspaceManager,
       codexRunner: this.codexRunner,
+      agentRunner: this.agentRunner,
       config: this.config,
       renderPrompt: this.renderPrompt,
       resumeContext: resume_context,
       recoverWorkspaceAttemptResidue,
       issueStateFetcher: this.issueStateFetcher,
       cancellationSignal,
-      onCodexEvent: (event) => {
+      onAgentEvent: (event) => {
         this.onWorkerEvent?.({ issue_id: issue.id, event: { ...event, worker_instance_id: workerInstanceId } });
       }
     });
@@ -435,7 +445,8 @@ export class LocalRunnerBridge {
       worker_instance_id: workerInstanceId,
       completion_reason: result.completion_reason,
       refreshed_state: result.refreshed_state,
-      session_id: result.session_id
+      session_id: result.session_id,
+      retryable: result.retryable
     });
   }
 
@@ -482,7 +493,15 @@ export class LocalRunnerBridge {
       recoveryPrompt: params.recovery_prompt,
       cancellationSignal,
       onCodexEvent: (event) => {
-        this.onWorkerEvent?.({ issue_id: params.issue.id, event: { ...event, worker_instance_id: workerInstanceId } });
+        this.onWorkerEvent?.({
+          issue_id: params.issue.id,
+          event: {
+            ...event,
+            agent_runtime: 'codex-app-server',
+            worker_process_pid: event.codex_app_server_pid,
+            worker_instance_id: workerInstanceId
+          }
+        });
       }
     });
     onRunnerSettled(result.cancellation_outcome ?? null);

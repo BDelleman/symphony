@@ -100,7 +100,15 @@ export const CANONICAL_EVENT = {
   agentRunner: {
     attemptStarted: 'agent_runner.attempt.started',
     attemptCompleted: 'agent_runner.attempt.completed',
-    attemptFailed: 'agent_runner.attempt.failed'
+    attemptFailed: 'agent_runner.attempt.failed',
+    processStarted: 'agent_runner.process.started',
+    sessionStarted: 'agent_runner.session.started',
+    turnStarted: 'agent_runner.turn.started',
+    activity: 'agent_runner.activity',
+    turnCompleted: 'agent_runner.turn.completed',
+    turnFailed: 'agent_runner.turn.failed',
+    turnCancelled: 'agent_runner.turn.cancelled',
+    turnTimedOut: 'agent_runner.turn.timed_out'
   },
   workspace: {
     provisionStart: 'workspace.provision.start',
