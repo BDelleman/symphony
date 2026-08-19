@@ -101,6 +101,8 @@ Open:
 
 - Dashboard: `http://127.0.0.1:3000/`
 
+Press `Ctrl+C` in the terminal running the command to stop the local dashboard.
+
 ### Dynamic Port
 
 ```bash
