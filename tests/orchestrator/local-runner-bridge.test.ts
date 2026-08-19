@@ -358,6 +358,57 @@ describe('LocalRunnerBridge integration', () => {
     });
   });
 
+  it('records cancellation as normal completion when tracker confirms a handoff', async () => {
+    const logs: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const config = makeConfig();
+    config.tracker.active_states = ['Todo', 'Agent Review'];
+    config.tracker.handoff_states = ['Agent Review'];
+    const bridge = new LocalRunnerBridge({
+      workspaceManager: {
+        ensureWorkspace: vi.fn(async () => ({ path: '/tmp/symphony/ABC-1', workspace_key: 'ABC-1', created_now: true })),
+        prepareAttempt: vi.fn(async () => {}),
+        finalizeAttempt: vi.fn(async () => {}),
+        cleanupWorkspace: vi.fn(async () => true)
+      } as unknown as WorkspaceManager,
+      codexRunner: {} as CodexRunner,
+      agentRunner: {
+        runtime: 'claude-cli',
+        capabilities: {
+          native_resume: 'within-attempt',
+          missing_tool_output_recovery: false,
+          remote_worker: false,
+          enforcement_usage: false
+        },
+        startSessionAndRunTurn: vi.fn(async () => ({
+          runtime: 'claude-cli',
+          status: 'cancelled',
+          session_id: 'claude-session',
+          thread_id: 'claude:claude-session',
+          turn_id: 'claude-turn',
+          last_event: CANONICAL_EVENT.agentRunner.turnCancelled,
+          error_code: REASON_CODES.workerCancelRequested,
+          cancellation_outcome: 'graceful_exit',
+          retryable: false
+        }))
+      } as any,
+      config,
+      issueStateFetcher: vi.fn(async () => [makeIssue({ state: 'Agent Review' })]),
+      promptTemplate: 'Issue {{ issue.identifier }} attempt {{ attempt }}',
+      logger: { log: ({ event, context }) => logs.push({ event, context: context ?? {} }) }
+    });
+
+    const spawned = await bridge.spawnWorker({ issue: makeIssue(), attempt: null });
+    expect(spawned.ok).toBe(true);
+    if (!spawned.ok) throw new Error('expected spawn success');
+    await (spawned.worker_handle as { promise: Promise<void> }).promise;
+
+    expect(logs.some((entry) => entry.event === CANONICAL_EVENT.agentRunner.attemptFailed)).toBe(false);
+    expect(logs.find((entry) => entry.event === CANONICAL_EVENT.agentRunner.attemptCompleted)?.context).toMatchObject({
+      completion_reason: REASON_CODES.handoffStateReached,
+      refreshed_state: 'Agent Review'
+    });
+  });
+
   it('stops fresh Agent Review runs after routing to the next workflow state', async () => {
     const routeCases = [
       { targetState: 'In Progress', expectedReason: REASON_CODES.freshDispatchStateRouted },

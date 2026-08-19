@@ -160,6 +160,32 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
       }
 
       if (turnResult.status !== 'completed') {
+        if (turnResult.status === 'cancelled') {
+          try {
+            const refreshedIssues = await input.issueStateFetcher([currentIssue.id]);
+            const refreshedIssue = refreshedIssues.find((issue) => issue.id === currentIssue.id) ?? refreshedIssues[0];
+            if (refreshedIssue && isStateListed(refreshedIssue.state, input.config.tracker.terminal_states)) {
+              return {
+                reason: 'normal',
+                session_id: turnResult.session_id,
+                completion_reason: REASON_CODES.terminalStateReached,
+                refreshed_state: refreshedIssue.state,
+                cancellation_outcome: turnResult.cancellation_outcome
+              };
+            }
+            if (refreshedIssue && isStateListed(refreshedIssue.state, input.config.tracker.handoff_states)) {
+              return {
+                reason: 'normal',
+                session_id: turnResult.session_id,
+                completion_reason: REASON_CODES.handoffStateReached,
+                refreshed_state: refreshedIssue.state,
+                cancellation_outcome: turnResult.cancellation_outcome
+              };
+            }
+          } catch {
+            // Preserve the cancellation failure when tracker state cannot confirm a successful handoff.
+          }
+        }
         const error =
           turnResult.error_code === REASON_CODES.turnInputRequired
             ? `${turnResult.error_code}: ${

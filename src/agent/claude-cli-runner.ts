@@ -814,7 +814,7 @@ function partialUsageSnapshot(
     tool_counts: { ...toolCounts },
     mcp_counts: { ...mcpCounts },
     updated_at: updatedAt,
-    missing_reason: null,
+    missing_reason: 'live_lower_bound_until_terminal_result',
     reconciliation_delta: null,
     model_usage: []
   };
@@ -1955,23 +1955,9 @@ export class ClaudeCliRunner implements AgentRunner {
               mcp_counts: { ...mcpCounts }
             };
           }
-          emit({
-            event: CANONICAL_EVENT.agentRunner.activity,
-            session_id: state.sessionId ?? undefined,
-            turn_id: turnId,
-            detail: eventName,
-            provider_usage: latestPartialUsage ?? undefined
-          });
           return;
         }
         if (type === 'user' || type === 'system') {
-          if (type === 'system') state.unknownEventCount += 1;
-          emit({
-            event: CANONICAL_EVENT.agentRunner.activity,
-            session_id: state.sessionId ?? undefined,
-            turn_id: turnId,
-            detail: eventName
-          });
           return;
         }
         state.unknownEventCount += 1;
@@ -2075,11 +2061,9 @@ export class ClaudeCliRunner implements AgentRunner {
           }
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
-        failProtocol(
-          escapedDescendants.some(processExists)
-            ? 'claude_escaped_descendant_cleanup_failed'
-            : 'claude_escaped_descendant_detected'
-        );
+        if (escapedDescendants.some(processExists)) {
+          failProtocol('claude_escaped_descendant_cleanup_failed');
+        }
       }
       const stderrDigest = stderrBytes > 0 ? stderrHash.digest('hex') : null;
       const terminal = state.terminalResult;
@@ -2247,17 +2231,6 @@ export class ClaudeCliRunner implements AgentRunner {
       this.retainSessionBinding(sessionId, binding, fingerprint);
 
       const providerUsage = finalUsage!;
-      const reconciliation = providerUsage.reconciliation_delta;
-      if (reconciliation && Object.values(reconciliation).some((value) => value !== 0)) {
-        emit({
-          event: CANONICAL_EVENT.agentRunner.activity,
-          session_id: sessionId,
-          thread_id: `claude:${sessionId}`,
-          turn_id: turnId,
-          detail: 'claude_usage_reconciliation_mismatch',
-          provider_usage: providerUsage
-        });
-      }
       for (const observedModel of effectiveModelsFromResult(terminal, state.effectiveModel)) {
         if (observedModel === this.options.model) continue;
         if (emittedReroutes.has(observedModel)) continue;

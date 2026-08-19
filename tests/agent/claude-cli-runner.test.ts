@@ -158,6 +158,10 @@ process.stdin.on('end', () => {
   }
   if (process.env.MOCK_API_RETRY === '1') process.stdout.write(JSON.stringify({ type: 'system', subtype: 'api_retry', session_id: '${SESSION_ID}', error: 'overloaded' }) + '\\n');
   if (process.env.MOCK_PERMISSION_DENIED_EVENT === '1') process.stdout.write(JSON.stringify({ type: 'system', subtype: 'permission_denied', session_id: '${SESSION_ID}', tool_use_id: 'denied-1', tool_name: 'Bash' }) + '\\n');
+  if (process.env.MOCK_SYSTEM_EVENTS === '1') {
+    process.stdout.write(JSON.stringify({ type: 'system', subtype: 'thinking_tokens', session_id: '${SESSION_ID}' }) + '\\n');
+    process.stdout.write(JSON.stringify({ type: 'system', subtype: 'task_notification', session_id: '${SESSION_ID}' }) + '\\n');
+  }
   if (process.env.MOCK_MODE === 'error-result') { result.subtype = 'error_during_execution'; result.is_error = true; }
   if (process.env.MOCK_MODE === 'missing-is-error') delete result.is_error;
   if (process.env.MOCK_MODE === 'wrong-is-error') result.is_error = 'false';
@@ -586,6 +590,7 @@ describe('ClaudeCliRunner', () => {
       provider_turn_count: 2,
       estimated_cost_usd: null
     });
+    expect(partials).toHaveLength(3);
     expect(result.provider_usage).toMatchObject({
       status: 'final',
       confidence: 'provider_result',
@@ -593,7 +598,24 @@ describe('ClaudeCliRunner', () => {
       tool_counts: { Read: 1 },
       reconciliation_delta: { provider_turn_count: 1 }
     });
-    expect(events.some((event) => event.detail === 'claude_usage_reconciliation_mismatch')).toBe(true);
+    expect(events.some((event) => event.detail === 'claude_usage_reconciliation_mismatch')).toBe(false);
+  });
+
+  it('treats ordinary system activity as known protocol events', async () => {
+    const fixture = createFixture();
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_SYSTEM_EVENTS: '1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      provider_usage: { unknown_event_count: 0 }
+    });
   });
 
   it('ignores auxiliary result messages but still requires one primary result', async () => {
@@ -1132,7 +1154,7 @@ describe('ClaudeCliRunner', () => {
     });
   });
 
-  it('fails the invocation and kills a descendant that escapes the provider process group', async () => {
+  it('kills an escaped descendant without failing an otherwise successful invocation', async () => {
     const fixture = createFixture();
     const pidFile = path.join(fixture.root, 'escaped.pid');
     const result = await new ClaudeCliRunner({
@@ -1148,8 +1170,7 @@ describe('ClaudeCliRunner', () => {
     }).startSessionAndRunTurn({ ...startInput(fixture.root), turnTimeoutMs: 5_000 });
 
     expect(result).toMatchObject({
-      status: 'failed',
-      error_code: 'claude_escaped_descendant_detected',
+      status: 'completed',
       retryable: false
     });
     const escapedPid = Number(fs.readFileSync(pidFile, 'utf8'));
