@@ -53,10 +53,31 @@ describe('worktree_bootstrap.py', () => {
 
     run('git', ['worktree', 'add', target, '-b', 'feature/NIE-BOOTSTRAP'], primary);
 
-    const result = runBootstrap(['--allow-sensitive'], target);
+    const result = runBootstrap([], target);
     expect(result.status).toBe(0);
     expect(fs.existsSync(path.join(target, '.cache', 'artifact.txt'))).toBe(true);
   }, GIT_WORKTREE_INTEGRATION_TEST_TIMEOUT_MS);
+
+  it('treats a standalone clone with an inactive include policy as a safe no-op', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-clone-bootstrap-'));
+    cleanupPaths.push(root);
+    const source = path.join(root, 'source');
+    const clone = path.join(root, 'clone');
+    fs.mkdirSync(source, { recursive: true });
+    run('git', ['init'], source);
+    run('git', ['config', 'user.email', 'test@example.com'], source);
+    run('git', ['config', 'user.name', 'Test User'], source);
+    run('git', ['checkout', '-b', 'main'], source);
+    fs.writeFileSync(path.join(source, '.worktreeinclude'), '# no ignored artifacts requested\n');
+    fs.writeFileSync(path.join(source, 'README.md'), 'root\n');
+    run('git', ['add', '.worktreeinclude', 'README.md'], source);
+    run('git', ['commit', '-m', 'init'], source);
+    run('git', ['clone', '--no-hardlinks', source, clone], root);
+
+    const result = runBootstrap([], clone);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('include file has no active patterns; copied nothing');
+  });
 
   it('uses current working directory as default target', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-worktree-bootstrap-'));
@@ -127,5 +148,59 @@ describe('worktree_bootstrap.py', () => {
     const summary = JSON.parse(summaryLine as string) as { copied: number; selected: number };
     expect(summary.selected).toBe(1);
     expect(summary.copied).toBe(0);
+  });
+
+  it('hard-denies dotenv, auth-store, package-manager auth, and key material even when explicitly included', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-worktree-bootstrap-sensitive-'));
+    cleanupPaths.push(root);
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'target');
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+    run('git', ['init'], source);
+    run('git', ['config', 'user.email', 'test@example.com'], source);
+    run('git', ['config', 'user.name', 'Test User'], source);
+    run('git', ['init'], target);
+    fs.writeFileSync(path.join(source, '.gitignore'), '.env*\n.claude.json\n.mcp.json\n.npmrc\n.pnpmrc\n.git-credentials\ncredentials.json\n*service-account*.json\n*.pem\ntokenizer-cache.bin\n');
+    fs.writeFileSync(path.join(source, '.worktreeinclude'), '.env*\n.claude.json\n.mcp.json\n.npmrc\n.pnpmrc\n.git-credentials\ncredentials.json\n*service-account*.json\n*.pem\ntokenizer-cache.bin\n');
+    for (const name of ['.env', '.env.local', '.claude.json', '.mcp.json', '.npmrc', '.pnpmrc', '.git-credentials', 'credentials.json', 'deploy-service-account.json', 'client.pem', 'tokenizer-cache.bin']) {
+      fs.writeFileSync(path.join(source, name), 'must-not-copy\n');
+    }
+
+    const result = runBootstrap(['--source', source, '--target', target], root);
+    expect(result.status).toBe(0);
+    for (const name of ['.env', '.env.local', '.claude.json', '.mcp.json', '.npmrc', '.pnpmrc', '.git-credentials', 'credentials.json', 'deploy-service-account.json', 'client.pem']) {
+      expect(fs.existsSync(path.join(target, name))).toBe(false);
+    }
+    expect(fs.existsSync(path.join(target, 'tokenizer-cache.bin'))).toBe(true);
+    expect(result.stdout).toContain('sensitive path is hard-denied');
+  });
+
+  it('refuses selected source symlinks consistently with the TypeScript bootstrap path', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-worktree-bootstrap-symlink-'));
+    cleanupPaths.push(root);
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'target');
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+    run('git', ['init'], source);
+    run('git', ['config', 'user.email', 'test@example.com'], source);
+    run('git', ['config', 'user.name', 'Test User'], source);
+    run('git', ['init'], target);
+    fs.writeFileSync(path.join(source, '.gitignore'), 'cache-link\n');
+    fs.writeFileSync(path.join(source, '.worktreeinclude'), 'cache-link\n');
+    fs.writeFileSync(path.join(source, 'cache-target'), 'ignored artifact\n');
+    fs.symlinkSync('cache-target', path.join(source, 'cache-link'));
+
+    const result = runBootstrap(['--source', source, '--target', target], root);
+    expect(result.status).toBe(2);
+    expect(result.stdout).toContain('refusing to copy symlink: cache-link');
+    expect(fs.existsSync(path.join(target, 'cache-link'))).toBe(false);
+  });
+
+  it('rejects the removed legacy --allow-sensitive escape hatch', () => {
+    const result = runBootstrap(['--allow-sensitive'], process.cwd());
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('unrecognized arguments: --allow-sensitive');
   });
 });

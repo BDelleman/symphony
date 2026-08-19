@@ -46,6 +46,19 @@ function renderBranchName(template: string, identifier: string): string {
   return template.replace(/\{\{\s*issue\.identifier\s*\}\}/g, sanitizeBranchIdentifier(identifier));
 }
 
+function assertCredentialFreeRemote(remote: string): void {
+  if (!remote.includes('://')) return;
+  try {
+    const parsed = new URL(remote);
+    if (parsed.password || ((parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.username)) {
+      throw new WorkspaceError('workspace_provision_failed', 'workspace_remote_contains_credentials');
+    }
+  } catch (error) {
+    if (error instanceof WorkspaceError) throw error;
+    throw new WorkspaceError('workspace_provision_failed', 'workspace_remote_invalid');
+  }
+}
+
 async function pathExists(targetPath: string): Promise<boolean> {
   try {
     await fs.stat(targetPath);
@@ -372,6 +385,7 @@ export class WorktreeProvisioner implements WorkspaceProvisioner {
 interface CloneProvisionerOptions {
   repoRoot: string;
   baseRef: string;
+  branchTemplate: string;
   teardownMode: 'remove_worktree' | 'keep';
   runGit?: RunGit;
   fsOps?: {
@@ -382,6 +396,7 @@ interface CloneProvisionerOptions {
 export class CloneProvisioner implements WorkspaceProvisioner {
   private readonly repoRoot: string;
   private readonly baseRef: string;
+  private readonly branchTemplate: string;
   private readonly teardownMode: 'remove_worktree' | 'keep';
   private readonly runGit: RunGit;
   private readonly rmPath: typeof fs.rm;
@@ -389,6 +404,7 @@ export class CloneProvisioner implements WorkspaceProvisioner {
   constructor(options: CloneProvisionerOptions) {
     this.repoRoot = options.repoRoot;
     this.baseRef = options.baseRef;
+    this.branchTemplate = options.branchTemplate;
     this.teardownMode = options.teardownMode;
     this.runGit = options.runGit ?? defaultRunGit;
     this.rmPath = options.fsOps?.rm ?? fs.rm;
@@ -396,6 +412,11 @@ export class CloneProvisioner implements WorkspaceProvisioner {
 
   async provision(params: WorkspaceProvisionContext): Promise<WorkspaceProvisionResult> {
     await assertGitRepoRoot(this.repoRoot);
+    const branchName = renderBranchName(this.branchTemplate, params.identifier);
+    const upstream = await this.runGit({ cwd: this.repoRoot, args: ['config', '--get', 'remote.origin.url'] });
+    const upstreamRemote = upstream.ok && upstream.stdout.trim() ? upstream.stdout.trim() : this.repoRoot;
+    assertCredentialFreeRemote(upstreamRemote);
+    const cloneBranch = this.baseRef.replace(/^origin\//, '');
     const existingWorkspaceStat = await fs.stat(params.workspacePath).catch(() => null);
     if (existingWorkspaceStat?.isDirectory()) {
       const gitMarker = path.join(params.workspacePath, '.git');
@@ -408,18 +429,28 @@ export class CloneProvisioner implements WorkspaceProvisioner {
           cwd: params.workspacePath,
           args: ['config', '--get', 'remote.origin.url']
         });
-        if (topLevel.ok && remote.ok) {
+        const branch = await this.runGit({
+          cwd: params.workspacePath,
+          args: ['rev-parse', '--abbrev-ref', 'HEAD']
+        });
+        if (topLevel.ok && remote.ok && branch.ok) {
           const remoteValue = remote.stdout.trim();
           const resolvedRemote = path.resolve(remoteValue);
-          if (remoteValue === this.repoRoot || resolvedRemote === this.repoRoot) {
+          const workspaceMatches = path.resolve(topLevel.stdout.trim()) === path.resolve(params.workspacePath);
+          const branchMatches = branch.stdout.trim() === branchName;
+          const remoteMatches =
+            remoteValue === this.repoRoot || resolvedRemote === this.repoRoot || remoteValue === upstreamRemote;
+          if (workspaceMatches && branchMatches && remoteMatches) {
             await writeProvisionSentinel({
               workspacePath: params.workspacePath,
               provisionerType: 'clone',
-              repoRoot: this.repoRoot
+              repoRoot: this.repoRoot,
+              branchName
             });
             return {
               status: 'reused',
               provisioner_type: 'clone',
+              branch_name: branchName,
               repo_root: this.repoRoot,
               workspace_exists: true,
               workspace_git_status: 'unknown',
@@ -442,21 +473,39 @@ export class CloneProvisioner implements WorkspaceProvisioner {
     await this.rmPath(params.workspacePath, { recursive: true, force: true });
     const clone = await this.runGit({
       cwd: process.cwd(),
-      args: ['clone', '--branch', this.baseRef, '--single-branch', this.repoRoot, params.workspacePath]
+      args: ['clone', '--no-hardlinks', '--branch', cloneBranch, '--single-branch', this.repoRoot, params.workspacePath]
     });
     if (!clone.ok) {
       throw new WorkspaceError('workspace_provision_failed', clone.stderr.trim() || 'clone_failed');
+    }
+    const setOrigin = await this.runGit({
+      cwd: params.workspacePath,
+      args: ['remote', 'set-url', 'origin', upstreamRemote]
+    });
+    if (!setOrigin.ok) {
+      await this.rmPath(params.workspacePath, { recursive: true, force: true });
+      throw new WorkspaceError('workspace_provision_failed', setOrigin.stderr.trim() || 'clone_origin_update_failed');
+    }
+    const createBranch = await this.runGit({
+      cwd: params.workspacePath,
+      args: ['checkout', '-b', branchName]
+    });
+    if (!createBranch.ok) {
+      await this.rmPath(params.workspacePath, { recursive: true, force: true });
+      throw new WorkspaceError('workspace_provision_failed', createBranch.stderr.trim() || 'clone_branch_create_failed');
     }
 
     await writeProvisionSentinel({
       workspacePath: params.workspacePath,
       provisionerType: 'clone',
-      repoRoot: this.repoRoot
+      repoRoot: this.repoRoot,
+      branchName
     });
 
     return {
       status: 'provisioned',
       provisioner_type: 'clone',
+      branch_name: branchName,
       repo_root: this.repoRoot,
       workspace_exists: true,
       workspace_git_status: 'unknown',
@@ -503,6 +552,7 @@ export function createWorkspaceProvisioner(config: {
     return new CloneProvisioner({
       repoRoot: config.repo_root ?? '',
       baseRef: config.base_ref,
+      branchTemplate: config.branch_template,
       teardownMode: config.teardown_mode === 'keep' ? 'keep' : 'remove_worktree'
     });
   }
