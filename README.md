@@ -125,7 +125,7 @@ symphony doctor --json
 symphony doctor --ci
 ```
 
-`symphony doctor` is non-mutating unless `--fix` is supplied.
+`symphony doctor` is non-mutating unless `--fix` is supplied or the explicit `--claude-smoke --linear-issue <id>` mode is selected.
 
 `symphony doctor` checks the PATH-linked `symphony` shim, the referenced
 checkout and built CLI entrypoint, local workflow resolution, effective workflow
