@@ -1620,7 +1620,8 @@ function checkBaseRef(repoRoot: string, baseRef: string): DoctorFindingInput {
 }
 
 function checkCloneBaseRef(repoRoot: string, baseRef: string): DoctorFindingInput {
-  const branchRef = `refs/heads/${baseRef}`;
+  const cloneRef = baseRef.replace(/^origin\//, '');
+  const branchRef = `refs/heads/${cloneRef}`;
   const branch = runGit(repoRoot, ['rev-parse', '--verify', '--quiet', `${branchRef}^{commit}`]);
   if (branch.ok) {
     return {
@@ -1633,7 +1634,7 @@ function checkCloneBaseRef(repoRoot: string, baseRef: string): DoctorFindingInpu
     };
   }
 
-  const tagRef = `refs/tags/${baseRef}`;
+  const tagRef = `refs/tags/${cloneRef}`;
   const tag = runGit(repoRoot, ['rev-parse', '--verify', '--quiet', `${tagRef}^{commit}`]);
   if (tag.ok) {
     return {

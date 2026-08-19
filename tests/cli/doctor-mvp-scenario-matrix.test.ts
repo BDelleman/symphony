@@ -426,10 +426,11 @@ describe('Doctor MVP real CLI scenario matrix', () => {
 
     const remoteTrackingCloneProject = await createProject(cloneWorkflow(gitRoot, { baseRef: 'origin/main' }));
     const remoteTrackingClone = runDoctor(remoteTrackingCloneProject, [guardrailFlag], { PATH: binDir });
-    expect(remoteTrackingClone.status).toBe(2);
+    expect(remoteTrackingClone.status).toBe(0);
     expect(check(remoteTrackingClone.json, 'workspace.base_ref')).toMatchObject({
-      status: 'failure',
-      reason: 'base_ref_unavailable'
+      status: 'ok',
+      reason: 'base_ref_exists',
+      details: { baseRef: 'origin/main', ref: 'refs/heads/main' }
     });
 
     const dirtyGitRoot = await createGitRepo({ dirty: true });
