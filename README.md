@@ -133,6 +133,9 @@ be checked. Init copies portable skills into `.codex/skills/`, where Codex can
 load project-local skills; `.symphony/skills/` and `.symphony/prompts/` remain
 reserved, git-visible paths and are not active runtime skill-loading locations.
 
+Provider-readiness checks report only whether a credential is present and which
+source supplied it; they never print credential values.
+
 Exit codes are stable for automation:
 
 - `0`: clean, no findings.
