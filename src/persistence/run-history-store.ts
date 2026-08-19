@@ -234,6 +234,8 @@ export class RunHistoryStore {
     issue_run_id?: string | null;
     attempt_id?: string | null;
     terminal_status: RunTerminalStatus;
+    process_status?: RunTerminalStatus;
+    workflow_outcome?: string;
     error_code?: string | null;
     terminal_reason_code?: string | null;
     terminal_reason_detail?: string | null;
@@ -254,8 +256,8 @@ export class RunHistoryStore {
     const handoffReached =
       terminalReasonCode === REASON_CODES.handoffStateReached ||
       terminalReasonCode === REASON_CODES.handoffRelease;
-    const processStatus: RunTerminalStatus = handoffReached ? 'cancelled' : params.terminal_status;
-    const workflowOutcome = handoffReached ? 'handoff_reached' : params.terminal_status;
+    const processStatus: RunTerminalStatus = params.process_status ?? (handoffReached ? 'cancelled' : params.terminal_status);
+    const workflowOutcome = params.workflow_outcome ?? (handoffReached ? 'handoff_reached' : params.terminal_status);
     const completedAt = asIso(this.nowMs());
     const issueRunId = params.issue_run_id ?? this.identityProjection.lookupIssueRunIdForRun(params.run_id);
     this.transaction(() => {

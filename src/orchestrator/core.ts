@@ -49,6 +49,7 @@ import {
 import {
   addRuntimeSecondsFromEntry as coordinateAddRuntimeSecondsFromEntry,
   completeRunRecord as coordinateCompleteRunRecord,
+  successfulWorkflowTerminationProjection,
   terminateRunningIssue as coordinateTerminateRunningIssue,
   type RunCompletionCoordinatorContext,
   workerTerminationAllowsRecovery as coordinateWorkerTerminationAllowsRecovery,
@@ -2439,11 +2440,16 @@ export class OrchestratorCore {
   }
 
   private emitMappedPhaseMarker(issue_id: string, workerEvent: WorkerObservabilityEvent): void {
-    const mapped = this.mapPhaseForWorkerEvent(workerEvent.event);
+    const running = this.state.running.get(issue_id);
+    const mapped =
+      workerEvent.event === CANONICAL_EVENT.agentRunner.turnCancelled &&
+      running?.termination &&
+      successfulWorkflowTerminationProjection(running.termination.reason)
+        ? 'completed'
+        : this.mapPhaseForWorkerEvent(workerEvent.event);
     if (!mapped) {
       return;
     }
-    const running = this.state.running.get(issue_id);
     this.emitPhaseMarker(issue_id, {
       at_ms: workerEvent.timestamp_ms,
       phase: mapped,

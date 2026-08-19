@@ -229,7 +229,9 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     expect(snapshot.retry_attempts.has('i-stale-handoff')).toBe(false);
     expect(completedRuns).toEqual([
       expect.objectContaining({
-        terminal_status: 'cancelled',
+        terminal_status: 'succeeded',
+        process_status: 'cancelled',
+        workflow_outcome: 'handoff_reached',
         error_code: REASON_CODES.handoffRelease,
         terminal_reason_code: REASON_CODES.handoffRelease,
         session_id: 'implementation-session',
@@ -239,8 +241,8 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     ]);
     expect(stateTransitions.filter((transition) => transition.to_status !== 'running')).toEqual([
       expect.objectContaining({
-        to_status: 'cancelled',
-        status: 'cancelled',
+        to_status: 'handoff_reached',
+        status: 'succeeded',
         reason_code: REASON_CODES.handoffRelease
       })
     ]);
@@ -283,6 +285,58 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     expect(freshReview?.retry_attempt).toBe(0);
     expect(freshReview?.thread_id).toBeNull();
     expect(freshReview?.session_id).toBeNull();
+  });
+
+  it('records Human Review as a successful handoff while the stopped process remains cancelled', async () => {
+    const completedRuns: Array<Parameters<OrchestratorPersistencePort['completeRun']>[0]> = [];
+    let harness: Harness;
+    harness = createHarness({
+      configOverrides: {
+        active_states: ['Todo', 'In Progress', 'Agent Review'],
+        handoff_states: ['Agent Review', 'Human Review'],
+        fresh_dispatch_states: ['Agent Review']
+      },
+      terminateWorker: async ({ issue_id, cleanup_workspace, reason }) => {
+        harness.terminated.push({ issue_id, cleanup_workspace, reason });
+        harness.orchestrator.onWorkerEvent(issue_id, {
+          timestamp_ms: harness.now.value + 1,
+          event: CANONICAL_EVENT.agentRunner.turnCancelled,
+          agent_runtime: 'claude-cli'
+        });
+        return makeTerminationResult({ cleanup_requested: cleanup_workspace, cleanup_succeeded: null });
+      },
+      persistence: {
+        startRun: async () => 'run-human-review-handoff',
+        recordSession: async () => undefined,
+        recordEvent: async () => undefined,
+        completeRun: async (params) => {
+          completedRuns.push(params);
+        }
+      }
+    });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-human-review-handoff', identifier: 'ABC-HUMAN', state: 'Agent Review' })
+    ]);
+    await harness.orchestrator.tick('interval');
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([
+      makeIssue({ id: 'i-human-review-handoff', identifier: 'ABC-HUMAN', state: 'Human Review' })
+    ]);
+
+    await harness.orchestrator.reconcileRunningIssues();
+
+    expect(harness.terminated).toEqual([
+      { issue_id: 'i-human-review-handoff', cleanup_workspace: false, reason: REASON_CODES.handoffStateReached }
+    ]);
+    expect(completedRuns).toEqual([
+      expect.objectContaining({
+        terminal_status: 'succeeded',
+        process_status: 'cancelled',
+        workflow_outcome: 'handoff_reached'
+      })
+    ]);
+    expect(harness.orchestrator.getStateSnapshot().phase_timeline?.get('i-human-review-handoff')?.at(-1)?.phase).toBe(
+      'completed'
+    );
   });
 
   it('treats mismatched worker exits during release as stale without confirming the releasing worker', async () => {
@@ -343,7 +397,9 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     expect(releaseStateDuringMismatch).toBe('requested');
     expect(completedRuns).toEqual([
       expect.objectContaining({
-        terminal_status: 'cancelled',
+        terminal_status: 'succeeded',
+        process_status: 'cancelled',
+        workflow_outcome: 'handoff_reached',
         error_code: REASON_CODES.handoffRelease
       })
     ]);
@@ -414,15 +470,17 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     const snapshot = harness.orchestrator.getStateSnapshot();
     expect(releaseStateDuringCleanup).toBe('requested');
     expect(harness.terminated).toEqual([
-      { issue_id: 'i-cleanup-release', cleanup_workspace: true, reason: 'terminal_state_transition' }
+      { issue_id: 'i-cleanup-release', cleanup_workspace: true, reason: REASON_CODES.terminalStateReached }
     ]);
     expect(snapshot.running.has('i-cleanup-release')).toBe(false);
     expect(snapshot.blocked_inputs.has('i-cleanup-release')).toBe(false);
     expect(snapshot.retry_attempts.has('i-cleanup-release')).toBe(false);
     expect(completedRuns).toEqual([
       expect.objectContaining({
-        terminal_status: 'cancelled',
-        error_code: 'terminal_state_transition'
+        terminal_status: 'succeeded',
+        process_status: 'cancelled',
+        workflow_outcome: 'succeeded',
+        error_code: REASON_CODES.terminalStateReached
       })
     ]);
   });
@@ -626,7 +684,9 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     ]);
     expect(completedRuns).toEqual([
       expect.objectContaining({
-        terminal_status: 'cancelled',
+        terminal_status: 'succeeded',
+        process_status: 'cancelled',
+        workflow_outcome: 'handoff_reached',
         error_code: REASON_CODES.handoffRelease,
         terminal_reason_code: REASON_CODES.handoffRelease,
         session_id: 'review-session',
@@ -959,7 +1019,7 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
       {
         issue_id: 'i-terminal',
         cleanup_workspace: true,
-        reason: 'terminal_state_transition'
+        reason: REASON_CODES.terminalStateReached
       }
     ]);
     expect(snapshot.codex_totals.seconds_running).toBe(2);
@@ -1342,7 +1402,7 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     const terminated = logs.find((entry) => entry.event === CANONICAL_EVENT.orchestration.workerTerminated);
     expect(terminated?.context.issue_id).toBe('i-terminal');
     expect(terminated?.context.issue_identifier).toBe('ABC-99');
-    expect(terminated?.context.reason).toBe('terminal_state_transition');
+    expect(terminated?.context.reason).toBe(REASON_CODES.terminalStateReached);
     expect(terminated?.context.cleanup_workspace).toBe(true);
   });
 

@@ -34,6 +34,21 @@ interface PersistedCompletionLineage {
   turn_id: string | null;
 }
 
+interface CompletionProjection {
+  process_status: TerminalStatus;
+  workflow_outcome: string;
+}
+
+export function successfulWorkflowTerminationProjection(reason: string): CompletionProjection | null {
+  if (reason === REASON_CODES.handoffStateReached || reason === REASON_CODES.handoffRelease) {
+    return { process_status: 'cancelled', workflow_outcome: 'handoff_reached' };
+  }
+  if (reason === REASON_CODES.terminalStateReached) {
+    return { process_status: 'cancelled', workflow_outcome: 'succeeded' };
+  }
+  return null;
+}
+
 function persistedCompletionLineage(
   runningEntry: RunningEntry,
   preferredThreadId: string | null,
@@ -227,9 +242,25 @@ export async function terminateRunningIssue(
   };
 
   const finalizationDetail = workerTerminationResultDetail(`worker termination finalized: ${reason}`, terminationResult);
+  const successfulWorkflowProjection = successfulWorkflowTerminationProjection(reason);
+  const terminalStatus: TerminalStatus = successfulWorkflowProjection ? 'succeeded' : 'cancelled';
   addRuntimeSecondsFromEntry(context, runningEntry);
-  await completeRunRecord(context, runningEntry, 'cancelled', reason, null, finalizationDetail);
-  await context.hooks.persistExecutionGraphStateTransition(runningEntry, 'cancelled', 'cancelled', reason, finalizationDetail);
+  await completeRunRecord(
+    context,
+    runningEntry,
+    terminalStatus,
+    reason,
+    null,
+    finalizationDetail,
+    successfulWorkflowProjection ?? undefined
+  );
+  await context.hooks.persistExecutionGraphStateTransition(
+    runningEntry,
+    successfulWorkflowProjection?.workflow_outcome ?? 'cancelled',
+    terminalStatus,
+    reason,
+    finalizationDetail
+  );
   rememberInactiveWorkerPid({
     state: context.state,
     runningEntry,
@@ -240,6 +271,9 @@ export async function terminateRunningIssue(
   rememberReleasedWorker({ state: context.state, runningEntry, reason, cleanupWorkspace: cleanup_workspace, nowMs: context.nowMs() });
   context.state.running.delete(issue_id);
   context.state.claimed.delete(issue_id);
+  if (successfulWorkflowProjection) {
+    context.state.completed.add(issue_id);
+  }
   context.logger?.log({
     level: 'info',
     event: CANONICAL_EVENT.orchestration.workerTerminated,
@@ -274,7 +308,8 @@ export async function completeRunRecord(
   terminal_status: TerminalStatus,
   error_code: string | null,
   recoveryOverride: MissingToolOutputRecoveryState | null = null,
-  terminalReasonDetail: string | null = null
+  terminalReasonDetail: string | null = null,
+  completionProjection?: CompletionProjection
 ): Promise<void> {
   if (!runningEntry.run_id || !context.persistence) {
     return;
@@ -301,6 +336,8 @@ export async function completeRunRecord(
       issue_run_id: runningEntry.issue_run_id,
       attempt_id: runningEntry.attempt_id,
       terminal_status,
+      process_status: completionProjection?.process_status,
+      workflow_outcome: completionProjection?.workflow_outcome,
       error_code,
       terminal_reason_code: error_code,
       terminal_reason_detail: terminalReasonDetail,

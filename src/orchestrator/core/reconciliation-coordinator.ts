@@ -7,7 +7,7 @@ import { CANONICAL_EVENT } from '../../observability/events';
 import { REASON_CODES } from '../../observability/reason-codes';
 import { isActiveState, isTerminalState } from '../decisions';
 import type { BlockedEntry, OrchestratorOptions, OrchestratorState, RunningEntry } from '../types';
-import { isFreshDispatchState, isHandoffFreshDispatchState, normalizeStateName } from './retry-backpressure';
+import { isFreshDispatchState, isHandoffFreshDispatchState, isHandoffState, normalizeStateName } from './retry-backpressure';
 import { coordinateReconcileStalledRuns, type RunningWaitCoordinatorContext } from './running-wait-coordinator';
 import type { DispatchCoordinatorScheduleRetryParams } from './dispatch-coordinator';
 
@@ -77,7 +77,7 @@ export async function coordinateReconcileRunningIssues(context: ReconciliationCo
     }
 
     if (isTerminalState(refreshedIssue.state, context.config)) {
-      await context.hooks.terminateRunningIssue(refreshedIssue.id, true, 'terminal_state_transition');
+      await context.hooks.terminateRunningIssue(refreshedIssue.id, true, REASON_CODES.terminalStateReached);
       continue;
     }
 
@@ -86,6 +86,11 @@ export async function coordinateReconcileRunningIssues(context: ReconciliationCo
       !didRunStartInState(runningEntry, refreshedIssue.state)
     ) {
       await context.hooks.terminateRunningIssue(refreshedIssue.id, false, REASON_CODES.handoffRelease);
+      continue;
+    }
+
+    if (isHandoffState(refreshedIssue.state, context.config) && !didRunStartInState(runningEntry, refreshedIssue.state)) {
+      await context.hooks.terminateRunningIssue(refreshedIssue.id, false, REASON_CODES.handoffStateReached);
       continue;
     }
 

@@ -1241,6 +1241,8 @@ export interface OrchestratorPersistencePort {
     issue_run_id?: string | null;
     attempt_id?: string | null;
     terminal_status: RunTerminalStatus;
+    process_status?: RunTerminalStatus;
+    workflow_outcome?: string;
     error_code?: string | null;
     terminal_reason_code?: string | null;
     terminal_reason_detail?: string | null;

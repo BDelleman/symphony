@@ -391,6 +391,11 @@ export function isHandoffFreshDispatchState(issueState: string, config: Orchestr
   return handoffStates.some((state) => normalizeStateName(state) === normalizedState);
 }
 
+export function isHandoffState(issueState: string, config: OrchestratorOptions['config']): boolean {
+  const normalizedState = normalizeStateName(issueState);
+  return (config.handoff_states ?? []).some((state) => normalizeStateName(state) === normalizedState);
+}
+
 export function normalizeStateName(state: string): string {
   return state.trim().toLowerCase();
 }
