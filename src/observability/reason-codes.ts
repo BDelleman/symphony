@@ -1,6 +1,6 @@
 import { DYNAMIC_TOOL_CONSOLE_RECOVERY_ACTION, UNSUPPORTED_DYNAMIC_TOOL_CONSOLE_RESUME_REASON_CODE } from './dynamic-tool-capability';
 
-export const REASON_CODE_REGISTRY_VERSION = '2026-08-18.v1';
+export const REASON_CODE_REGISTRY_VERSION = '2026-08-19.v1';
 
 export type ReasonCodeClassification =
   | 'healthy'
@@ -29,6 +29,7 @@ export const REASON_CODES = {
   handoffStateReached: 'handoff_state_reached',
   handoffRelease: 'handoff_release',
   freshDispatchStateRouted: 'fresh_dispatch_state_routed',
+  freshDispatchNoRoute: 'fresh_dispatch_no_route',
   issueLeftActiveStates: 'issue_left_active_states',
   issueStateMissing: 'issue_state_missing',
   terminalStateReached: 'terminal_state_reached',
@@ -203,6 +204,16 @@ export const CANONICAL_REASON_CODE_REGISTRY = {
     headline: 'Fresh run routed issue',
     detail: 'The worker completed normally and stopped because a fresh-dispatch run moved the issue to its next workflow state.',
     expected_transition: 'The dispatcher for the routed state may pick up the issue next'
+  },
+  [REASON_CODES.freshDispatchNoRoute]: {
+    reason_code: REASON_CODES.freshDispatchNoRoute,
+    classification: 'blocked_input',
+    actionability: 'required',
+    recommended_actions: ['Inspect the phase blocker', 'Correct the required evidence or tracker state', 'Requeue the issue'],
+    label: 'Fresh Phase Did Not Route',
+    headline: 'Fresh workflow phase stopped without routing',
+    detail: 'A fresh review or landing run completed while the issue remained in its dispatch state, so Symphony blocked redispatch instead of looping.',
+    expected_transition: 'An operator corrects the blocker and requeues the issue'
   },
   [REASON_CODES.issueLeftActiveStates]: {
     reason_code: REASON_CODES.issueLeftActiveStates,

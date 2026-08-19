@@ -85,6 +85,35 @@ describe('OrchestratorCore handoff', () => {
     expect(harness.orchestrator.getStateSnapshot().claimed.has('i-review-claimed')).toBe(true);
   });
 
+  it('blocks a fresh phase that exits without routing instead of redispatching it', async () => {
+    const harness = createHarness({
+      configOverrides: {
+        active_states: ['Agent Review'],
+        handoff_states: ['Agent Review'],
+        fresh_dispatch_states: ['Agent Review']
+      }
+    });
+    const issue = makeIssue({ id: 'i-review-no-route', identifier: 'NIE-NO-ROUTE', state: 'Agent Review' });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([issue]);
+
+    await harness.orchestrator.tick('interval');
+    await harness.orchestrator.onWorkerExit(
+      issue.id,
+      'abnormal',
+      `${REASON_CODES.freshDispatchNoRoute}: Agent Review`,
+      { retryable: false }
+    );
+
+    let snapshot = harness.orchestrator.getStateSnapshot();
+    expect(snapshot.blocked_inputs.get(issue.id)?.stop_reason_code).toBe(REASON_CODES.freshDispatchNoRoute);
+    expect(snapshot.retry_attempts.has(issue.id)).toBe(false);
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([issue]);
+    await harness.orchestrator.tick('interval');
+    snapshot = harness.orchestrator.getStateSnapshot();
+    expect(snapshot.blocked_inputs.get(issue.id)?.stop_reason_code).toBe(REASON_CODES.freshDispatchNoRoute);
+    expect(harness.spawned).toHaveLength(1);
+  });
+
   it('dispatches stale retry state in Agent Review as fresh without prior thread lineage', async () => {
     const harness = createHarness({
       configOverrides: {
@@ -377,9 +406,14 @@ describe('OrchestratorCore handoff', () => {
     ]);
     await harness.orchestrator.reconcileRunningIssues();
 
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-review-handback', identifier: 'NIE-HAND', state: 'In Progress' })
+    ]);
+    await harness.orchestrator.tick('interval');
+
     const snapshot = harness.orchestrator.getStateSnapshot();
     expect(harness.terminated).toEqual([
-      { issue_id: 'i-review-handback', cleanup_workspace: false, reason: REASON_CODES.turnWaitingThresholdExceeded }
+      { issue_id: 'i-review-handback', cleanup_workspace: false, reason: REASON_CODES.freshDispatchStateRouted }
     ]);
     expect(harness.spawned).toEqual([
       { issue_id: 'i-review-handback', attempt: null, worker_host: null, resume_context: null },
@@ -388,7 +422,7 @@ describe('OrchestratorCore handoff', () => {
     expect(snapshot.blocked_inputs.has('i-review-handback')).toBe(false);
     expect(snapshot.retry_attempts.has('i-review-handback')).toBe(false);
     expect(snapshot.running.get('i-review-handback')?.issue.state).toBe('In Progress');
-    expect(logs.some((entry) => entry.event === 'orchestration.agent_review_handoff_progress_observed')).toBe(true);
+    expect(logs.some((entry) => entry.event === 'orchestration.agent_review_handoff_progress_observed')).toBe(false);
     expect(logs.some((entry) => entry.event === CANONICAL_EVENT.orchestration.redispatchCompletionGateBlocked)).toBe(false);
   });
 
@@ -457,6 +491,11 @@ describe('OrchestratorCore handoff', () => {
     ]);
     await harness.orchestrator.reconcileRunningIssues();
 
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-review-handback-churn', identifier: 'NIE-CHURN', state: 'In Progress' })
+    ]);
+    await harness.orchestrator.tick('interval');
+
     const snapshot = harness.orchestrator.getStateSnapshot();
     expect(snapshot.blocked_inputs.has('i-review-handback-churn')).toBe(false);
     expect(snapshot.retry_attempts.has('i-review-handback-churn')).toBe(false);
@@ -465,7 +504,7 @@ describe('OrchestratorCore handoff', () => {
       'i-review-handback-churn',
       'i-review-handback-churn'
     ]);
-    expect(logs.some((entry) => entry.event === 'orchestration.agent_review_handoff_progress_observed')).toBe(true);
+    expect(logs.some((entry) => entry.event === 'orchestration.agent_review_handoff_progress_observed')).toBe(false);
   });
 
   it('does not treat Agent Review status movement alone as worker-owned handback progress', async () => {
@@ -518,9 +557,10 @@ describe('OrchestratorCore handoff', () => {
     expect(harness.spawned).toEqual([
       { issue_id: 'i-status-only-handback', attempt: null, worker_host: null, resume_context: null }
     ]);
-    expect(snapshot.retry_attempts.get('i-status-only-handback')?.stop_reason_code).toBe(
-      REASON_CODES.workerOpaqueActivityHardTimeout
-    );
+    expect(harness.terminated).toEqual([
+      { issue_id: 'i-status-only-handback', cleanup_workspace: false, reason: REASON_CODES.freshDispatchStateRouted }
+    ]);
+    expect(snapshot.retry_attempts.has('i-status-only-handback')).toBe(false);
     expect(snapshot.running.has('i-status-only-handback')).toBe(false);
     expect(logs.some((entry) => entry.event === 'orchestration.agent_review_handoff_progress_observed')).toBe(false);
   });

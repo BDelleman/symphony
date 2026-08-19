@@ -664,6 +664,66 @@ export async function coordinateWorkerExit(
         return;
       }
 
+      if (stopReasonCode === REASON_CODES.freshDispatchNoRoute) {
+        const stopReasonDetail = error ?? 'fresh workflow phase completed without routing the issue';
+        context.hooks.emitPhaseMarker(issue_id, {
+          phase: 'blocked_input',
+          detail: stopReasonDetail,
+          attempt: running.retry_attempt + 1,
+          thread_id: running.thread_id,
+          session_id: running.session_id
+        });
+        await context.hooks.scheduleBlockedInput({
+          issue_id,
+          issue_identifier: running.identifier,
+          attempt: running.retry_attempt + 1,
+          issue_run_id: running.issue_run_id ?? null,
+          previous_attempt_id: running.attempt_id ?? null,
+          worker_host: running.worker_host ?? null,
+          workspace_path: running.workspace_path ?? null,
+          provisioner_type: running.provisioner_type ?? null,
+          branch_name: running.branch_name ?? null,
+          repo_root: running.repo_root ?? null,
+          workspace_exists: running.workspace_exists,
+          workspace_git_status: running.workspace_git_status,
+          workspace_provisioned: running.workspace_provisioned,
+          workspace_is_git_worktree: running.workspace_is_git_worktree,
+          copy_ignored_applied: running.copy_ignored_applied,
+          copy_ignored_status: running.copy_ignored_status,
+          copy_ignored_summary: running.copy_ignored_summary,
+          stop_reason_code: REASON_CODES.freshDispatchNoRoute,
+          stop_reason_detail: stopReasonDetail,
+          session_console: running.recent_events,
+          previous_thread_id: running.thread_id,
+          previous_turn_id: running.turn_id,
+          previous_session_id: running.session_id,
+          required_actions: ['Inspect the phase blocker', 'Correct the required evidence or tracker state', 'Requeue the issue']
+        });
+        await context.hooks.persistExecutionGraphStateTransition(
+          running,
+          'blocked',
+          'blocked',
+          REASON_CODES.freshDispatchNoRoute,
+          stopReasonDetail
+        );
+        context.logger?.log({
+          level: 'warn',
+          event: CANONICAL_EVENT.orchestration.workerExitHandled,
+          message: 'worker exit handled: fresh workflow phase did not route',
+          context: {
+            issue_id,
+            issue_identifier: running.identifier,
+            session_id: running.session_id,
+            reason,
+            outcome: 'blocked',
+            stop_reason_code: REASON_CODES.freshDispatchNoRoute,
+            error: stopReasonDetail
+          }
+        });
+        context.ports.notifyObservers?.();
+        return;
+      }
+
       if (details.retryable === false) {
         context.hooks.emitPhaseMarker(issue_id, {
           phase: 'failed',

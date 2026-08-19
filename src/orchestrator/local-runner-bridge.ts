@@ -8,6 +8,7 @@ import type { Issue } from '../tracker';
 import { TemplateEngine, type Template } from '../workflow';
 import type { EffectiveConfig } from '../workflow';
 import type { WorkspaceManager } from '../workspace';
+import type { WorkspaceInfo } from '../workspace';
 import type { SpawnWorkerResult, WorkerExitDetails, WorkerTerminationResult } from './types';
 import { runLocalWorkerAttempt, runLocalWorkerRecoveryAttempt } from './local-worker-runner';
 
@@ -112,6 +113,7 @@ export class LocalRunnerBridge {
     const workerPromise = this.startWorker(
       params.issue,
       params.attempt,
+      workspace,
       workerHost,
       params.resume_context ?? null,
       params.recover_workspace_attempt_residue ?? false,
@@ -185,7 +187,7 @@ export class LocalRunnerBridge {
     const workerInstanceId = this.createWorkerInstanceId(params.issue.id);
     let runnerSettled = false;
     let cancellationOutcome: CodexCancellationOutcome | null = null;
-    const workerPromise = this.startRecoveryWorker(params, workerHost, workerInstanceId, cancellationController.signal, (outcome) => {
+    const workerPromise = this.startRecoveryWorker(params, workspace, workerHost, workerInstanceId, cancellationController.signal, (outcome) => {
       cancellationOutcome = outcome;
       runnerSettled = true;
     });
@@ -375,6 +377,7 @@ export class LocalRunnerBridge {
   private async startWorker(
     issue: Issue,
     attempt: number | null,
+    workspace: WorkspaceInfo,
     worker_host: string | null,
     resume_context: string | null,
     recoverWorkspaceAttemptResidue: boolean,
@@ -399,6 +402,7 @@ export class LocalRunnerBridge {
       attempt,
       worker_host: worker_host ?? undefined,
       workspaceManager: this.workspaceManager,
+      workspace,
       codexRunner: this.codexRunner,
       agentRunner: this.agentRunner,
       config: this.config,
@@ -464,6 +468,7 @@ export class LocalRunnerBridge {
       previous_session_id: string | null;
       recovery_prompt: string;
     },
+    workspace: WorkspaceInfo,
     worker_host: string | null,
     workerInstanceId: string,
     cancellationSignal: AbortSignal,
@@ -488,6 +493,7 @@ export class LocalRunnerBridge {
       attempt: params.attempt,
       worker_host: worker_host ?? undefined,
       workspaceManager: this.workspaceManager,
+      workspace,
       codexRunner: this.codexRunner,
       config: this.config,
       renderPrompt: this.renderPrompt,

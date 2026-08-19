@@ -115,6 +115,41 @@ describe('WorkspaceProvisioner', () => {
     await fs.rm(repoRoot, { recursive: true, force: true });
   });
 
+  it('reuses a valid managed worktree even when the primary checkout is dirty', async () => {
+    const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-provisioner-repo-'));
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-provisioner-ws-'));
+    const workspacePath = path.join(workspaceRoot, 'ABC-1');
+    await fs.mkdir(path.join(repoRoot, '.git'));
+    await fs.mkdir(workspacePath);
+    await fs.writeFile(path.join(workspacePath, '.git'), 'gitdir: managed\n');
+    const runGit = vi.fn(async ({ cwd, args }: { cwd: string; args: string[] }) => {
+      if (args[0] === 'worktree' && args[1] === 'list') return { ok: true, stdout: '', stderr: '' };
+      if (cwd === workspacePath && args.join(' ') === 'rev-parse --show-toplevel') {
+        return { ok: true, stdout: `${workspacePath}\n`, stderr: '' };
+      }
+      if (cwd === workspacePath && args.join(' ') === 'rev-parse --abbrev-ref HEAD') {
+        return { ok: true, stdout: 'feature/ABC-1\n', stderr: '' };
+      }
+      if (args[0] === 'status') return { ok: true, stdout: ' M README.md\n', stderr: '' };
+      return { ok: true, stdout: '', stderr: '' };
+    });
+    const provisioner = new WorktreeProvisioner({
+      repoRoot,
+      baseRef: 'origin/main',
+      branchTemplate: 'feature/{{ issue.identifier }}',
+      teardownMode: 'keep',
+      allowDirtyRepo: false,
+      runGit,
+      fsOps: { stat: fs.stat, rm: fs.rm }
+    });
+
+    await expect(provisioner.provision({ identifier: 'ABC-1', workspacePath })).resolves.toMatchObject({ status: 'reused' });
+    expect(runGit).not.toHaveBeenCalledWith({ cwd: repoRoot, args: ['status', '--porcelain'] });
+
+    await fs.rm(repoRoot, { recursive: true, force: true });
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  });
+
   it('worktree provisioner prunes stale metadata before provisioning', async () => {
     const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-provisioner-repo-'));
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-provisioner-ws-'));
@@ -322,7 +357,7 @@ describe('WorkspaceProvisioner', () => {
       })
     ).rejects.toMatchObject({ code: 'workspace_unprovisioned_conflict' });
 
-    expect(runGit).toHaveBeenCalledTimes(2);
+    expect(runGit).toHaveBeenCalledTimes(1);
     await fs.rm(repoRoot, { recursive: true, force: true });
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   });

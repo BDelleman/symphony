@@ -1,5 +1,6 @@
 import type { Issue } from '../tracker';
 import type { WorkspaceManager } from '../workspace';
+import type { WorkspaceInfo } from '../workspace';
 import type { CodexRunner } from '../codex';
 import type { CodexRunnerEvent } from '../codex';
 import { CodexAgentRunner, type AgentRunResult, type AgentRunner, type AgentRunnerEvent } from '../agent';
@@ -21,6 +22,7 @@ export interface LocalWorkerRunInput {
   attempt: number | null;
   worker_host?: string;
   workspaceManager: WorkspaceManager;
+  workspace: WorkspaceInfo;
   codexRunner?: CodexRunner;
   agentRunner?: AgentRunner;
   config: EffectiveConfig;
@@ -58,7 +60,7 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
   };
 
   try {
-    const workspace = await input.workspaceManager.ensureWorkspace(input.issue.identifier);
+    const workspace = input.workspace;
     workspacePath = workspace.path;
     const normalizedWorkspace = path.resolve(workspace.path);
     const normalizedRoot = path.resolve(input.config.workspace.root);
@@ -173,7 +175,12 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
                 cancellation_outcome: turnResult.cancellation_outcome
               };
             }
-            if (refreshedIssue && isStateListed(refreshedIssue.state, input.config.tracker.handoff_states)) {
+            if (
+              refreshedIssue &&
+              isStateListed(refreshedIssue.state, input.config.tracker.handoff_states) &&
+              (!isStateListed(currentIssue.state, input.config.tracker.fresh_dispatch_states) ||
+                !isSameState(currentIssue.state, refreshedIssue.state))
+            ) {
               return {
                 reason: 'normal',
                 session_id: turnResult.session_id,
@@ -238,7 +245,12 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
         };
       }
 
-      if (refreshedIssue && isStateListed(refreshedIssue.state, input.config.tracker.handoff_states)) {
+      if (
+        refreshedIssue &&
+        isStateListed(refreshedIssue.state, input.config.tracker.handoff_states) &&
+        (!isStateListed(currentIssue.state, input.config.tracker.fresh_dispatch_states) ||
+          !isSameState(currentIssue.state, refreshedIssue.state))
+      ) {
         return {
           reason: 'normal',
           session_id: lastSessionId,
@@ -257,6 +269,20 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
           session_id: lastSessionId,
           completion_reason: REASON_CODES.freshDispatchStateRouted,
           refreshed_state: refreshedIssue.state
+        };
+      }
+
+      if (
+        refreshedIssue &&
+        isStateListed(currentIssue.state, input.config.tracker.fresh_dispatch_states) &&
+        isSameState(currentIssue.state, refreshedIssue.state)
+      ) {
+        return {
+          reason: 'abnormal',
+          session_id: lastSessionId,
+          error: `${REASON_CODES.freshDispatchNoRoute}: ${currentIssue.state}`,
+          refreshed_state: refreshedIssue.state,
+          retryable: false
         };
       }
 
@@ -332,7 +358,7 @@ export async function runLocalWorkerRecoveryAttempt(
         error: 'codex_runner_missing'
       };
     }
-    const workspace = await input.workspaceManager.ensureWorkspace(input.issue.identifier);
+    const workspace = input.workspace;
     workspacePath = workspace.path;
     const normalizedWorkspace = path.resolve(workspace.path);
     const normalizedRoot = path.resolve(input.config.workspace.root);
@@ -412,12 +438,31 @@ export async function runLocalWorkerRecoveryAttempt(
       };
     }
 
-    if (refreshedIssue && isStateListed(refreshedIssue.state, input.config.tracker.handoff_states)) {
+    if (
+      refreshedIssue &&
+      isStateListed(refreshedIssue.state, input.config.tracker.handoff_states) &&
+      (!isStateListed(input.issue.state, input.config.tracker.fresh_dispatch_states) ||
+        !isSameState(input.issue.state, refreshedIssue.state))
+    ) {
       return {
         reason: 'normal',
         session_id: turnResult.session_id,
         completion_reason: REASON_CODES.handoffStateReached,
         refreshed_state: refreshedIssue.state
+      };
+    }
+
+    if (
+      refreshedIssue &&
+      isStateListed(input.issue.state, input.config.tracker.fresh_dispatch_states) &&
+      isSameState(input.issue.state, refreshedIssue.state)
+    ) {
+      return {
+        reason: 'abnormal',
+        session_id: turnResult.session_id,
+        error: `${REASON_CODES.freshDispatchNoRoute}: ${input.issue.state}`,
+        refreshed_state: refreshedIssue.state,
+        retryable: false
       };
     }
 

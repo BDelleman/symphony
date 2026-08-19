@@ -255,16 +255,6 @@ export class WorktreeProvisioner implements WorkspaceProvisioner {
     const branchName = renderBranchName(this.branchTemplate, params.identifier);
     const integrity = await this.checkAndReconcileStaleWorktreeMetadata(params.workspacePath);
 
-    if (!this.allowDirtyRepo) {
-      const status = await this.runGit({ cwd: this.repoRoot, args: ['status', '--porcelain'] });
-      if (!status.ok) {
-        throw new WorkspaceError('workspace_provision_failed', `failed to inspect repo status: ${status.stderr.trim() || 'unknown'}`);
-      }
-      if (status.stdout.trim().length > 0) {
-        throw new WorkspaceError('workspace_provision_failed', 'worktree_dirty_repo');
-      }
-    }
-
     const existingWorkspaceStat = await this.statPath(params.workspacePath).catch(() => null);
     if (existingWorkspaceStat?.isDirectory()) {
       const gitMarker = path.join(params.workspacePath, '.git');
@@ -319,6 +309,16 @@ export class WorktreeProvisioner implements WorkspaceProvisioner {
           'workspace_unprovisioned_conflict',
           'workspace path exists but is not a managed git worktree and is not safe to reprovision'
         );
+      }
+    }
+
+    if (!this.allowDirtyRepo) {
+      const status = await this.runGit({ cwd: this.repoRoot, args: ['status', '--porcelain'] });
+      if (!status.ok) {
+        throw new WorkspaceError('workspace_provision_failed', `failed to inspect repo status: ${status.stderr.trim() || 'unknown'}`);
+      }
+      if (status.stdout.trim().length > 0) {
+        throw new WorkspaceError('workspace_provision_failed', 'worktree_dirty_repo');
       }
     }
 

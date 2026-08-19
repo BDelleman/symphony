@@ -409,6 +409,56 @@ describe('LocalRunnerBridge integration', () => {
     });
   });
 
+  it('does not treat same-state fresh-phase cancellation as a successful handoff', async () => {
+    const config = makeConfig();
+    config.tracker.active_states = ['Agent Review'];
+    config.tracker.handoff_states = ['Agent Review'];
+    config.tracker.fresh_dispatch_states = ['Agent Review'];
+    const exits: Array<{ reason: string; error?: string; retryable?: boolean }> = [];
+    const bridge = new LocalRunnerBridge({
+      workspaceManager: {
+        ensureWorkspace: vi.fn(async () => ({ path: '/tmp/symphony/ABC-1', workspace_key: 'ABC-1', created_now: true })),
+        prepareAttempt: vi.fn(async () => {}),
+        finalizeAttempt: vi.fn(async () => {}),
+        cleanupWorkspace: vi.fn(async () => true)
+      } as unknown as WorkspaceManager,
+      codexRunner: {} as CodexRunner,
+      agentRunner: {
+        runtime: 'claude-cli',
+        capabilities: {
+          native_resume: 'within-attempt',
+          missing_tool_output_recovery: false,
+          remote_worker: false,
+          enforcement_usage: false
+        },
+        startSessionAndRunTurn: vi.fn(async () => ({
+          runtime: 'claude-cli',
+          status: 'cancelled',
+          session_id: 'claude-session',
+          thread_id: 'claude:claude-session',
+          turn_id: 'claude-turn',
+          last_event: CANONICAL_EVENT.agentRunner.turnCancelled,
+          error_code: REASON_CODES.workerCancelRequested,
+          cancellation_outcome: 'graceful_exit',
+          retryable: false
+        }))
+      } as any,
+      config,
+      issueStateFetcher: vi.fn(async () => [makeIssue({ state: 'Agent Review' })]),
+      promptTemplate: 'Issue {{ issue.identifier }} attempt {{ attempt }}',
+      onWorkerExit: ({ reason, error, retryable }) => {
+        exits.push({ reason, error, retryable });
+      }
+    });
+
+    const spawned = await bridge.spawnWorker({ issue: makeIssue({ state: 'Agent Review' }), attempt: null });
+    expect(spawned.ok).toBe(true);
+    if (!spawned.ok) throw new Error('expected spawn success');
+    await (spawned.worker_handle as { promise: Promise<void> }).promise;
+
+    expect(exits).toEqual([{ reason: 'abnormal', error: REASON_CODES.workerCancelRequested, retryable: false }]);
+  });
+
   it('stops fresh Agent Review runs after routing to the next workflow state', async () => {
     const routeCases = [
       { targetState: 'In Progress', expectedReason: REASON_CODES.freshDispatchStateRouted },
@@ -476,6 +526,50 @@ describe('LocalRunnerBridge integration', () => {
         { completion_reason: routeCase.expectedReason, refreshed_state: routeCase.targetState }
       ]);
     }
+  });
+
+  it('blocks a fresh workflow phase that finishes without routing', async () => {
+    const startSessionAndRunTurn = vi.fn().mockResolvedValue({
+      status: 'completed' as const,
+      thread_id: 'review-thread',
+      turn_id: 'review-turn',
+      session_id: 'review-session',
+      last_event: CANONICAL_EVENT.codex.turnCompleted
+    });
+    const config = makeConfig();
+    config.tracker.active_states = ['Agent Review'];
+    config.tracker.handoff_states = ['Agent Review'];
+    config.tracker.fresh_dispatch_states = ['Agent Review'];
+    const exits: Array<{ reason: string; error?: string; retryable?: boolean }> = [];
+    const bridge = new LocalRunnerBridge({
+      workspaceManager: {
+        ensureWorkspace: vi.fn(async () => ({ path: '/tmp/symphony/ABC-1', workspace_key: 'ABC-1', created_now: true })),
+        prepareAttempt: vi.fn(async () => {}),
+        finalizeAttempt: vi.fn(async () => {}),
+        cleanupWorkspace: vi.fn(async () => true)
+      } as unknown as WorkspaceManager,
+      codexRunner: { startSessionAndRunTurn } as unknown as CodexRunner,
+      config,
+      issueStateFetcher: vi.fn(async () => [makeIssue({ state: 'Agent Review' })]),
+      promptTemplate: 'Issue {{ issue.identifier }} attempt {{ attempt }}',
+      onWorkerExit: ({ reason, error, retryable }) => {
+        exits.push({ reason, error, retryable });
+      }
+    });
+
+    const spawned = await bridge.spawnWorker({ issue: makeIssue({ state: 'Agent Review' }), attempt: null });
+    expect(spawned.ok).toBe(true);
+    if (!spawned.ok) throw new Error('expected spawn success');
+    await (spawned.worker_handle as { promise: Promise<void> }).promise;
+
+    expect(startSessionAndRunTurn).toHaveBeenCalledTimes(1);
+    expect(exits).toEqual([
+      {
+        reason: 'abnormal',
+        error: `${REASON_CODES.freshDispatchNoRoute}: Agent Review`,
+        retryable: false
+      }
+    ]);
   });
 
   it('refreshes issue state on the final turn before stopping at a handoff state', async () => {
@@ -1016,6 +1110,7 @@ describe('LocalRunnerBridge integration', () => {
     await flush();
 
     expect(ensureWorkspace).toHaveBeenCalledWith('ABC-1');
+    expect(ensureWorkspace).toHaveBeenCalledTimes(1);
     expect(prepareAttempt).toHaveBeenCalledWith('/tmp/symphony/ABC-1');
     expect(startSessionAndRunTurn).toHaveBeenCalledTimes(1);
     expect(startSessionAndRunTurn).toHaveBeenCalledWith(

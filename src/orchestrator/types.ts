@@ -82,6 +82,8 @@ export interface BudgetRuntimeProjection {
 export interface RunningEntry {
   issue: Issue;
   identifier: string;
+  /** Immutable tracker state that owned this worker at dispatch time. */
+  dispatch_state?: string;
   started_issue_state?: string;
   run_id: string | null;
   issue_run_id?: string | null;

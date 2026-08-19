@@ -859,6 +859,66 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     expect(harness.terminated).toEqual([]);
   });
 
+  it('releases a fresh Merging worker as soon as it leaves its dispatch state', async () => {
+    const harness = createHarness({
+      configOverrides: {
+        active_states: ['In Progress', 'Agent Review', 'Merging'],
+        handoff_states: ['Agent Review', 'Merging'],
+        fresh_dispatch_states: ['Agent Review', 'Merging']
+      }
+    });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-merging', identifier: 'ABC-MERGE', state: 'Merging' })
+    ]);
+    await harness.orchestrator.tick('interval');
+
+    const before = harness.orchestrator.getStateSnapshot().running.get('i-merging');
+    expect(before?.dispatch_state).toBe('Merging');
+
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([
+      makeIssue({ id: 'i-merging', identifier: 'ABC-MERGE', state: 'In Progress' })
+    ]);
+    await harness.orchestrator.reconcileRunningIssues();
+
+    expect(harness.terminated).toContainEqual({
+      issue_id: 'i-merging',
+      cleanup_workspace: false,
+      reason: REASON_CODES.freshDispatchStateRouted
+    });
+  });
+
+  it('releases an active fresh review worker when it routes back to implementation', async () => {
+    const harness = createHarness({
+      configOverrides: {
+        active_states: ['In Progress', 'Agent Review'],
+        handoff_states: ['Agent Review'],
+        fresh_dispatch_states: ['Agent Review']
+      }
+    });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-review-fix', identifier: 'ABC-REVIEW-FIX', state: 'Agent Review' })
+    ]);
+    await harness.orchestrator.tick('interval');
+    harness.orchestrator.onWorkerEvent('i-review-fix', {
+      timestamp_ms: harness.now.value + 1,
+      event: CANONICAL_EVENT.codex.turnWaiting,
+      thread_id: 'review-thread',
+      turn_id: 'review-turn',
+      session_id: 'review-session'
+    });
+
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([
+      makeIssue({ id: 'i-review-fix', identifier: 'ABC-REVIEW-FIX', state: 'In Progress' })
+    ]);
+    await harness.orchestrator.reconcileRunningIssues();
+
+    expect(harness.terminated).toContainEqual({
+      issue_id: 'i-review-fix',
+      cleanup_workspace: false,
+      reason: REASON_CODES.freshDispatchStateRouted
+    });
+  });
+
   it('stops running worker without cleanup when state becomes non-active and non-terminal', async () => {
     const harness = createHarness();
     harness.tracker.fetch_candidate_issues.mockResolvedValue([makeIssue({ id: 'i-nonactive' })]);

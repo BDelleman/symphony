@@ -94,6 +94,35 @@ describe('WorkspaceManager', () => {
     expect(first.path).toBe(second.path);
   });
 
+  it('revalidates the provisioner when reusing an existing workspace', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const provision = vi.fn(async () => ({
+      status: 'reused' as const,
+      provisioner_type: 'clone' as const,
+      branch_name: 'feature/ABC-1',
+      repo_root: root,
+      workspace_exists: true,
+      workspace_git_status: 'clean' as const,
+      workspace_provisioned: true,
+      workspace_is_git_worktree: false
+    }));
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { timeout_ms: 1000 },
+      provisioner: {
+        provision,
+        teardown: async () => ({ status: 'kept', provisioner_type: 'clone' })
+      }
+    });
+
+    await manager.ensureWorkspace('ABC-1');
+    const reused = await manager.ensureWorkspace('ABC-1');
+
+    expect(provision).toHaveBeenCalledTimes(2);
+    expect(reused).toMatchObject({ created_now: false, provisioner_type: 'clone', branch_name: 'feature/ABC-1' });
+  });
+
   it('replaces non-allowed identifier characters with underscore', () => {
     const manager = new WorkspaceManager({
       root: '/tmp/symphony',
