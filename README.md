@@ -530,6 +530,18 @@ Strict mode contract:
 - Log sink failures emit warning events and do not crash orchestration flow.
 - Dashboard health reflects runtime validation/error semantics from orchestrator
   state, not direct mutation from UI actions.
+- Dashboard project history reports `workflow_outcome` and `process_status` as
+  separate fields per attempt. `workflow_outcome` describes the ticket result
+  (for example `handoff_reached` when a handoff state is reached), while
+  `process_status` describes how the worker process exited (for example
+  `cancelled`). A successful handoff therefore reports
+  `workflow_outcome=handoff_reached` with `process_status=cancelled`.
+- Claude provider usage is telemetry only. Reported `input_tokens`,
+  `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`,
+  `provider_turn_count`, and `estimated_cost_usd` values exist for observability
+  and never enforce token, turn, or dollar limits: budget stops read Codex token
+  totals, turn limits read the Symphony worker turn count, and no dollar limit
+  exists. The `claude-cli` runtime reports `enforcement_usage: false`.
 
 ## Contribution Notes
 
