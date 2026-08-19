@@ -218,7 +218,7 @@ export class RetentionHealthStore {
       integrity_ok: healthOk,
       integrity_check: integrityCheck,
       history_schema: historySchema,
-      recent_write_failures: this.listHistoryWriteFailures(5)
+      recent_write_failures: historySchema.status === 'degraded' ? this.listHistoryWriteFailures(5) : []
     };
   }
 

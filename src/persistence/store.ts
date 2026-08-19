@@ -344,7 +344,11 @@ export class SqlitePersistenceStore {
         'history_orphan_reconciliation_ambiguous',
         `${ambiguous} active issue run(s) have ambiguous parent or worker ownership.`
       );
-    } else if (this.readHistorySchemaHealth().degraded_reason_code === 'history_orphan_reconciliation_ambiguous') {
+    } else if (
+      ['history_orphan_reconciliation_ambiguous', 'history_write_failed'].includes(
+        this.readHistorySchemaHealth().degraded_reason_code ?? ''
+      )
+    ) {
       this.recordHistorySchemaState({
         appliedVersion: this.readHistorySchemaHealth().applied_version,
         status: 'healthy',

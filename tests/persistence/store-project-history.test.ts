@@ -443,7 +443,7 @@ describe('SqlitePersistenceStore project history', () => {
     ]);
   });
 
-  it('records failed history writes as degraded health across restart', async () => {
+  it('retains failed history writes while clearing active degradation after clean restart reconciliation', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-history-write-failure-'));
     dirs.push(dir);
     const dbPath = path.join(dir, 'runtime.sqlite');
@@ -489,6 +489,10 @@ describe('SqlitePersistenceStore project history', () => {
         recorded_at: '2026-04-11T10:00:00.000Z'
       }
     ]);
+    expect(storeB.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 0, ambiguous: 0 });
+    expect(storeB.historySchemaHealth()).toMatchObject({ status: 'healthy', degraded_reason_code: null });
+    expect(storeB.health().recent_write_failures).toEqual([]);
+    expect(storeB.listHistoryWriteFailures()).toHaveLength(1);
   });
 
   it('restores write-failure diagnostics for already-applied history schemas', async () => {

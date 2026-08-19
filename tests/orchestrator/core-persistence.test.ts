@@ -1413,7 +1413,8 @@ describe('OrchestratorCore persistence', () => {
       expect.objectContaining({
         issue_run_id: 'issue_run_1',
         attempt_id: 'attempt_1',
-        thread_id: 'thread-0',
+        thread_id: null,
+        turn_id: null,
         to_status: 'blocked',
         reason_code: 'operator_action_required_no_progress_redispatch_blocked'
       })

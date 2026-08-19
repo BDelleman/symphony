@@ -1137,8 +1137,8 @@ export async function persistExecutionGraphRetryTransition(params: {
     await persistence.appendStateTransition?.({
       issue_run_id: retryEntry.issue_run_id,
       attempt_id: retryEntry.previous_attempt_id,
-      thread_id: retryEntry.previous_thread_id,
-      turn_id: retryEntry.previous_thread_id ? (retryEntry.previous_turn_id ?? null) : null,
+      thread_id: null,
+      turn_id: null,
       from_status: null,
       to_status: toStatus,
       transitioned_at: asIso(nowMs()),
