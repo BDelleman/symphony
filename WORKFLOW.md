@@ -576,13 +576,14 @@ Use this only when completion is blocked by missing required tools or missing au
 3. Poll for updates as needed, including GitHub PR review comments from humans and bots.
 4. If human feedback requires normal implementation changes, move the issue to `In Progress`.
 5. If human feedback requires a fresh approach, move the issue to `Rework` and follow the rework flow.
-6. If approved, human moves the issue to `Merging`.
+6. If approved, human moves the issue to `Merging`. Entering `Merging` is the
+   authoritative human approval; the `Human Review` label may remain attached.
 7. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
    - At landing start and again immediately before merge, refresh Linear with
-     MCP and record the issue version and labels plus the current PR head SHA,
-     checks, review decision, and exact-head approval.
-   - If `Human Review` appears at either preflight, stop without merging or
-     changing the issue state.
+     MCP and record the issue version, state, and labels plus the current PR head
+     SHA, checks, review decision, and exact-head approval.
+   - If the issue is no longer in `Merging` at either preflight, stop without
+     merging or changing the issue state.
 8. After merge is complete, move the issue to `Done`.
 9. If merge is not complete, do not move to `Done`; keep state at `Merging`, move back to `In Progress` for normal fixable failures, or move back to `Rework` when a reset is required.
 
