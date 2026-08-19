@@ -1558,6 +1558,7 @@ describe('local symphony command router', () => {
     const { repoRoot, binDir } = await createDoctorRepo();
     const projectRoot = await createDoctorProject(ENV_BACKED_LINEAR_WORKFLOW);
     await fs.writeFile(path.join(projectRoot, '.env'), 'DOCTOR_ONLY_LINEAR_TOKEN=secret-from-env-file\n', 'utf8');
+    await fs.chmod(path.join(projectRoot, '.env'), 0o600);
     const harness = createHarness({ repoRoot });
     harness.deps.cwd = projectRoot;
     harness.deps.env = { PATH: binDir };
@@ -1592,6 +1593,63 @@ describe('local symphony command router', () => {
     });
     expect(JSON.stringify(payload)).not.toContain('secret-from-env-file');
     expect(harness.stderr).toBe('');
+  });
+
+  it('validates the pinned Claude CLI, redacted subscription auth, and local runtime scope', async () => {
+    const { repoRoot, binDir } = await createDoctorRepo();
+    const projectRoot = await createDoctorProject([
+      '---',
+      'tracker:',
+      '  kind: memory',
+      'workspace:',
+      '  provisioner:',
+      '    type: none',
+      '---',
+      'Claude runtime doctor fixture.'
+    ].join('\n'));
+    await writeExecutable(
+      path.join(binDir, 'claude'),
+      [
+        `#!${process.execPath}`,
+        'if (process.argv[2] === "--version") { console.log("2.1.224 (Claude Code)"); process.exit(0); }',
+        'if (process.argv[2] === "auth") { console.log(JSON.stringify({ loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", subscriptionType: "team", email: "must-not-leak@example.test" })); process.exit(0); }',
+        'process.exit(1);',
+        ''
+      ].join('\n')
+    );
+    const harness = createHarness({ repoRoot });
+    harness.deps.cwd = projectRoot;
+    harness.deps.env = {
+      PATH: binDir,
+      HOME: projectRoot,
+      SYMPHONY_AGENT_RUNTIME: 'claude-cli',
+      ANTHROPIC_MODEL: 'claude-sonnet-4-6'
+    };
+
+    await runCommandRouter({
+      argv: ['doctor', '--json', '--port', '0', '--i-understand-that-this-will-be-running-without-the-usual-guardrails'],
+      deps: harness.deps
+    });
+    const payload = JSON.parse(harness.stdout);
+
+    expect(doctorFinding(payload, 'claude.command')).toMatchObject({ severity: 'pass' });
+    expect(doctorFinding(payload, 'claude.version')).toMatchObject({
+      severity: 'pass',
+      details: { expectedVersion: '2.1.224', actualVersion: '2.1.224' }
+    });
+    expect(doctorFinding(payload, 'claude.runtime_scope')).toMatchObject({ severity: 'pass' });
+    expect(doctorFinding(payload, 'claude.session_persistence')).toMatchObject({ severity: 'pass' });
+    expect(doctorFinding(payload, 'claude.credential_boundary')).toMatchObject({ severity: 'pass' });
+    expect(doctorFinding(payload, 'claude.auth')).toMatchObject({
+      severity: 'pass',
+      details: {
+        loggedIn: true,
+        authMethod: 'claude.ai',
+        apiProvider: 'firstParty',
+        subscriptionType: 'team'
+      }
+    });
+    expect(JSON.stringify(doctorFinding(payload, 'claude.auth'))).not.toContain('must-not-leak@example.test');
   });
 
   it('reports environment-variable provenance for doctor env overrides', async () => {

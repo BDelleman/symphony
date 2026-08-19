@@ -23,6 +23,7 @@ export type WorkerCompletionReason =
   | typeof REASON_CODES.issueLeftActiveStates
   | typeof REASON_CODES.terminalStateReached;
 export interface WorkerExitDetails {
+  retryable?: boolean;
   completion_reason?: WorkerCompletionReason;
   refreshed_state?: string | null;
   worker_handle?: unknown;
@@ -113,6 +114,9 @@ export interface RunningEntry {
   persisted_turn_ids?: string[];
   pending_persisted_turn_ids?: string[];
   codex_app_server_pid: string | null;
+  agent_runtime?: 'codex-app-server' | 'claude-cli' | null;
+  worker_process_pid?: string | null;
+  last_process_liveness_at_ms?: number | null;
   turn_count: number;
   last_event: string | null;
   last_event_summary: string | null;
@@ -1109,6 +1113,9 @@ export interface OrchestratorPersistencePort {
     reasoning_output_tokens?: number | null;
     total_tokens?: number | null;
     model_context_window?: number | null;
+    runtime_provider?: string | null;
+    provider_turn_count?: number | null;
+    estimated_cost_usd?: number | null;
     telemetry_confidence: 'observed_live' | 'backfilled' | 'missing';
     observed_at: string;
     token_model_fact_id?: string;
@@ -1203,6 +1210,8 @@ export interface OrchestratorPersistencePort {
 export interface WorkerObservabilityEvent {
   timestamp_ms: number;
   event: string;
+  agent_runtime?: 'codex-app-server' | 'claude-cli';
+  worker_process_pid?: number | null;
   thread_id?: string;
   turn_id?: string;
   session_id?: string;
@@ -1215,6 +1224,8 @@ export interface WorkerObservabilityEvent {
   tool_call_id?: string | null;
   tool_name?: string | null;
   usage?: CodexUsageTotals;
+  provider_usage?: import('../agent').ProviderUsage;
+  process_liveness_only?: boolean;
   token_telemetry_status?: TokenTelemetryStatus;
   token_telemetry_last_source?: string | null;
   token_telemetry_last_at_ms?: number | null;

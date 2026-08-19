@@ -181,7 +181,7 @@ function appServerLiteSummaryForWorkerEvent(workerEvent: WorkerObservabilityEven
     };
   }
 
-  if (workerEvent.usage || workerEvent.rate_limits || workerEvent.token_telemetry_status) {
+  if (workerEvent.usage || workerEvent.provider_usage || workerEvent.rate_limits || workerEvent.token_telemetry_status) {
     return {
       payload_class: 'protocol_lifecycle',
       summary: `${workerEvent.event}: token/rate/model telemetry`,
@@ -189,6 +189,7 @@ function appServerLiteSummaryForWorkerEvent(workerEvent: WorkerObservabilityEven
         ...baseFields,
         protocol_event_category: 'token_rate_signal',
         usage: workerEvent.usage ?? null,
+        provider_usage: workerEvent.provider_usage ?? null,
         token_telemetry_status: workerEvent.token_telemetry_status ?? null,
         token_telemetry_last_source: workerEvent.token_telemetry_last_source ?? null,
         rate_limits: workerEvent.rate_limits ?? null,
@@ -237,9 +238,12 @@ function appServerLiteSummaryForWorkerEvent(workerEvent: WorkerObservabilityEven
 function executionGraphStatusForWorkerEvent(eventName: string): ExecutionGraphStatus {
   switch (eventName) {
     case CANONICAL_EVENT.codex.turnCompleted:
+    case CANONICAL_EVENT.agentRunner.turnCompleted:
     case CANONICAL_EVENT.codex.toolCallCompleted:
       return 'succeeded';
     case CANONICAL_EVENT.codex.turnFailed:
+    case CANONICAL_EVENT.agentRunner.turnFailed:
+    case CANONICAL_EVENT.agentRunner.turnTimedOut:
     case CANONICAL_EVENT.codex.toolCallFailed:
     case CANONICAL_EVENT.codex.dynamicToolCapabilityMismatch:
     case CANONICAL_EVENT.codex.unsupportedToolCall:
@@ -247,6 +251,7 @@ function executionGraphStatusForWorkerEvent(eventName: string): ExecutionGraphSt
     case CANONICAL_EVENT.codex.turnInputRequired:
       return 'blocked';
     case CANONICAL_EVENT.codex.turnCancelled:
+    case CANONICAL_EVENT.agentRunner.turnCancelled:
       return 'cancelled';
     default:
       return 'running';
@@ -271,8 +276,11 @@ function phaseSpanNameForWorkerEvent(eventName: string): string | null {
       return 'implementation';
     case CANONICAL_EVENT.codex.phaseValidation:
     case CANONICAL_EVENT.codex.turnCompleted:
+    case CANONICAL_EVENT.agentRunner.turnCompleted:
       return 'validation';
     case CANONICAL_EVENT.codex.turnFailed:
+    case CANONICAL_EVENT.agentRunner.turnFailed:
+    case CANONICAL_EVENT.agentRunner.turnTimedOut:
       return 'failed';
     case CANONICAL_EVENT.codex.turnInputRequired:
       return 'blocked_input';
@@ -306,14 +314,19 @@ function toolNameForWorkerEvent(workerEvent: WorkerObservabilityEvent): string |
 function transitionStatusForWorkerEvent(eventName: string): string | null {
   switch (eventName) {
     case CANONICAL_EVENT.codex.turnStarted:
+    case CANONICAL_EVENT.agentRunner.turnStarted:
       return 'running';
     case CANONICAL_EVENT.codex.turnInputRequired:
       return 'blocked';
     case CANONICAL_EVENT.codex.turnCompleted:
+    case CANONICAL_EVENT.agentRunner.turnCompleted:
       return 'succeeded';
     case CANONICAL_EVENT.codex.turnFailed:
+    case CANONICAL_EVENT.agentRunner.turnFailed:
+    case CANONICAL_EVENT.agentRunner.turnTimedOut:
       return 'failed';
     case CANONICAL_EVENT.codex.turnCancelled:
+    case CANONICAL_EVENT.agentRunner.turnCancelled:
       return 'cancelled';
     default:
       return null;
@@ -323,6 +336,7 @@ function transitionStatusForWorkerEvent(eventName: string): string | null {
 function shouldPersistTokenModelFact(workerEvent: WorkerObservabilityEvent): boolean {
   return Boolean(
     workerEvent.usage ||
+      workerEvent.provider_usage ||
       workerEvent.model_reroute !== undefined ||
       workerEvent.requested_model !== undefined ||
       workerEvent.effective_model !== undefined
@@ -333,6 +347,7 @@ function tokenModelFactSource(workerEvent: WorkerObservabilityEvent): string {
   return (
     workerEvent.token_telemetry_last_source ??
     workerEvent.model_reroute?.source ??
+    workerEvent.provider_usage?.source ??
     (workerEvent.usage ? 'worker_event_usage' : 'worker_event_model')
   );
 }
@@ -341,7 +356,11 @@ function tokenModelFactConfidence(workerEvent: WorkerObservabilityEvent): 'obser
   if (workerEvent.token_telemetry_status === 'unavailable') {
     return 'missing';
   }
-  return workerEvent.usage || workerEvent.model_reroute || workerEvent.requested_model || workerEvent.effective_model
+  return workerEvent.usage ||
+    workerEvent.provider_usage ||
+    workerEvent.model_reroute ||
+    workerEvent.requested_model ||
+    workerEvent.effective_model
     ? 'observed_live'
     : 'missing';
 }
@@ -710,12 +729,19 @@ export async function persistExecutionGraphWorkerEvent(params: {
         requested_model: workerEvent.requested_model ?? runningEntry.requested_model ?? null,
         effective_model: workerEvent.effective_model ?? runningEntry.effective_model ?? null,
         model_source: tokenModelFactSource(workerEvent),
-        input_tokens: workerEvent.usage?.input_tokens ?? null,
-        output_tokens: workerEvent.usage?.output_tokens ?? null,
-        cached_input_tokens: workerEvent.usage?.cached_input_tokens ?? null,
+        input_tokens: workerEvent.usage?.input_tokens ?? workerEvent.provider_usage?.input_tokens ?? null,
+        output_tokens: workerEvent.usage?.output_tokens ?? workerEvent.provider_usage?.output_tokens ?? null,
+        cached_input_tokens: workerEvent.usage?.cached_input_tokens ?? workerEvent.provider_usage?.cache_read_tokens ?? null,
         reasoning_output_tokens: workerEvent.usage?.reasoning_output_tokens ?? null,
-        total_tokens: workerEvent.usage?.total_tokens ?? null,
+        total_tokens:
+          workerEvent.usage?.total_tokens ??
+          (workerEvent.provider_usage?.input_tokens !== null && workerEvent.provider_usage?.output_tokens !== null
+            ? (workerEvent.provider_usage?.input_tokens ?? 0) + (workerEvent.provider_usage?.output_tokens ?? 0)
+            : null),
         model_context_window: workerEvent.usage?.model_context_window ?? null,
+        runtime_provider: workerEvent.agent_runtime ?? null,
+        provider_turn_count: workerEvent.provider_usage?.provider_turn_count ?? null,
+        estimated_cost_usd: workerEvent.provider_usage?.estimated_cost_usd ?? null,
         telemetry_confidence: tokenModelFactConfidence(workerEvent),
         observed_at: workerEvent.token_telemetry_last_at_ms ? asIso(workerEvent.token_telemetry_last_at_ms) : at
       });

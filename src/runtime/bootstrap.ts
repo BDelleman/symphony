@@ -7,7 +7,8 @@ import { spawnSync } from 'node:child_process';
 
 import { ControlPlaneHealthRecorder, LocalApiServer, type ApiProjectLayoutDiagnostics } from '../api';
 import { SnapshotService } from '../api/snapshot-service';
-import { CodexRunner, createDefaultDynamicToolExecutor, type CodexRunnerEvent } from '../codex';
+import { CodexRunner, createDefaultDynamicToolExecutor } from '../codex';
+import { ClaudeCliRunner, CodexAgentRunner, type AgentRunnerEvent } from '../agent';
 import {
   DEFAULT_LOG_FILE_NAME,
   LevelFilterSink,
@@ -485,11 +486,13 @@ export function createRuntimeTerminateWorkerPort(
     bridge.terminateWorker({ issue_id, worker_handle, cleanup_workspace, reason });
 }
 
-export function toWorkerEvent(event: CodexRunnerEvent, nowMs: number): WorkerObservabilityEvent {
+export function toWorkerEvent(event: AgentRunnerEvent, nowMs: number): WorkerObservabilityEvent {
   const parsed = Date.parse(event.timestamp);
   return {
     timestamp_ms: Number.isFinite(parsed) ? parsed : nowMs,
     event: event.event,
+    agent_runtime: event.agent_runtime,
+    worker_process_pid: event.worker_process_pid,
     thread_id: event.thread_id,
     turn_id: event.turn_id,
     session_id: event.session_id,
@@ -500,6 +503,8 @@ export function toWorkerEvent(event: CodexRunnerEvent, nowMs: number): WorkerObs
     request_method: event.request_method,
     request_category: event.request_category,
     usage: event.usage,
+    provider_usage: event.provider_usage,
+    process_liveness_only: event.process_liveness_only,
     rate_limits: event.rate_limits,
     codex_thread_activity_at_ms: event.codex_thread_activity_at_ms,
     codex_thread_activity_source: event.codex_thread_activity_source,
@@ -1083,6 +1088,16 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
       fetchFn: options.fetchFn
     })
   });
+  const agentRuntimeConfig = effectiveConfig.agent_runtime;
+  const agentRunner =
+    agentRuntimeConfig?.selected === 'claude-cli'
+      ? new ClaudeCliRunner({
+          command: agentRuntimeConfig.claude_command,
+          model: agentRuntimeConfig.claude_model ?? '',
+          allowNonSubscriptionAuth: agentRuntimeConfig.claude_allow_non_subscription_auth,
+          supportedVersion: agentRuntimeConfig.claude_supported_version
+        })
+      : new CodexAgentRunner(codexRunner);
   let orchestrator: OrchestratorCore;
   let apiServer: LocalApiServer | null = null;
   let runtimeStarted = false;
@@ -1090,12 +1105,19 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
   const bridge = new LocalRunnerBridge({
     workspaceManager,
     codexRunner,
+    agentRunner,
     config: effectiveConfig,
     logger,
     promptTemplate: workflowDefinition.prompt_template,
     issueStateFetcher: async (issue_ids) => tracker.fetch_issue_states_by_ids(issue_ids),
-    onWorkerExit: async ({ issue_id, reason, error, completion_reason, refreshed_state, worker_instance_id, session_id }) => {
-      await orchestrator.onWorkerExit(issue_id, reason, error, { completion_reason, refreshed_state, worker_instance_id, session_id });
+    onWorkerExit: async ({ issue_id, reason, error, completion_reason, refreshed_state, worker_instance_id, session_id, retryable }) => {
+      await orchestrator.onWorkerExit(issue_id, reason, error, {
+        completion_reason,
+        refreshed_state,
+        worker_instance_id,
+        session_id,
+        retryable
+      });
     },
     onWorkerEvent: ({ issue_id, event }) => {
       orchestrator.onWorkerEvent(issue_id, toWorkerEvent(event, nowMs()));

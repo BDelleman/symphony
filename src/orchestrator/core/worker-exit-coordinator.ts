@@ -663,6 +663,39 @@ export async function coordinateWorkerExit(
         return;
       }
 
+      if (details.retryable === false) {
+        context.hooks.emitPhaseMarker(issue_id, {
+          phase: 'failed',
+          detail: error ?? `worker exited: ${reason}`,
+          attempt: running.retry_attempt,
+          thread_id: running.thread_id,
+          session_id: running.session_id
+        });
+        await context.hooks.persistExecutionGraphStateTransition(
+          running,
+          'failed',
+          'failed',
+          stopReasonCode,
+          error ?? `worker exited: ${reason}`
+        );
+        context.logger?.log({
+          level: 'error',
+          event: CANONICAL_EVENT.orchestration.workerExitHandled,
+          message: 'worker exit handled: non-retryable failure',
+          context: {
+            issue_id,
+            issue_identifier: running.identifier,
+            session_id: running.session_id,
+            reason,
+            outcome: 'failed',
+            retryable: false,
+            error: error ?? null
+          }
+        });
+        context.ports.notifyObservers?.();
+        return;
+      }
+
       await context.hooks.scheduleRetry({
         issue_id,
         identifier: running.identifier,

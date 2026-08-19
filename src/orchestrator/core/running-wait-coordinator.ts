@@ -194,6 +194,7 @@ export function coordinateResetRunningWaitEpisode(runningEntry: RunningEntry, pr
 
 export function coordinateIsMeaningfulWorkerProgressEvent(workerEvent: WorkerObservabilityEvent): boolean {
   return (
+    (workerEvent.event === CANONICAL_EVENT.agentRunner.activity && !workerEvent.process_liveness_only) ||
     workerEvent.event === CANONICAL_EVENT.codex.dynamicToolCapabilityMismatch ||
     workerEvent.event === CANONICAL_EVENT.codex.approvalAutoApproved ||
     workerEvent.event === CANONICAL_EVENT.codex.toolInputAutoAnswered ||

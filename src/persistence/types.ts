@@ -327,6 +327,9 @@ export interface TokenModelFactRecord {
   reasoning_output_tokens: number | null;
   total_tokens: number | null;
   model_context_window: number | null;
+  runtime_provider?: string | null;
+  provider_turn_count?: number | null;
+  estimated_cost_usd?: number | null;
   telemetry_confidence: TokenModelTelemetryConfidence;
   observed_at: string;
 }

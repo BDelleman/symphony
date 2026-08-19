@@ -250,6 +250,13 @@ function historyMigrations(): HistoryMigration[] {
       apply: (context) => {
         ensureRuntimeUpdateDrainAuditEventTypes(context.db);
       }
+    },
+    {
+      version: 13,
+      name: 'provider_usage_dimensions_v1',
+      apply: (context) => {
+        ensureTokenModelFactColumns(context.db, context.recordHistoryHealthMetadata);
+      }
     }
   ];
 }
@@ -588,7 +595,10 @@ function ensureTokenModelFactColumns(
   const existing = new Set(columns.map((column) => column.name));
   const migrations: Array<[string, string]> = [
     ['requested_model', 'ALTER TABLE history_token_model_fact ADD COLUMN requested_model TEXT'],
-    ['model_context_window', 'ALTER TABLE history_token_model_fact ADD COLUMN model_context_window INTEGER']
+    ['model_context_window', 'ALTER TABLE history_token_model_fact ADD COLUMN model_context_window INTEGER'],
+    ['runtime_provider', 'ALTER TABLE history_token_model_fact ADD COLUMN runtime_provider TEXT'],
+    ['provider_turn_count', 'ALTER TABLE history_token_model_fact ADD COLUMN provider_turn_count INTEGER'],
+    ['estimated_cost_usd', 'ALTER TABLE history_token_model_fact ADD COLUMN estimated_cost_usd REAL']
   ];
   for (const [column, sql] of migrations) {
     if (!existing.has(column)) {

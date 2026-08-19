@@ -5,14 +5,19 @@ import { describe, expect, it } from 'vitest';
 import { parseWorkflowFrontMatter } from '../../src/workflow/frontmatter';
 
 describe('workflow command examples', () => {
-  it('uses typed model selection instead of shell-interpolated codex app-server commands', () => {
+  it('keeps runtime and model selection in the project environment', () => {
     const workflowPath = path.join(process.cwd(), 'WORKFLOW.md');
     const workflow = readFileSync(workflowPath, 'utf8');
+    const envExample = readFileSync(path.join(process.cwd(), '.env.example'), 'utf8');
+    const worktreeInclude = readFileSync(path.join(process.cwd(), '.worktreeinclude'), 'utf8');
 
     expect(workflow).not.toMatch(/--model\s+\S+\s+app-server/);
     expect(workflow).not.toMatch(/CODEX_HOME=.*codex .*app-server/);
-    expect(workflow).toMatch(/codex:\n(?:  .+\n)*  model: [^\s]+\n/);
-    expect(workflow).toMatch(/  reasoning_effort: medium\n/);
+    expect(workflow).not.toMatch(/^  (?:home|model|reasoning_effort|extra_flags):/m);
+    expect(envExample).toContain('SYMPHONY_AGENT_RUNTIME=codex');
+    expect(envExample).toContain('ANTHROPIC_MODEL=');
+    expect(envExample).toContain('SYMPHONY_CODEX_MODEL=');
+    expect(worktreeInclude).not.toMatch(/^\.env(?:\..*)?$/m);
   });
 
   it('keeps the checked-in self-hosting workspace root under system state', () => {

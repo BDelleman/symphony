@@ -38,7 +38,7 @@ workspace:
 
 hooks:
   after_create: |
-    uv run --python 3.14 python scripts/worktree_bootstrap.py --allow-sensitive
+    uv run --python 3.14 python scripts/worktree_bootstrap.py
   before_remove: |
     node scripts/workspace-before-remove.js
   timeout_ms: 60000
@@ -52,12 +52,6 @@ agent:
     control_plane_health: degraded
     control_plane_stale_after_ms: 60000
 codex:
-  home: $HOME/.codex
-  model: gpt-5.5
-  reasoning_effort: medium
-  extra_flags:
-    - --config
-    - shell_environment_policy.inherit=all
   read_timeout_ms: 15000
   approval_policy: never
   thread_sandbox: danger-full-access

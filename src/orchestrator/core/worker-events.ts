@@ -133,7 +133,11 @@ export function isTerminalTurnEvent(event: string): boolean {
   return (
     event === CANONICAL_EVENT.codex.turnCompleted ||
     event === CANONICAL_EVENT.codex.turnFailed ||
-    event === CANONICAL_EVENT.codex.turnCancelled
+    event === CANONICAL_EVENT.codex.turnCancelled ||
+    event === CANONICAL_EVENT.agentRunner.turnCompleted ||
+    event === CANONICAL_EVENT.agentRunner.turnFailed ||
+    event === CANONICAL_EVENT.agentRunner.turnCancelled ||
+    event === CANONICAL_EVENT.agentRunner.turnTimedOut
   );
 }
 
@@ -141,6 +145,7 @@ export function shouldResetRunningWaitEpisode(event: string): boolean {
   return (
     isTerminalTurnEvent(event) ||
     event === CANONICAL_EVENT.codex.turnStarted ||
+    event === CANONICAL_EVENT.agentRunner.turnStarted ||
     event === CANONICAL_EVENT.codex.promptSent ||
     event === CANONICAL_EVENT.codex.turnInputRequired ||
     event === CANONICAL_EVENT.codex.startupFailed ||
@@ -420,7 +425,17 @@ export function applyWorkerEvent(context: WorkerEventWorkflowContext): void {
     return;
   }
 
-  runningEntry.last_codex_timestamp_ms = workerEvent.timestamp_ms;
+  if (workerEvent.process_liveness_only) {
+    runningEntry.last_process_liveness_at_ms = workerEvent.timestamp_ms;
+  } else {
+    runningEntry.last_codex_timestamp_ms = workerEvent.timestamp_ms;
+  }
+  if (workerEvent.agent_runtime) {
+    runningEntry.agent_runtime = workerEvent.agent_runtime;
+  }
+  if (workerEvent.worker_process_pid !== undefined && workerEvent.worker_process_pid !== null) {
+    runningEntry.worker_process_pid = String(workerEvent.worker_process_pid);
+  }
   runningEntry.last_event = workerEvent.event;
   runningEntry.last_event_summary = humanizeWorkerEvent(workerEvent);
   runningEntry.last_message = workerEvent.detail ?? null;
@@ -508,6 +523,8 @@ export function applyWorkerEvent(context: WorkerEventWorkflowContext): void {
     runningEntry.token_telemetry_status = 'pending';
     runningEntry.token_telemetry_turn_started_at_ms = workerEvent.timestamp_ms;
     runningEntry.token_telemetry_warning_emitted = false;
+  } else if (workerEvent.event === CANONICAL_EVENT.agentRunner.turnStarted) {
+    runningEntry.turn_count += 1;
   }
 
   const usageThreadMatches =
@@ -573,9 +590,11 @@ export function applyWorkerEvent(context: WorkerEventWorkflowContext): void {
     runningEntry.token_telemetry_status = 'unavailable';
   }
 
-  context.maybeEmitTokenTelemetryWarning(runningEntry, workerEvent.timestamp_ms);
-  context.maybeEmitBudgetTelemetryUnavailable(runningEntry, workerEvent);
-  context.maybeEnforceBudget(issueId, runningEntry, workerEvent.timestamp_ms);
+  if (workerEvent.agent_runtime !== 'claude-cli') {
+    context.maybeEmitTokenTelemetryWarning(runningEntry, workerEvent.timestamp_ms);
+    context.maybeEmitBudgetTelemetryUnavailable(runningEntry, workerEvent);
+    context.maybeEnforceBudget(issueId, runningEntry, workerEvent.timestamp_ms);
+  }
 
   if (workerEvent.rate_limits) {
     state.codex_rate_limits = { ...workerEvent.rate_limits };
@@ -938,6 +957,7 @@ export function classifyWorkerActivity(params: {
   const latestLivenessAtMs = Math.max(
     0,
     runningEntry.last_codex_timestamp_ms ?? runningEntry.started_at_ms,
+    runningEntry.last_process_liveness_at_ms ?? 0,
     runningEntry.last_heartbeat_at_ms ?? 0,
     latestThreadActivityAtMs ?? 0
   );

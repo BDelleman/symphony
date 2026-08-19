@@ -243,6 +243,9 @@ export interface AppendTokenModelFactParams {
   reasoning_output_tokens?: number | null;
   total_tokens?: number | null;
   model_context_window?: number | null;
+  runtime_provider?: string | null;
+  provider_turn_count?: number | null;
+  estimated_cost_usd?: number | null;
   telemetry_confidence: TokenModelTelemetryConfidence;
   observed_at: string;
   token_model_fact_id?: string;
@@ -1032,6 +1035,16 @@ export class ExecutionGraphWriter {
     const reasoningOutputTokens = validateOptionalTokenCount(params.reasoning_output_tokens, 'reasoning_output_tokens');
     const totalTokens = validateOptionalTokenCount(params.total_tokens, 'total_tokens');
     const modelContextWindow = validateOptionalTokenCount(params.model_context_window, 'model_context_window');
+    const runtimeProvider = normalizeOptionalText(params.runtime_provider);
+    const providerTurnCount = validateOptionalTokenCount(params.provider_turn_count, 'provider_turn_count');
+    const estimatedCostUsd =
+      params.estimated_cost_usd === undefined || params.estimated_cost_usd === null
+        ? null
+        : Number.isFinite(params.estimated_cost_usd) && params.estimated_cost_usd >= 0
+          ? params.estimated_cost_usd
+          : (() => {
+              throw new Error('estimated_cost_usd must be a non-negative finite number');
+            })();
     const telemetryConfidence = normalizeTelemetryConfidence(params.telemetry_confidence);
     const tokenModelFactId =
       params.token_model_fact_id ??
@@ -1049,6 +1062,9 @@ export class ExecutionGraphWriter {
         reasoningOutputTokens,
         totalTokens,
         modelContextWindow,
+        runtimeProvider,
+        providerTurnCount,
+        estimatedCostUsd,
         telemetryConfidence,
         params.observed_at
       ]);
@@ -1058,8 +1074,8 @@ export class ExecutionGraphWriter {
         `INSERT INTO history_token_model_fact
         (token_model_fact_id, issue_run_id, attempt_id, thread_id, turn_id, requested_model, effective_model,
          model_source, input_tokens, output_tokens, cached_input_tokens, reasoning_output_tokens, total_tokens,
-         model_context_window, telemetry_confidence, observed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         model_context_window, runtime_provider, provider_turn_count, estimated_cost_usd, telemetry_confidence, observed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         tokenModelFactId,
@@ -1076,6 +1092,9 @@ export class ExecutionGraphWriter {
         reasoningOutputTokens,
         totalTokens,
         modelContextWindow,
+        runtimeProvider,
+        providerTurnCount,
+        estimatedCostUsd,
         telemetryConfidence,
         params.observed_at
       );

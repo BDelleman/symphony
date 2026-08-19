@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import dotenv from 'dotenv';
@@ -42,6 +43,22 @@ import {
   type PortableSkillId,
   type PortableSkillPrerequisiteKind
 } from '../workflow/portable-skill-catalog';
+import { CLAUDE_SUPPORTED_VERSION } from '../agent';
+
+const CLAUDE_NON_SUBSCRIPTION_ENV_NAMES = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_BEDROCK_BASE_URL',
+  'ANTHROPIC_VERTEX_BASE_URL',
+  'ANTHROPIC_FOUNDRY_BASE_URL',
+  'AWS_BEARER_TOKEN_BEDROCK',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_MANTLE',
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS'
+] as const;
 
 export type DoctorCheckStatus = 'ok' | 'warning' | 'failure';
 export type DoctorOverallStatus = DoctorCheckStatus;
@@ -80,7 +97,7 @@ export type DoctorFindingSafeFixMutationScope = 'project_file' | 'user_local_sta
 export interface DoctorFindingSafeFixMutation {
   scope: DoctorFindingSafeFixMutationScope;
   path: string;
-  operation: 'append_gitignore_entry' | 'record_setup_consent' | 'refresh_local_shim';
+  operation: 'append_gitignore_entry' | 'record_setup_consent' | 'refresh_local_shim' | 'chmod_env_file';
 }
 
 export interface DoctorFindingSafeFix {
@@ -386,6 +403,21 @@ function safeFixForFinding(
           scope: 'user_local_state',
           path: context.setupConsentStorePath ?? 'user-local setup consent store',
           operation: 'record_setup_consent'
+        }
+      ]
+    };
+  }
+  if (check.id === 'env.permissions') {
+    return {
+      available: check.status !== 'ok',
+      fixId: 'env-permissions',
+      command: 'symphony doctor --fix --yes',
+      requiresYes: true,
+      mutates: [
+        {
+          scope: 'project_file',
+          path: context.projectRoot ? path.join(context.projectRoot, '.env') : '.env',
+          operation: 'chmod_env_file'
         }
       ]
     };
@@ -997,6 +1029,7 @@ async function probeCodexSkillDiscovery(params: {
 }
 
 function isSensitiveKey(key: string): boolean {
+  if (key === 'authMethod') return false;
   return /(api[_-]?key|token|secret|password|credential|authorization|auth)/i.test(key);
 }
 
@@ -1050,6 +1083,7 @@ function normalizeFixAction(fix: DoctorFixActionInput): DoctorFixAction {
       'shim_checkout.built_cli'
     ],
     'layout.gitignore-system': ['layout.gitignore_system'],
+    'env-permissions': ['env.permissions'],
     'setup-consent': ['setup.consent']
   };
   return {
@@ -1672,6 +1706,167 @@ function addCodexCommandCheck(checks: DoctorFinding[], effectiveConfig: Effectiv
   });
 }
 
+function readClaudeUserSettingSelectors(env: NodeJS.ProcessEnv): string[] {
+  const home = env.HOME?.trim() || os.homedir();
+  const settingsPath = path.join(home, '.claude', 'settings.json');
+  if (!fs.existsSync(settingsPath)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as unknown;
+    const record = workflowRecord(parsed);
+    const settingsEnv = workflowRecord(record.env);
+    return [
+      ...(record.apiKeyHelper ? ['apiKeyHelper'] : []),
+      ...CLAUDE_NON_SUBSCRIPTION_ENV_NAMES.filter((name) => {
+        const value = settingsEnv[name];
+        return typeof value === 'string' ? value.trim().length > 0 : value !== null && value !== undefined;
+      })
+    ];
+  } catch {
+    return ['invalid_user_settings'];
+  }
+}
+
+function addClaudeRuntimeChecks(checks: DoctorFinding[], effectiveConfig: EffectiveConfig, env: NodeJS.ProcessEnv): void {
+  const runtime = effectiveConfig.agent_runtime;
+  if (!runtime || runtime.selected !== 'claude-cli') return;
+
+  const platformReady = ['darwin', 'linux'].includes(process.platform);
+  const remoteHosts = effectiveConfig.worker?.ssh_hosts ?? [];
+  addCheck(checks, {
+    id: 'claude.runtime_scope',
+    title: 'Claude runtime is local on a supported platform',
+    status: platformReady && remoteHosts.length === 0 ? 'ok' : 'failure',
+    reason:
+      !platformReady ? 'claude_platform_unsupported' : remoteHosts.length > 0 ? 'claude_remote_worker_unsupported' : 'claude_runtime_scope_supported',
+    summary:
+      !platformReady
+        ? `Claude CLI runtime is unsupported on ${process.platform}.`
+        : remoteHosts.length > 0
+          ? 'Claude CLI runtime does not support configured SSH worker hosts.'
+          : `Claude CLI runtime is local on supported platform ${process.platform}.`,
+    remediation:
+      platformReady && remoteHosts.length === 0
+        ? undefined
+        : 'Use a local macOS/Linux worker or select the Codex runtime for remote workers.',
+    details: { platform: process.platform, configuredRemoteHostCount: remoteHosts.length }
+  });
+  const persistenceDisabled = Boolean(env.CLAUDE_CODE_SKIP_PROMPT_HISTORY?.trim());
+  addCheck(checks, {
+    id: 'claude.session_persistence',
+    title: 'Claude session persistence is enabled',
+    status: persistenceDisabled ? 'failure' : 'ok',
+    reason: persistenceDisabled ? 'claude_session_persistence_disabled' : 'claude_session_persistence_ready',
+    summary: persistenceDisabled
+      ? 'CLAUDE_CODE_SKIP_PROMPT_HISTORY disables the transcript needed for exact attempt-local resume.'
+      : 'No session-persistence disabling selector was detected.',
+    remediation: persistenceDisabled ? 'Unset CLAUDE_CODE_SKIP_PROMPT_HISTORY before starting Symphony.' : undefined,
+    details: { disabled: persistenceDisabled }
+  });
+  addCheck(checks, {
+    id: 'claude.model',
+    title: 'Claude model is pinned',
+    status: runtime.claude_model ? 'ok' : 'failure',
+    reason: runtime.claude_model ? 'claude_model_pinned' : 'claude_model_missing',
+    summary: runtime.claude_model ? `Claude model is pinned to ${runtime.claude_model}.` : 'ANTHROPIC_MODEL is missing.',
+    details: { requestedModel: runtime.claude_model }
+  });
+
+  const executablePath = findCommandOnPath(runtime.claude_command, env);
+  addCheck(checks, {
+    id: 'claude.command',
+    title: 'Claude command is available',
+    status: executablePath ? 'ok' : 'failure',
+    reason: executablePath ? 'claude_command_available' : 'claude_command_missing',
+    summary: executablePath ? `Claude command resolves to ${executablePath}.` : `Claude command is not executable: ${runtime.claude_command}`,
+    remediation: executablePath ? undefined : 'Install the supported Claude CLI or set SYMPHONY_CLAUDE_COMMAND to an executable path.',
+    details: { command: runtime.claude_command, executablePath }
+  });
+  if (!executablePath) return;
+
+  const versionResult = spawnSync(executablePath, ['--version'], {
+    env,
+    encoding: 'utf8',
+    shell: false,
+    maxBuffer: 1024 * 1024
+  });
+  const version = `${versionResult.stdout ?? ''}\n${versionResult.stderr ?? ''}`.match(/\b\d+\.\d+\.\d+\b/)?.[0] ?? null;
+  const versionReady = versionResult.status === 0 && version === CLAUDE_SUPPORTED_VERSION;
+  addCheck(checks, {
+    id: 'claude.version',
+    title: 'Claude CLI contract version is pinned',
+    status: versionReady ? 'ok' : 'failure',
+    reason: versionReady ? 'claude_version_supported' : 'claude_version_unsupported',
+    summary: versionReady
+      ? `Claude CLI ${version} matches the supported adapter contract.`
+      : `Claude CLI version ${version ?? 'unknown'} does not match required ${CLAUDE_SUPPORTED_VERSION}.`,
+    remediation: versionReady ? undefined : `Install Claude CLI ${CLAUDE_SUPPORTED_VERSION} and disable its auto-updater for Symphony runs.`,
+    details: { expectedVersion: CLAUDE_SUPPORTED_VERSION, actualVersion: version, exitStatus: versionResult.status }
+  });
+
+  const selectors = [
+    ...CLAUDE_NON_SUBSCRIPTION_ENV_NAMES.filter((name) => Boolean(env[name]?.trim())),
+    ...readClaudeUserSettingSelectors(env)
+  ];
+  const routingReady =
+    !selectors.includes('invalid_user_settings') &&
+    (runtime.claude_allow_non_subscription_auth || selectors.length === 0);
+  addCheck(checks, {
+    id: 'claude.credential_boundary',
+    title: 'Claude credential route is approved',
+    status: routingReady ? 'ok' : 'failure',
+    reason: routingReady ? 'claude_credential_route_approved' : 'claude_non_subscription_route_forbidden',
+    summary: routingReady
+      ? runtime.claude_allow_non_subscription_auth
+        ? 'Non-subscription Claude authentication is explicitly enabled.'
+        : 'No API, gateway, or cloud-provider selector was detected.'
+      : `Detected non-subscription Claude routing selector(s): ${selectors.join(', ')}.`,
+    remediation: routingReady ? undefined : 'Remove the selectors or explicitly set SYMPHONY_CLAUDE_ALLOW_NON_SUBSCRIPTION_AUTH=true.',
+    details: { selectors: [...new Set(selectors)], overrideEnabled: runtime.claude_allow_non_subscription_auth }
+  });
+
+  const authResult = spawnSync(executablePath, ['auth', 'status', '--json'], {
+    env,
+    encoding: 'utf8',
+    shell: false,
+    maxBuffer: 1024 * 1024
+  });
+  let auth: { loggedIn: boolean; authMethod: string | null; apiProvider: string | null; subscriptionType: string | null } = {
+    loggedIn: false,
+    authMethod: null,
+    apiProvider: null,
+    subscriptionType: null
+  };
+  try {
+    const payload = workflowRecord(JSON.parse(authResult.stdout || '{}'));
+    auth = {
+      loggedIn: payload.loggedIn === true,
+      authMethod: typeof payload.authMethod === 'string' ? payload.authMethod : null,
+      apiProvider: typeof payload.apiProvider === 'string' ? payload.apiProvider : null,
+      subscriptionType: typeof payload.subscriptionType === 'string' ? payload.subscriptionType : null
+    };
+  } catch {
+    // The redacted default below becomes a blocking readiness finding.
+  }
+  const subscriptionReady =
+    authResult.status === 0 &&
+    auth.loggedIn &&
+    (runtime.claude_allow_non_subscription_auth ||
+      (auth.authMethod === 'claude.ai' &&
+        auth.apiProvider === 'firstParty' &&
+        ['team', 'enterprise'].includes(auth.subscriptionType ?? '')));
+  addCheck(checks, {
+    id: 'claude.auth',
+    title: 'Claude authentication is ready',
+    status: subscriptionReady ? 'ok' : 'failure',
+    reason: subscriptionReady ? 'claude_auth_ready' : 'claude_subscription_auth_required',
+    summary: subscriptionReady
+      ? 'Claude authentication matches the configured route policy.'
+      : 'Claude authentication is missing or does not match the required Team/Enterprise subscription route.',
+    remediation: subscriptionReady ? undefined : 'Run `claude auth login`, then verify Team/Enterprise first-party authentication with `symphony doctor`.',
+    details: auth
+  });
+}
+
 function addTrackerCredentialCheck(checks: DoctorFinding[], effectiveConfig: EffectiveConfig): void {
   const tracker = effectiveConfig.tracker;
   if (tracker.kind === 'memory') {
@@ -1928,7 +2123,11 @@ export async function runLocalDoctor(options: RunLocalDoctorOptions): Promise<{
       addTrackerCredentialCheck(checks, workflowValidation.effectiveConfig);
       addHookCommandReadinessCheck(checks, workflowValidation.effectiveConfig, dashboardEnv);
       if (workflowValidation.configValid) {
-        addCodexCommandCheck(checks, workflowValidation.effectiveConfig, dashboardEnv);
+        if (workflowValidation.effectiveConfig.agent_runtime?.selected === 'claude-cli') {
+          addClaudeRuntimeChecks(checks, workflowValidation.effectiveConfig, dashboardEnv);
+        } else {
+          addCodexCommandCheck(checks, workflowValidation.effectiveConfig, dashboardEnv);
+        }
         addWorkspaceChecks(checks, resolved, workflowValidation.effectiveConfig);
       }
     }
@@ -1947,6 +2146,54 @@ export async function runLocalDoctor(options: RunLocalDoctorOptions): Promise<{
         exists: fs.existsSync(resolved.envFilePath)
       }
     });
+    if (process.platform !== 'win32' && fs.existsSync(resolved.envFilePath)) {
+      let mode = fs.statSync(resolved.envFilePath).mode & 0o777;
+      if (mode !== 0o600 && args.fix) {
+        if (args.ci) {
+          addFix(fixes, {
+            id: 'env-permissions',
+            status: 'skipped',
+            summary: 'Project .env permissions were not changed because `--ci` forbids doctor fix mutations.'
+          });
+        } else if (!args.yes) {
+          addFix(fixes, {
+            id: 'env-permissions',
+            status: 'skipped',
+            summary: 'Project .env permissions were not changed because `--yes` was not provided.'
+          });
+        } else {
+          try {
+            fs.chmodSync(resolved.envFilePath, 0o600);
+            mode = fs.statSync(resolved.envFilePath).mode & 0o777;
+            addFix(fixes, {
+              id: 'env-permissions',
+              status: mode === 0o600 ? 'applied' : 'failed',
+              summary: mode === 0o600 ? 'Changed project .env permissions to 0600.' : 'Project .env permissions did not become 0600.'
+            });
+          } catch (error) {
+            addFix(fixes, {
+              id: 'env-permissions',
+              status: 'failed',
+              summary: `Could not change project .env permissions: ${error instanceof Error ? error.message : String(error)}`
+            });
+          }
+        }
+      }
+      const permissionReady = mode === 0o600;
+      addCheck(checks, {
+        id: 'env.permissions',
+        title: 'Project env file permissions are private',
+        status: permissionReady ? 'ok' : 'failure',
+        reason: permissionReady ? 'env_permissions_private' : 'env_permissions_insecure',
+        summary: permissionReady ? 'Project .env permissions are 0600.' : `Project .env permissions are ${mode.toString(8).padStart(4, '0')}; required mode is 0600.`,
+        remediation: permissionReady ? undefined : 'Run `symphony doctor --fix --yes` or `chmod 600 .env`.',
+        safeFix: safeFixForFinding(
+          { id: 'env.permissions', status: permissionReady ? 'ok' : 'failure' },
+          { projectRoot: resolved.currentProjectRoot }
+        ),
+        details: { mode: mode.toString(8).padStart(4, '0'), requiredMode: '0600' }
+      });
+    }
 
     layout = inspectProjectLayout(resolved.currentProjectRoot);
     if (args.fix && args.ci && !layout.ignoreAnalysis.hasNarrowSystemIgnore) {
@@ -1993,7 +2240,10 @@ export async function runLocalDoctor(options: RunLocalDoctorOptions): Promise<{
       dashboardEnv,
       resolved.envFilePath
     );
-    if (workflowValidation.effectiveConfig) {
+    if (
+      workflowValidation.effectiveConfig &&
+      workflowValidation.effectiveConfig.agent_runtime?.selected !== 'claude-cli'
+    ) {
       addCheck(
         checks,
         await probeCodexSkillDiscovery({
