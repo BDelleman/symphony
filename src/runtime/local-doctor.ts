@@ -51,7 +51,11 @@ import {
   resolveTrustedExecutable
 } from '../agent';
 import { auditSensitiveWorkspaceFiles, type SensitiveWorkspaceFileViolation } from '../workspace';
-import { findLatestTerminalRunEventEvidence, SqlitePersistenceStore } from '../persistence';
+import {
+  classifyPersistedWorkerOwnership,
+  findLatestTerminalRunEventEvidence,
+  SqlitePersistenceStore
+} from '../persistence';
 import { REASON_CODES } from '../observability';
 
 const CLAUDE_NON_SUBSCRIPTION_ENV_NAMES = [
@@ -2014,15 +2018,6 @@ interface HistoryReconciliationAudit {
   error: string | null;
 }
 
-function processPidIsLive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
 function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit {
   if (!fs.existsSync(dbPath)) {
     return { databaseExists: false, active: 0, repairable: 0, ambiguous: 0, error: null };
@@ -2071,9 +2066,11 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
     let repairable = 0;
     let ambiguous = 0;
     for (const row of rows) {
+      let terminalEvidence = Boolean(row.completed_at && row.terminal_status);
       if (!row.completed_at || !row.terminal_status) {
         const terminalEvent = findLatestTerminalRunEventEvidence(db!, row.issue_run_id, row.issue_id, row.started_at);
-        if (!terminalEvent) {
+        terminalEvidence = terminalEvent !== null;
+        if (!terminalEvidence) {
           const supersedingRun = db!.prepare(
             `SELECT issue_run_id
              FROM issue_run
@@ -2085,10 +2082,7 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
              ORDER BY started_at ASC
              LIMIT 1`
           ).get(row.issue_id, row.issue_run_id, row.started_at);
-          if (!supersedingRun) {
-            ambiguous += 1;
-            continue;
-          }
+          terminalEvidence = Boolean(supersedingRun);
         }
       }
       const owners = db!.prepare(
@@ -2097,13 +2091,12 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
          JOIN attempt ON attempt.attempt_id = thread.attempt_id
          WHERE attempt.issue_run_id = ? AND thread.ended_at IS NULL`
       ).all(row.issue_run_id) as Array<{ worker_instance_id: string | null; worker_process_pid: number | null }>;
-      const ownershipAmbiguous = owners.some((owner) =>
-        owner.worker_process_pid === null
-          ? owner.worker_instance_id !== null
-          : processPidIsLive(owner.worker_process_pid)
-      );
-      if (ownershipAmbiguous) ambiguous += 1;
-      else repairable += 1;
+      const workerOwnership = classifyPersistedWorkerOwnership(owners);
+      if (workerOwnership === 'active_or_unknown' || (!terminalEvidence && workerOwnership !== 'inactive')) {
+        ambiguous += 1;
+      } else {
+        repairable += 1;
+      }
     }
     return { databaseExists: true, active: rows.length, repairable, ambiguous, error: null };
   } catch (error) {

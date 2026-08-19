@@ -1,7 +1,7 @@
 import { REASON_CODES } from '../observability/reason-codes';
 import { redactUnknown } from '../security/redaction';
 import { AppServerLedgerStore } from './app-server-ledger-store';
-import { findLatestTerminalRunEventEvidence } from './execution-graph-reconciliation';
+import { classifyPersistedWorkerOwnership, findLatestTerminalRunEventEvidence } from './execution-graph-reconciliation';
 import {
   ExecutionGraphWriter,
   type AppendDrainAuditHistoryParams,
@@ -242,13 +242,11 @@ export class SqlitePersistenceStore {
           .get(row.issue_id, row.issue_run_id, row.started_at) as
           | { issue_run_id: string; started_at: string }
           | undefined;
-        if (!supersedingRun) {
-          ambiguous += 1;
-          continue;
+        if (supersedingRun) {
+          recoveryAt = supersedingRun.started_at;
+          recoveryStatus = 'cancelled';
+          recoveryDetail = `Closed after later terminal issue run ${supersedingRun.issue_run_id} proved this run was superseded.`;
         }
-        recoveryAt = supersedingRun.started_at;
-        recoveryStatus = 'cancelled';
-        recoveryDetail = `Closed after later terminal issue run ${supersedingRun.issue_run_id} proved this run was superseded.`;
       }
       const workerOwners = this.db
         .prepare(
@@ -258,18 +256,19 @@ export class SqlitePersistenceStore {
            WHERE attempt.issue_run_id = ? AND thread.ended_at IS NULL`
         )
         .all(row.issue_run_id) as Array<{ worker_instance_id: string | null; worker_process_pid: number | null }>;
-      const workerOwnershipAmbiguous = workerOwners.some((owner) => {
-        if (owner.worker_process_pid === null) return owner.worker_instance_id !== null;
-        try {
-          process.kill(owner.worker_process_pid, 0);
-          return true;
-        } catch (error) {
-          return (error as NodeJS.ErrnoException).code === 'EPERM';
-        }
-      });
-      if (workerOwnershipAmbiguous) {
+      const workerOwnership = classifyPersistedWorkerOwnership(workerOwners);
+      if (workerOwnership === 'active_or_unknown') {
         ambiguous += 1;
         continue;
+      }
+      if (!recoveryAt || !recoveryStatus) {
+        if (workerOwnership !== 'inactive') {
+          ambiguous += 1;
+          continue;
+        }
+        recoveryAt = row.started_at;
+        recoveryStatus = 'failed';
+        recoveryDetail = 'Closed after the persisted worker process was confirmed absent during restart reconciliation.';
       }
       const latestGraphTimestamp = this.db
         .prepare(

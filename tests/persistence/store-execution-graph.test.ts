@@ -405,6 +405,42 @@ describe('SqlitePersistenceStore execution graph', () => {
     });
   });
 
+  it('repairs an interrupted run after its persisted worker process exits', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-execution-graph-dead-owner-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'runtime.sqlite');
+    const durableIdentity = identity({ issue_id: 'i-dead-owner', issue_identifier: 'ABC-DEAD-OWNER' });
+    const store = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(store);
+    const started = store.recordRunStarted({
+      issue_id: 'i-dead-owner',
+      issue_identifier: 'ABC-DEAD-OWNER',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    store.appendThread({
+      attempt_id: started.attempt_id,
+      thread_id: 'thread-dead-owner',
+      session_id: 'session-dead-owner',
+      agent_runtime: 'claude-cli',
+      worker_instance_id: 'worker-dead-owner',
+      worker_process_pid: 2_147_483_647,
+      started_at: '2026-04-11T10:00:01.000Z',
+      status: 'running'
+    });
+
+    expect(store.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 1, ambiguous: 0 });
+    expect(store.reconstructTicketTimeline(durableIdentity).issue_runs[0]).toMatchObject({
+      ended_at: '2026-04-11T10:00:01.000Z',
+      status: 'failed',
+      process_status: 'failed',
+      workflow_outcome: 'failed',
+      reason_code: 'recovered_after_restart'
+    });
+  });
+
   it('reopens a linked issue run when retry lineage appends a later running attempt', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-execution-graph-retry-'));
     dirs.push(dir);

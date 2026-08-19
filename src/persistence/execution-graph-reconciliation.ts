@@ -13,6 +13,32 @@ export interface TerminalRunEventEvidence {
   status: RunTerminalStatus;
 }
 
+export interface PersistedWorkerOwner {
+  worker_instance_id: string | null;
+  worker_process_pid: number | null;
+}
+
+export type PersistedWorkerOwnership = 'none' | 'inactive' | 'active_or_unknown';
+
+export function classifyPersistedWorkerOwnership(owners: PersistedWorkerOwner[]): PersistedWorkerOwnership {
+  if (owners.length === 0) return 'none';
+  let inactiveOwnerObserved = false;
+  for (const owner of owners) {
+    if (owner.worker_process_pid === null || owner.worker_process_pid <= 0) {
+      if (owner.worker_instance_id !== null) return 'active_or_unknown';
+      continue;
+    }
+    try {
+      process.kill(owner.worker_process_pid, 0);
+      return 'active_or_unknown';
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return 'active_or_unknown';
+      inactiveOwnerObserved = true;
+    }
+  }
+  return inactiveOwnerObserved ? 'inactive' : 'none';
+}
+
 const TERMINAL_FAILURE_EVENTS: Readonly<Record<string, RunTerminalStatus>> = {
   'agent_runner.turn.failed': 'failed',
   'agent_runner.turn.cancelled': 'cancelled',
