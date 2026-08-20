@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 
 import { describe, expect, it } from 'vitest';
 
-import { ClaudeCliRunner, type AgentRunnerEvent } from '../../src/agent';
+import { ClaudeCliRunner, isClaudeSandboxShellLauncher, type AgentRunnerEvent } from '../../src/agent';
 
 const SESSION_ID = '123e4567-e89b-42d3-a456-426614174000';
 const NON_SUBSCRIPTION_SELECTORS = [
@@ -1515,5 +1515,26 @@ describe('ClaudeCliRunner', () => {
       status: 'failed',
       error_code: 'claude_session_collision'
     });
+  });
+});
+
+describe('isClaudeSandboxShellLauncher', () => {
+  it('recognizes the CLI sandbox shell supervisor argv observed from claude 2.1.224', () => {
+    expect(isClaudeSandboxShellLauncher(
+      "/proc/self/fd/3 /bin/bash -c source /home/user/.claude/shell-snapshots/snapshot-bash-1787240351764-gigf9j.sh 2>/dev/null || true && eval 'gh pr view 503 --json state'"
+    )).toBe(true);
+    expect(isClaudeSandboxShellLauncher('/proc/self/fd/11 /usr/bin/bash -c ls')).toBe(true);
+    expect(isClaudeSandboxShellLauncher('/proc/self/fd/3 /bin/sh -c ls')).toBe(true);
+  });
+
+  it('does not exempt real claude invocations or near-miss argv shapes', () => {
+    expect(isClaudeSandboxShellLauncher(
+      '/home/user/.local/share/claude/versions/2.1.224 --print --model claude-sonnet-4-6'
+    )).toBe(false);
+    expect(isClaudeSandboxShellLauncher('/proc/self/fd/3 --print --model claude-sonnet-4-6')).toBe(false);
+    expect(isClaudeSandboxShellLauncher('/bin/bash -c ls')).toBe(false);
+    expect(isClaudeSandboxShellLauncher('/proc/self/fd/x /bin/bash -c ls')).toBe(false);
+    expect(isClaudeSandboxShellLauncher('/proc/self/fd/3 /bin/bash ls')).toBe(false);
+    expect(isClaudeSandboxShellLauncher('')).toBe(false);
   });
 });
