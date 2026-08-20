@@ -50,6 +50,11 @@ import {
   inspectClaudeUserMcpConfiguration,
   resolveTrustedExecutable
 } from '../agent';
+import {
+  claudeSandboxProtectedPathCandidates,
+  createClaudeSandboxPathSnapshot,
+  probeClaudeSandboxRuntime
+} from '../agent/claude-sandbox';
 import { auditSensitiveWorkspaceFiles, type SensitiveWorkspaceFileViolation } from '../workspace';
 import {
   classifyPersistedWorkerOwnership,
@@ -2553,19 +2558,60 @@ function addClaudeRuntimeChecks(
   const sandboxDependencyNames = process.platform === 'darwin' ? ['sandbox-exec'] : ['bwrap', 'socat'];
   const sandboxDependencies = sandboxDependencyNames.map((name) => ({ name, executablePath: findCommandOnPath(name, env) }));
   const missingSandboxDependencies = sandboxDependencies.filter((entry) => !entry.executablePath).map((entry) => entry.name);
-  const sandboxReady = missingSandboxDependencies.length === 0;
+  let sandboxPolicyCounts = { existing: 0, skippedMissing: 0, collapsed: 0 };
+  let sandboxPolicyError: string | null = null;
+  try {
+    const sensitiveAudit = auditSensitiveWorkspaceFiles(projectRoot);
+    if (!sensitiveAudit.complete) throw new Error('claude_project_sensitive_audit_incomplete');
+    const snapshot = createClaudeSandboxPathSnapshot(claudeSandboxProtectedPathCandidates({
+      executable: executablePath,
+      workspace: projectRoot,
+      projectRoot,
+      projectSensitivePaths: sensitiveAudit.violations.map((violation) => violation.absolutePath),
+      home: env.HOME?.trim() || os.homedir()
+    }));
+    sandboxPolicyCounts = {
+      existing: snapshot.protectedPaths.length,
+      skippedMissing: snapshot.skippedMissingCount,
+      collapsed: snapshot.collapsedCount
+    };
+  } catch (error) {
+    sandboxPolicyError = error instanceof Error ? error.message : 'claude_sandbox_policy_invalid';
+  }
+  const bwrapExecutable = sandboxDependencies.find((entry) => entry.name === 'bwrap')?.executablePath ?? null;
+  const socatExecutable = sandboxDependencies.find((entry) => entry.name === 'socat')?.executablePath ?? null;
+  const sandboxProbe = missingSandboxDependencies.length === 0
+    ? probeClaudeSandboxRuntime({ platform: process.platform, bwrapExecutable, socatExecutable, env })
+    : null;
+  const sandboxReady = missingSandboxDependencies.length === 0 && !sandboxPolicyError && (sandboxProbe?.ready ?? false);
+  const sandboxFailureReason = sandboxPolicyError
+    ? 'claude_sandbox_policy_invalid'
+    : missingSandboxDependencies.length > 0
+      ? 'claude_sandbox_unavailable'
+      : sandboxProbe?.reason ?? 'claude_sandbox_unavailable';
   addCheck(checks, {
     id: 'claude.sandbox',
     title: 'Claude fail-closed sandbox prerequisites are available',
     status: sandboxReady ? 'ok' : 'failure',
-    reason: sandboxReady ? 'claude_sandbox_ready' : 'claude_sandbox_unavailable',
+    reason: sandboxReady ? 'claude_sandbox_ready' : sandboxFailureReason,
     summary: sandboxReady
-      ? `Sandbox dependencies are available (${sandboxDependencyNames.join(', ')}); Symphony will require failIfUnavailable.`
-      : `Required sandbox dependency or dependencies were not found: ${missingSandboxDependencies.join(', ')}.`,
-    remediation: sandboxReady ? undefined : 'Install every platform sandbox dependency before starting claude-cli workers.',
+      ? `Sandbox policy and dependencies are ready (${sandboxDependencyNames.join(', ')}); Symphony will require failIfUnavailable.`
+      : sandboxPolicyError
+        ? 'The generated Claude sandbox policy could not be materialized safely.'
+        : missingSandboxDependencies.length > 0
+          ? `Required sandbox dependency or dependencies were not found: ${missingSandboxDependencies.join(', ')}.`
+          : 'The installed sandbox dependencies failed the capability canary.',
+    remediation: sandboxReady ? undefined : 'Repair the reported sandbox policy or host dependency failure before starting claude-cli workers.',
     details: {
       dependencies: sandboxDependencies,
       missing: missingSandboxDependencies,
+      policy: sandboxPolicyCounts,
+      policyError: sandboxPolicyError,
+      probe: sandboxProbe ? {
+        reason: sandboxProbe.reason,
+        stderrBytes: sandboxProbe.stderrBytes,
+        stderrSha256: sandboxProbe.stderrSha256
+      } : null,
       failIfUnavailable: true,
       allowUnsandboxedCommands: false,
       deniedDomains: ['localhost', '127.0.0.1', '::1'],

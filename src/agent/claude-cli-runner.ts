@@ -8,6 +8,12 @@ import { StringDecoder } from 'node:string_decoder';
 import { CANONICAL_EVENT } from '../observability/events';
 import { REASON_CODES } from '../observability/reason-codes';
 import { auditSensitiveWorkspaceFiles } from '../workspace/sensitive-files';
+import {
+  claudeSandboxProtectedPathCandidates,
+  createClaudeSandboxPathSnapshot,
+  probeClaudeSandboxRuntime,
+  type ClaudeSandboxPathSnapshot
+} from './claude-sandbox';
 import type {
   AgentRunResult,
   AgentRunner,
@@ -867,44 +873,14 @@ function stableConfigurationHash(parts: unknown[]): string {
 function buildSandboxSettings(params: {
   executable: string;
   workspace: string;
-  projectRoot: string;
-  projectSensitivePaths: string[];
-  home: string;
   sessionTemp: string;
+  protectedPathSnapshot: ClaudeSandboxPathSnapshot;
   networkAllowedDomains: string[];
   sshAuthSock: string | null;
   allowedMcpServers: string[];
   enableWeakerNetworkIsolation: boolean;
 }): Record<string, unknown> {
-  const protectedPaths = [
-    path.dirname(params.executable),
-    path.join(params.workspace, '.env'),
-    path.join(params.home, '.claude'),
-    path.join(params.home, '.aws'),
-    path.join(params.home, '.azure'),
-    path.join(params.home, '.claude.json'),
-    path.join(params.home, '.config', 'gh'),
-    path.join(params.home, '.config', 'gcloud'),
-    path.join(params.home, '.config', 'containers'),
-    path.join(params.home, '.config', 'pip'),
-    path.join(params.home, '.config', 'pypoetry'),
-    path.join(params.home, '.cargo'),
-    path.join(params.home, '.composer'),
-    path.join(params.home, '.docker'),
-    path.join(params.home, '.kube'),
-    path.join(params.home, '.git-credentials'),
-    path.join(params.home, '.netrc'),
-    path.join(params.home, '.authinfo'),
-    path.join(params.home, '.npmrc'),
-    path.join(params.home, '.pnpmrc'),
-    path.join(params.home, '.pypirc'),
-    path.join(params.home, '.ssh'),
-    path.join(params.home, '.terraform.d'),
-    path.join(params.home, '.yarnrc'),
-    path.join(params.home, '.yarnrc.yml'),
-    ...params.projectSensitivePaths,
-    path.join(path.dirname(params.projectRoot), '.symphony-quarantine')
-  ];
+  const protectedPaths = params.protectedPathSnapshot.protectedPaths;
   const absoluteReadRules = protectedPaths.flatMap((protectedPath) => {
     const absolute = protectedPath.replace(/^\/+/, '');
     return [`Read(//${absolute})`, `Read(//${absolute}/**)`];
@@ -1519,14 +1495,41 @@ export class ClaudeCliRunner implements AgentRunner {
       assertApprovedAuth(executable, workspace, childEnv, home, this.options.allowNonSubscriptionAuth);
       if (input.cancellationSignal?.aborted) return cancelledBeforeSpawn();
 
+      const protectedPathSnapshot = createClaudeSandboxPathSnapshot(claudeSandboxProtectedPathCandidates({
+        executable,
+        workspace,
+        projectRoot,
+        projectSensitivePaths,
+        home
+      }));
+      let sandboxRuntimeFingerprint = `platform:${this.platform}`;
+      if (this.platform === 'linux') {
+        let bwrapExecutable: string | null = null;
+        let socatExecutable: string | null = null;
+        try {
+          bwrapExecutable = resolveTrustedExecutable('bwrap', childEnv, [workspace, projectRoot]);
+          socatExecutable = resolveTrustedExecutable('socat', childEnv, [workspace, projectRoot]);
+        } catch {
+          // The shared probe returns the canonical missing-dependency failure.
+        }
+        const sandboxProbe = probeClaudeSandboxRuntime({
+          platform: this.platform,
+          bwrapExecutable,
+          socatExecutable,
+          env: childEnv
+        });
+        if (!sandboxProbe.ready) {
+          throw new Error(`claude_sandbox_runtime_failed:${sandboxProbe.reason}`);
+        }
+        sandboxRuntimeFingerprint = sandboxProbe.fingerprint;
+      }
+
       const settingsFile = createSandboxSettingsFile(
         (sessionTemp) => buildSandboxSettings({
           executable,
           workspace,
-          projectRoot,
-          projectSensitivePaths,
-          home,
           sessionTemp,
+          protectedPathSnapshot,
           networkAllowedDomains,
           sshAuthSock: sshAgent?.socketPath ?? null,
           allowedMcpServers: [...allowedMcpServers].sort(),
@@ -1547,10 +1550,8 @@ export class ClaudeCliRunner implements AgentRunner {
       const stableSandboxPolicy = buildSandboxSettings({
         executable,
         workspace,
-        projectRoot,
-        projectSensitivePaths,
-        home,
         sessionTemp: '<session-temp>',
+        protectedPathSnapshot,
         networkAllowedDomains,
         sshAuthSock: sshAgent?.socketPath ?? null,
         allowedMcpServers: [...allowedMcpServers].sort(),
@@ -1572,6 +1573,8 @@ export class ClaudeCliRunner implements AgentRunner {
           managedPolicy.hash,
           userMcpConfiguration.hash,
           stableSandboxPolicy,
+          protectedPathSnapshot.fingerprint,
+          sandboxRuntimeFingerprint,
           [...allowedMcpServers].sort(),
           [...requiredMcpServers].sort(),
           executable,
