@@ -45,6 +45,21 @@ describe('Claude sandbox policy', () => {
       .toThrow('claude_sandbox_protected_path_unsafe');
   });
 
+  it('keeps the policy binding stable when a protected file is atomically replaced', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-sandbox-replace-'));
+    const protectedFile = path.join(root, 'credentials.json');
+    fs.writeFileSync(protectedFile, 'first');
+    const before = createClaudeSandboxPathSnapshot([protectedFile]);
+
+    const replacement = path.join(root, 'replacement.json');
+    fs.writeFileSync(replacement, 'second');
+    fs.renameSync(replacement, protectedFile);
+    const after = createClaudeSandboxPathSnapshot([protectedFile]);
+
+    expect(after.protectedPaths).toEqual(before.protectedPaths);
+    expect(after.fingerprint).toBe(before.fingerprint);
+  });
+
   it('runs the Linux dependency and namespace canary without model usage', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-sandbox-probe-'));
     const bwrap = path.join(root, 'bwrap');

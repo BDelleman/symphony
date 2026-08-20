@@ -103,7 +103,7 @@ export function createClaudeSandboxPathSnapshot(candidates: readonly string[]): 
     }
     resolved.set(canonical, {
       isDirectory: stat.isDirectory(),
-      identity: `${stat.dev}:${stat.ino}:${stat.mode & 0o777}`
+      identity: stat.isDirectory() ? 'directory' : 'file'
     });
   }
 
