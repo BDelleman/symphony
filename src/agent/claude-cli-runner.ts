@@ -1225,6 +1225,22 @@ function descendantProcessRows(rootPid: number | undefined, rows = readProcessRo
   return rows.filter((row) => row.pid !== rootPid && descendants.has(row.pid));
 }
 
+// Claude CLI 2.1.x runs each sandboxed Bash tool command by re-exec'ing its own
+// binary as the in-sandbox shell supervisor, with argv rewritten to
+// "/proc/self/fd/N /bin/bash -c <command>". Its /proc/<pid>/exe therefore
+// resolves to the claude executable even though no nested session exists. Only
+// this exact launcher shape is exempt: a real nested claude invocation carries
+// claude-style argv, and any nested claude spawned inside the sandboxed shell
+// still appears as its own descendant row and fails closed.
+export function isClaudeSandboxShellLauncher(args: string): boolean {
+  const argv = args.trim().split(/\s+/);
+  return (
+    /^\/proc\/self\/fd\/\d+$/.test(argv[0] ?? '') &&
+    ['/bin/bash', '/usr/bin/bash', '/bin/sh', '/usr/bin/sh'].includes(argv[1] ?? '') &&
+    argv[2] === '-c'
+  );
+}
+
 function findNestedClaudeDescendant(rootPid: number | undefined, executable: string, rows = readProcessRows()): number | null {
   if (!rootPid) return null;
   const resolvesToExecutable = (candidate: string): boolean => {
@@ -1236,6 +1252,7 @@ function findNestedClaudeDescendant(rootPid: number | undefined, executable: str
     }
   };
   for (const row of descendantProcessRows(rootPid, rows)) {
+    if (isClaudeSandboxShellLauncher(row.args)) continue;
     if (process.platform === 'linux') {
       try {
         if (fs.realpathSync(`/proc/${row.pid}/exe`) === executable) return row.pid;
