@@ -444,8 +444,8 @@ The bundled `WORKFLOW.md` uses the following v1 lifecycle:
 - Non-UI passing review routes from `Agent Review` to `Merging`.
 - Normal review findings route from `Agent Review` to `In Progress`.
 - Reset-level failures route from `Agent Review` to `Rework`.
-- `Merging` is active but not a handoff or fresh-dispatch state; merge handling
-  follows the workflow land loop.
+- `Merging` is active, a handoff state, and a fresh-dispatch state, so landing
+  starts independently from Agent Review and follows the workflow land loop.
 - `Done`, `Closed`, `Canceled`, and `Duplicate` are terminal cleanup states.
 
 ## 10. Implementation and Test Evidence
@@ -472,6 +472,34 @@ The v1 reference implementation evidence is:
 - Workflow lifecycle instructions: `WORKFLOW.md` defines Agent Review, Human
   Review, Merging, and Rework routing; covered by
   `tests/workflow/workflow-command-examples.test.ts`.
+- Governed Agent Review evidence: `scripts/review-with-governance.js` prepares
+  an exact-head review capsule under Git metadata and finalizes the existing v1
+  Review Receipt only after an adjacent GitHub identity and feedback refresh;
+  covered by `tests/cli/review-governance.test.ts`.
+
+### 10.1 Governed Agent Review Capsule
+
+The bundled Agent Review phase uses two local commands without adding runtime
+configuration or tracker mutation authority:
+
+- `review:governed prepare` requires the issue-derived branch, the explicit
+  Linear-linked open non-draft PR targeting `main`, matching local and remote
+  head SHAs, and a successful latest exact-head
+  `Fast validation (ubuntu-latest)` check. It records normalized PR context and
+  feedback, the complete changed-file manifest, the full binary-safe patch,
+  and their hashes under the current worktree's Git metadata.
+- `review:governed finalize` requires the same clean branch and capsule,
+  verifies capsule hashes, refreshes the explicit PR and feedback, rebuilds the
+  live diff, and refuses identity, content, feedback, or diff drift. It appends
+  the canonical verdict and version-1 Review Receipt, invokes the existing
+  artifact validator, and atomically writes the final artifact.
+
+The capsule is authoritative evidence for mechanical repository identity. It
+does not decide which review lenses apply, evaluate acceptance criteria, post
+comments, change Linear state, or merge a PR. Linear is refreshed immediately
+before finalization by the reviewer, and the Merging phase remains the final
+exact-head safeguard. Linear state and labels are refreshed again after the
+review comment and immediately before its state transition.
 
 Deferred or out-of-scope items:
 
@@ -497,9 +525,11 @@ tracker:
   handoff_states:
     - Agent Review
     - Human Review
+    - Merging
 
   fresh_dispatch_states:
     - Agent Review
+    - Merging
 ```
 
 Interpretation:
@@ -507,8 +537,10 @@ Interpretation:
 - `Agent Review` is a handoff state and a fresh-dispatch state.
 - `Agent Review` is listed in `active_states`, so review automation may
   discover it as a candidate and start a fresh run.
+- `Merging` is also active and fresh-dispatch, so landing starts in a separate
+  run after review or human approval.
 - `Human Review` is a handoff state but not a fresh-dispatch state in this
-- example. Because it is not listed in `active_states`, automation does not
+  example. Because it is not listed in `active_states`, automation does not
   dispatch it in this workflow.
 - No terminal state is used for handoff.
 - If the two extension fields are omitted, both resolve to `[]` and existing

@@ -45,6 +45,7 @@
     "stress:known-flake-clusters": "node scripts/stress-known-flake-clusters.js",
     "stress:control-plane": "node scripts/stress-control-plane.js",
     "submit:pr-governed": "node scripts/submit-pr-with-governance.js",
+    "review:governed": "node scripts/review-with-governance.js",
     "start:dashboard": "npm run build && node scripts/start-dashboard-supervisor.js",
     "start:dashboard:direct": "npm run build && node scripts/start-dashboard.js",
     "start:project-dashboard": "bash scripts/start-project-dashboard.sh",

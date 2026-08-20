@@ -10,6 +10,7 @@ const validReview = `## Agent Review
 ### Scope Read
 - Issue: NIE-1
 - PR: https://github.com/example/repo/pull/1
+- Base SHA: base123
 - Head SHA: abc123
 - Prior findings reviewed: none
 
@@ -31,6 +32,9 @@ const validReview = `## Agent Review
 
 ### Verdict
 - Pass: route to Human Review
+
+### Review Receipt
+{"version":1,"issue_id":"NIE-1","pr_number":1,"base_sha":"base123","head_sha":"abc123","issue_version":null,"verdict":"pass","route":"human_review","reviewer_attempt_id":"attempt-1","created_at":"2026-08-19T08:00:00.000Z"}
 `;
 
 const validCrossSurfaceReview = `## Agent Review
@@ -38,6 +42,7 @@ const validCrossSurfaceReview = `## Agent Review
 ### Scope Read
 - Issue: NIE-2
 - PR: https://github.com/example/repo/pull/2
+- Base SHA: base456
 - Head SHA: def456
 - Prior findings reviewed: first comment required pending work in UI
 
@@ -81,6 +86,9 @@ const validCrossSurfaceReview = `## Agent Review
 
 ### Verdict
 - Pass: route to Human Review
+
+### Review Receipt
+{"version":1,"issue_id":"NIE-2","pr_number":2,"base_sha":"base456","head_sha":"def456","issue_version":42,"verdict":"pass","route":"human_review","reviewer_attempt_id":"attempt-2","created_at":"2026-08-19T08:00:00.000Z"}
 `;
 
 function runReviewCheck(body: string, env?: NodeJS.ProcessEnv) {
@@ -96,18 +104,35 @@ function runReviewCheck(body: string, env?: NodeJS.ProcessEnv) {
 }
 
 describe('review artifact check', () => {
-  it('passes a concise review artifact with findings', () => {
+  it('rejects a passing review artifact with a blocking finding', () => {
     const result = runReviewCheck(validReview.replace('No blocking findings.', 'P1: candidate drift is not refused.'));
 
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain('Review artifact check passed.');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Passing verdict requires `No blocking findings`');
   });
+
+  it.each(['P1 — candidate drift is not refused.', '[P1] candidate drift is not refused.', 'P2 - state is not persisted.'])(
+    'rejects passing severity syntax: %s',
+    (finding) => {
+      const result = runReviewCheck(validReview.replace('No blocking findings.', `No blocking findings.\n- ${finding}`));
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Passing verdict requires `No blocking findings`');
+    }
+  );
 
   it('passes a concise review artifact without findings when lens evidence is present', () => {
     const result = runReviewCheck(validReview);
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('Review artifact check passed.');
+  });
+
+  it('rejects P3 suggestions even when the artifact has no blocking findings', () => {
+    const result = runReviewCheck(validReview.replace('No blocking findings.', 'No blocking findings.\n- P3: consider more examples.'));
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Findings must not include P3 or non-blocking suggestions');
   });
 
   it('does not require cross-surface sections for an explicit non-cross-cutting review', () => {
@@ -204,6 +229,7 @@ describe('review artifact check', () => {
         .replace('- Representative-path shortcut used? no', '- Representative-path shortcut used? yes')
         .replace('- No blocking findings.', '- P1: dashboard proof is fixture-only.')
         .replace('- Pass: route to Human Review', '- Blocked: move to In Progress')
+        .replace('"verdict":"pass","route":"human_review"', '"verdict":"blocked","route":"in_progress"')
     );
 
     expect(result.status).toBe(0);
@@ -215,6 +241,20 @@ describe('review artifact check', () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('pr_body_escaped_newlines: body contains escaped newline sequences; normalize before submit');
+  });
+
+  it('fails when the exact-head review receipt does not match the reviewed head', () => {
+    const result = runReviewCheck(validReview.replace('"head_sha":"abc123"', '"head_sha":"stale"'));
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Review Receipt head_sha must match Scope Read Head SHA');
+  });
+
+  it('fails when receipt routing contradicts the review verdict', () => {
+    const result = runReviewCheck(validReview.replace('"route":"human_review"', '"route":"merging"'));
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Review Receipt verdict and route must match the Verdict section');
   });
 
   it('reads review body files', () => {

@@ -31,11 +31,18 @@ implements the base contract in `SPEC.md` plus documented local extensions in
 	npm run build
 	```
 
+	This builds the dashboard client and the TypeScript project.
+
 3. Run tests:
 
 	```bash
 	npm test
 	```
+
+	This runs the fast deterministic unit suite.
+
+	Run `npm run test:integration` when changing git, worktree, or
+	process-heavy behavior.
 
 	Use `npm run test:full` for release or Agent Review evidence.
 
@@ -98,6 +105,8 @@ Open:
 
 - Dashboard: `http://127.0.0.1:3000/`
 
+Press `Ctrl+C` in the terminal running the command to stop the local dashboard.
+
 ### Dynamic Port
 
 ```bash
@@ -119,6 +128,8 @@ symphony doctor
 symphony doctor --json
 symphony doctor --ci
 ```
+
+`symphony doctor` is non-mutating unless `--fix` is supplied or the explicit `--claude-smoke --linear-issue <id>` mode is selected.
 
 `symphony doctor` checks the PATH-linked `symphony` shim, the referenced
 checkout and built CLI entrypoint, local workflow resolution, effective workflow
@@ -142,6 +153,8 @@ Exit codes are stable for automation:
 - `0`: clean, no findings.
 - `1`: warning-only findings.
 - `2`: blocker findings.
+
+`symphony doctor --ci` uses this documented doctor exit-code contract for automation.
 
 Use `--fix` for bounded local-adoption remediation. It can invoke local link
 refresh for link-related findings and can record setup consent only when paired
@@ -228,6 +241,8 @@ Notes:
   - `SYMPHONY_CODEX_REASONING` (override reasoning effort)
   - `SYMPHONY_CODEX_FLAGS` (append extra Codex CLI flags as a JSON string array, for example `["--config","shell_environment_policy.inherit=all"]`)
 - `.env` is loaded automatically for startup scripts (or `SYMPHONY_ENV_FILE` for a custom file path).
+- Startup settings are read from the project `.env` when the process boots, so
+  `.env` changes take effect only after restarting Symphony.
 - An opt-in local Claude CLI runtime can be selected entirely from the project `.env`:
 
   ```dotenv

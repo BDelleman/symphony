@@ -2590,6 +2590,9 @@ export class OrchestratorCore {
     if (normalized.includes(REASON_CODES.issueStateRefreshFailed)) {
       return REASON_CODES.issueStateRefreshFailed;
     }
+    if (normalized.includes(REASON_CODES.freshDispatchNoRoute)) {
+      return REASON_CODES.freshDispatchNoRoute;
+    }
     if (normalized.includes(REASON_CODES.unsafeWorkspaceRoot)) {
       return REASON_CODES.unsafeWorkspaceRoot;
     }

@@ -103,6 +103,15 @@ export async function coordinateReconcileRunningIssues(context: ReconciliationCo
       continue;
     }
 
+    const dispatchState = runningEntry.dispatch_state ?? runningEntry.started_issue_state ?? runningEntry.issue.state;
+    if (
+      isFreshDispatchState(dispatchState, context.config) &&
+      normalizeStateName(dispatchState) !== normalizeStateName(refreshedIssue.state)
+    ) {
+      await context.hooks.terminateRunningIssue(refreshedIssue.id, false, REASON_CODES.freshDispatchStateRouted);
+      continue;
+    }
+
     if (isActiveState(refreshedIssue.state, context.config)) {
       runningEntry.issue = refreshedIssue;
       runningEntry.identifier = refreshedIssue.identifier;
@@ -224,7 +233,10 @@ export async function coordinateReconcileBlockedInputs(context: ReconciliationCo
 }
 
 function didRunStartInState(runningEntry: RunningEntry, issueState: string): boolean {
-  return normalizeStateName(runningEntry.started_issue_state ?? runningEntry.issue.state) === normalizeStateName(issueState);
+  return (
+    normalizeStateName(runningEntry.dispatch_state ?? runningEntry.started_issue_state ?? runningEntry.issue.state) ===
+    normalizeStateName(issueState)
+  );
 }
 
 function shouldClearStaleNoProgressBlockedInput(

@@ -191,6 +191,10 @@ export function staleWorkerEventReasonForRunningEntry(params: {
     return 'inactive_worker_pid';
   }
 
+  if (isCodexContinuationSessionStart(runningEntry, workerEvent)) {
+    return null;
+  }
+
   if (eventPid && runningEntry.codex_app_server_pid && eventPid !== runningEntry.codex_app_server_pid) {
     return 'worker_identity_mismatch';
   }
@@ -466,6 +470,12 @@ export function applyWorkerEvent(context: WorkerEventWorkflowContext): void {
   if (staleReason) {
     recordStaleRunningWorkerEvent(context, runningEntry, staleReason);
     return;
+  }
+
+  if (isCodexContinuationSessionStart(runningEntry, workerEvent)) {
+    runningEntry.thread_id = workerEvent.thread_id ?? null;
+    runningEntry.turn_id = null;
+    runningEntry.session_id = null;
   }
 
   if (workerEvent.process_liveness_only) {
@@ -1168,6 +1178,22 @@ function isSameThreadContinuationTurnStart(runningEntry: RunningEntry, workerEve
     typeof turnId === 'string' &&
     !(runningEntry.persisted_turn_ids ?? []).includes(turnId) &&
     !(runningEntry.pending_persisted_turn_ids ?? []).includes(turnId)
+  );
+}
+
+function isCodexContinuationSessionStart(runningEntry: RunningEntry, workerEvent: WorkerObservabilityEvent): boolean {
+  const eventWorkerInstanceId = normalizeWorkerInstanceId(workerEvent.worker_instance_id);
+  const eventPid = normalizeCodexAppServerPid(workerEvent.codex_app_server_pid);
+  return (
+    workerEvent.event === CANONICAL_EVENT.codex.sessionStarted &&
+    runningEntry.last_event === CANONICAL_EVENT.codex.turnCompleted &&
+    Boolean(eventWorkerInstanceId) &&
+    eventWorkerInstanceId === runningEntry.worker_instance_id &&
+    Boolean(eventPid) &&
+    eventPid !== runningEntry.codex_app_server_pid &&
+    Boolean(workerEvent.thread_id) &&
+    workerEvent.thread_id !== runningEntry.thread_id &&
+    workerEvent.timestamp_ms >= (runningEntry.last_codex_timestamp_ms ?? 0)
   );
 }
 

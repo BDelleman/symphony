@@ -1971,6 +1971,15 @@ export class ClaudeCliRunner implements AgentRunner {
               toolCounts[boundedToolName] = (toolCounts[boundedToolName] ?? 0) + 1;
               const mcpServer = mcpServerFromToolName(boundedToolName);
               if (mcpServer) mcpCounts[mcpServer] = (mcpCounts[mcpServer] ?? 0) + 1;
+              emit({
+                event: CANONICAL_EVENT.codex.toolCallStarted,
+                session_id: state.sessionId ?? undefined,
+                turn_id: turnId,
+                detail: 'claude_tool_started',
+                tool_call_id: toolId,
+                tool_name: boundedToolName,
+                tool_call_evidence_source: 'worker_event'
+              });
             }
           }
           if (latestPartialUsage) {
@@ -1982,7 +1991,31 @@ export class ClaudeCliRunner implements AgentRunner {
           }
           return;
         }
-        if (type === 'user' || type === 'system') {
+        if (type === 'user') {
+          const message = asRecord(payload.message);
+          const content = Array.isArray(message?.content)
+            ? message.content
+            : Array.isArray(payload.content)
+              ? payload.content
+              : [];
+          for (const rawBlock of content) {
+            const block = asRecord(rawBlock);
+            if (!block || readString(block, 'type') !== 'tool_result') continue;
+            const rawToolId = readString(block, 'tool_use_id') ?? readString(block, 'toolUseId');
+            if (!rawToolId) continue;
+            const toolId = crypto.createHash('sha256').update(rawToolId).digest('hex');
+            emit({
+              event: block.is_error === true ? CANONICAL_EVENT.codex.toolCallFailed : CANONICAL_EVENT.codex.toolCallCompleted,
+              session_id: state.sessionId ?? undefined,
+              turn_id: turnId,
+              detail: block.is_error === true ? 'claude_tool_failed' : 'claude_tool_completed',
+              tool_call_id: toolId,
+              tool_call_evidence_source: 'worker_event'
+            });
+          }
+          return;
+        }
+        if (type === 'system') {
           return;
         }
         state.unknownEventCount += 1;

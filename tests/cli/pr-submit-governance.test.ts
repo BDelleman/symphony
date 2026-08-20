@@ -62,7 +62,7 @@ describe('PR submission governance scripts', () => {
     const root = process.cwd();
     const gitRelativeOutput = '.symphony-pr-body.normalized.test.md';
     const normalizedPath = resolveGitPath(root, gitRelativeOutput);
-    const expectedBodyFileArg = path.relative(root, normalizedPath) || normalizedPath;
+    const expectedBodyFileArg = normalizedPath;
     const result = runNode([path.join(root, 'scripts/submit-pr-with-governance.js'), '--mode', 'create', '--title', 'Test PR'], root, {
       SYMPHONY_PR_BODY: '## Summary\\n- one\\n- two',
       SYMPHONY_PR_BODY_FILE: '',
@@ -77,5 +77,51 @@ describe('PR submission governance scripts', () => {
     expect(fs.existsSync(normalizedPath)).toBe(true);
     expect(fs.readFileSync(normalizedPath, 'utf8')).toBe('## Summary\n- one\n- two');
     fs.rmSync(normalizedPath, { force: true });
+  });
+
+  it('constructs one governed upsert boundary with explicit branch push and readiness wait', () => {
+    const root = process.cwd();
+    const result = runNode(
+      [
+        path.join(root, 'scripts/submit-pr-with-governance.js'),
+        '--mode',
+        'upsert',
+        '--title',
+        'Test PR',
+        '--branch',
+        'feature/NIE-999',
+        '--wait'
+      ],
+      root,
+      {
+        SYMPHONY_PR_BODY: '## Summary\n- one',
+        SYMPHONY_PR_BODY_FILE: '',
+        SYMPHONY_SUBMIT_PR_DRY_RUN: '1'
+      }
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('[dry-run] validate exact committed candidate for feature/NIE-999');
+    expect(result.stdout).toContain('[dry-run] git push origin HEAD:refs/heads/feature/NIE-999');
+    expect(result.stdout).toContain('[dry-run] gh pr create --title "Test PR"');
+    expect(result.stdout).toContain('--head feature/NIE-999 --base main');
+    expect(result.stdout).toContain('[dry-run] gh pr edit --add-label symphony');
+    expect(result.stdout).toContain('[dry-run] wait for exact-head implementation readiness');
+  });
+
+  it('requires the readiness wait for governed upsert', () => {
+    const root = process.cwd();
+    const result = runNode(
+      [path.join(root, 'scripts/submit-pr-with-governance.js'), '--mode', 'upsert', '--title', 'Test PR', '--branch', 'feature/NIE-999'],
+      root,
+      {
+        SYMPHONY_PR_BODY: '## Summary\n- one',
+        SYMPHONY_PR_BODY_FILE: '',
+        SYMPHONY_SUBMIT_PR_DRY_RUN: '1'
+      }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('submit_pr_wait_required');
   });
 });

@@ -33,6 +33,7 @@ export function projectToolCallLedger(entry: { tool_call_ledger?: RunningEntry['
       last_seen_at_ms: call.last_seen_at_ms,
       completed_at: call.completed_at_ms === null ? null : asIsoDate(call.completed_at_ms),
       completed_at_ms: call.completed_at_ms,
+      duration_ms: call.completed_at_ms === null ? null : Math.max(0, call.completed_at_ms - call.first_seen_at_ms),
       completion_status: call.completion_status,
       evidence_sources: [...call.evidence_sources],
       start_evidence_source: call.start_evidence_source,

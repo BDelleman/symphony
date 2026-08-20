@@ -463,6 +463,7 @@ export async function coordinateDispatchIssue(
   state.running.set(issue.id, {
     issue,
     identifier: issue.identifier,
+    dispatch_state: issue.state,
     started_issue_state: issue.state,
     run_id: null,
     issue_run_id: graphContext.issue_run_id ?? null,

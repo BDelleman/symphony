@@ -36,7 +36,7 @@ describe('linear ui evidence guidance', () => {
 
     expect(playbook).toContain('intentional exception to MCP-first Linear operations');
     expect(playbook).toContain('Do not hand-author dynamic app-server `linear_graphql` calls');
-    expect(workflow).toContain('missing or non-rendering UI evidence');
+    expect(workflow).toContain('Missing or non-rendering UI evidence');
     expect(workflow).toContain('The evidence must be visible as Linear-rendered image/video media');
     expect(reviewChecklist).toContain('Linear workflow operations use MCP');
     expect(reviewChecklist).toContain('Any raw `linear_graphql` use is justified');

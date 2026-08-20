@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { assertHumanReadableMarkdownBody } = require('./lib/markdown-body');
 
-const DEFAULT_OUTPUT_FILE = '.git/.symphony-pr-body.normalized.md';
+const DEFAULT_OUTPUT_FILE = path.join(os.tmpdir(), `symphony-pr-body-${process.pid}.md`);
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -49,7 +50,8 @@ function resolveGitPath(rootDir, outputFile) {
 function writeNormalizedBody(rootDir, outputFile, normalizedBody) {
   const resolvedOutput = resolveGitPath(rootDir, outputFile);
   fs.mkdirSync(path.dirname(resolvedOutput), { recursive: true });
-  fs.writeFileSync(resolvedOutput, normalizedBody, 'utf8');
+  fs.writeFileSync(resolvedOutput, normalizedBody, { encoding: 'utf8', mode: 0o600 });
+  fs.chmodSync(resolvedOutput, 0o600);
   return resolvedOutput;
 }
 

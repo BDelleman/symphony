@@ -152,6 +152,7 @@ process.stdin.on('end', () => {
     process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-1', model, usage: { input_tokens: 4, output_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 0 }, content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'README.md' } }] } }) + '\\n');
     process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-1', model, usage: { input_tokens: 4, output_tokens: 3, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 }, content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'README.md' } }] } }) + '\\n');
     process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-2', model, usage: { input_tokens: 6, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [] } }) + '\\n');
+    process.stdout.write(JSON.stringify({ type: 'user', session_id: '${SESSION_ID}', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok' }] } }) + '\\n');
   }
   if (process.env.MOCK_EMPTY_ASSISTANT_USAGE === '1') {
     process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'empty-usage', model, usage: {}, content: [] } }) + '\\n');
@@ -622,6 +623,13 @@ describe('ClaudeCliRunner', () => {
       tool_counts: { Read: 1 },
       reconciliation_delta: { provider_turn_count: 1 }
     });
+    const toolEvents = events.filter((event) => event.tool_call_id);
+    expect(toolEvents.map((event) => event.event)).toEqual([
+      'codex.tool.started',
+      'codex.tool.completed'
+    ]);
+    expect(toolEvents[0]?.tool_name).toBe('Read');
+    expect(toolEvents[0]?.tool_call_id).toBe(toolEvents[1]?.tool_call_id);
     expect(events.some((event) => event.detail === 'claude_usage_reconciliation_mismatch')).toBe(false);
   });
 

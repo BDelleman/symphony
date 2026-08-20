@@ -205,20 +205,19 @@ export class WorkspaceManager {
           duration_ms: number;
         }
       | undefined;
-    if (created_now) {
-      try {
-        this.onProvisionerResult?.({
+    try {
+      this.onProvisionerResult?.({
           phase: 'provision',
           identifier,
           workspace_path: workspacePath,
           status: 'start',
           provisioner_type: 'unknown'
         });
-        provisionResult = await this.provisioner.provision({
-          identifier,
-          workspacePath
-        });
-        this.onProvisionerResult?.({
+      provisionResult = await this.provisioner.provision({
+        identifier,
+        workspacePath
+      });
+      this.onProvisionerResult?.({
           phase: 'provision',
           identifier,
           workspace_path: workspacePath,
@@ -228,8 +227,8 @@ export class WorkspaceManager {
           workspace_integrity_reason: provisionResult.workspace_integrity_reason ?? null,
           workspace_integrity_checked_at: provisionResult.workspace_integrity_checked_at ?? null,
           workspace_integrity_reconciled_at: provisionResult.workspace_integrity_reconciled_at ?? null
-        });
-      } catch (error) {
+      });
+    } catch (error) {
         let cleanupAttempted = false;
         let cleanupSucceeded = false;
         let cleanupError: string | undefined;
@@ -254,8 +253,9 @@ export class WorkspaceManager {
           cleanup_succeeded: cleanupSucceeded,
           ...(cleanupError ? { cleanup_error: cleanupError } : {})
         });
-        throw error;
-      }
+      throw error;
+    }
+    if (created_now) {
       if (this.copyIgnored?.enabled) {
         copyIgnoredApplied = true;
         if (
