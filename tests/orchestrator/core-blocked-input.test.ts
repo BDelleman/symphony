@@ -1435,9 +1435,9 @@ describe('OrchestratorCore blocked input', () => {
   });
 
   it.each([
-    { state: 'Done', result_code: 'not_active' },
-    { state: 'Backlog', result_code: 'not_active' }
-  ])('rejects automation fault clearing when tracker state is $state without deleting breaker state', async ({ state, result_code }) => {
+    { state: 'Done' },
+    { state: 'Backlog' }
+  ])('clears automation faults when tracker state is $state without redispatching', async ({ state }) => {
     const persistence = {
       upsertBreaker: vi.fn(async () => undefined),
       deleteBreaker: vi.fn(async () => undefined),
@@ -1457,21 +1457,50 @@ describe('OrchestratorCore blocked input', () => {
     expect(result).toMatchObject({
       ok: true,
       issue_id: issue.id,
-      status: 'held',
-      result_code,
-      breaker_cleared: false,
+      status: 'cleared',
+      result_code: 'terminal_or_inactive_issue_cleared',
+      breaker_cleared: true,
       dispatch_started: false
     });
-    expect(harness.orchestrator.getStateSnapshot().circuit_breakers.get(issue.id)).toMatchObject({
-      breaker_active: true
-    });
-    expect(persistence.deleteBreaker).not.toHaveBeenCalled();
+    expect(harness.orchestrator.getStateSnapshot().circuit_breakers.has(issue.id)).toBe(false);
+    expect(persistence.deleteBreaker).toHaveBeenCalledWith(issue.id);
     expect(harness.spawned.filter((entry) => entry.issue_id === issue.id)).toHaveLength(1);
     expect(harness.orchestrator.getStateSnapshot().operator_actions?.get(issue.id)?.at(-1)).toMatchObject({
       action: 'clear_automation_fault',
-      result: 'rejected',
-      result_code
+      result: 'accepted',
+      result_code: 'terminal_or_inactive_issue_cleared'
     });
+  });
+
+  it('clears terminal automation faults during Drain Mode without dispatching', async () => {
+    const persistence = {
+      upsertBreaker: vi.fn(async () => undefined),
+      deleteBreaker: vi.fn(async () => undefined),
+      upsertOperatorActions: vi.fn(async () => undefined),
+      appendOperatorActionHistory: vi.fn(async () => 'operator-action-1')
+    };
+    const harness = createAutomationFaultHarness({ persistence: persistence as any });
+    const issue = makeIssue({ id: 'i-clear-drain-done', identifier: 'ABC-CLEAR-DRAIN-DONE', state: 'In Progress' });
+    await openAutomationFault(harness, issue);
+    (harness.orchestrator as any).enterDrainMode({ reason: 'safe runtime restart' });
+
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([makeIssue({ ...issue, state: 'Done' })]);
+    const result = await harness.orchestrator.clearAutomationFault(issue.identifier, {
+      actor: 'operator@example.test',
+      reason_note: 'ticket completed manually'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      issue_id: issue.id,
+      status: 'cleared',
+      result_code: 'terminal_or_inactive_issue_cleared',
+      breaker_cleared: true,
+      dispatch_started: false
+    });
+    expect(harness.orchestrator.getStateSnapshot().circuit_breakers.has(issue.id)).toBe(false);
+    expect(persistence.deleteBreaker).toHaveBeenCalledWith(issue.id);
+    expect(harness.spawned.filter((entry) => entry.issue_id === issue.id)).toHaveLength(1);
   });
 
   it('holds automation fault clearing when runtime identity is stale without deleting breaker state', async () => {
@@ -1490,6 +1519,7 @@ describe('OrchestratorCore blocked input', () => {
     await openAutomationFault(harness, issue);
 
     runtimeIdentity = makeRuntimeIdentity('stale');
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([issue]);
     const result = await harness.orchestrator.clearAutomationFault(issue.identifier, {
       actor: 'operator@example.test',
       reason_note: 'operator fixed dirty checkout'
@@ -1504,7 +1534,6 @@ describe('OrchestratorCore blocked input', () => {
       dispatch_started: false,
       breaker_cleared: false
     });
-    expect(harness.tracker.fetch_issue_states_by_ids).not.toHaveBeenCalled();
     expect(harness.orchestrator.getStateSnapshot().circuit_breakers.get(issue.id)).toMatchObject({
       breaker_active: true
     });
@@ -1536,6 +1565,7 @@ describe('OrchestratorCore blocked input', () => {
     await openAutomationFault(harness, issue);
 
     dispatchAllowed = false;
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([issue]);
     const result = await harness.orchestrator.clearAutomationFault(issue.identifier, {
       actor: 'operator@example.test',
       reason_note: 'operator fixed dirty checkout'
@@ -1550,7 +1580,6 @@ describe('OrchestratorCore blocked input', () => {
       dispatch_started: false,
       breaker_cleared: false
     });
-    expect(harness.tracker.fetch_issue_states_by_ids).not.toHaveBeenCalled();
     expect(harness.orchestrator.getStateSnapshot().circuit_breakers.get(issue.id)).toMatchObject({
       breaker_active: true
     });

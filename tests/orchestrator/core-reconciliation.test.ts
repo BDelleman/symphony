@@ -36,6 +36,20 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     const harness = createHarness();
     harness.tracker.fetch_candidate_issues.mockResolvedValue([makeIssue({ id: 'i-clear', identifier: 'ABC-CLEAR' })]);
     await harness.orchestrator.tick('interval');
+    harness.orchestrator.restoreSuppressionState({
+      blocked_entries: [],
+      breaker_entries: [
+        {
+          issue_id: 'i-clear',
+          issue_identifier: 'ABC-CLEAR',
+          breaker_active: true,
+          breaker_hit_count: 3,
+          breaker_window_minutes: 30,
+          breaker_first_hit_at_ms: harness.now.value,
+          breaker_last_hit_at_ms: harness.now.value
+        }
+      ]
+    });
     await harness.orchestrator.onWorkerExit(
       'i-clear',
       'abnormal',
@@ -47,7 +61,53 @@ describe('OrchestratorCore reconciliation and stale lineage', () => {
     ]);
 
     await harness.orchestrator.tick('interval');
-    expect(harness.orchestrator.getStateSnapshot().blocked_inputs.has('i-clear')).toBe(false);
+    const snapshot = harness.orchestrator.getStateSnapshot();
+    expect(snapshot.blocked_inputs.has('i-clear')).toBe(false);
+    expect(snapshot.circuit_breakers.has('i-clear')).toBe(false);
+  });
+
+  it('clears breaker-only automation faults when tracker reports terminal or missing issues', async () => {
+    const harness = createHarness();
+    const makeBreaker = (issue_id: string, issue_identifier: string) => ({
+      issue_id,
+      issue_identifier,
+      breaker_active: true,
+      breaker_hit_count: 3,
+      breaker_window_minutes: 30,
+      breaker_first_hit_at_ms: harness.now.value,
+      breaker_last_hit_at_ms: harness.now.value
+    });
+    harness.orchestrator.restoreSuppressionState({
+      blocked_entries: [],
+      breaker_entries: [
+        makeBreaker('i-breaker-done', 'ABC-BREAKER-DONE'),
+        makeBreaker('i-breaker-gone', 'ABC-BREAKER-GONE'),
+        makeBreaker('i-breaker-live', 'ABC-BREAKER-LIVE')
+      ]
+    });
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([
+      makeIssue({ id: 'i-breaker-done', identifier: 'ABC-BREAKER-DONE', state: 'Done' }),
+      makeIssue({ id: 'i-breaker-live', identifier: 'ABC-BREAKER-LIVE', state: 'In Progress' })
+    ]);
+
+    await harness.orchestrator.tick('interval');
+
+    const snapshot = harness.orchestrator.getStateSnapshot();
+    expect(snapshot.circuit_breakers.has('i-breaker-done')).toBe(false);
+    expect(snapshot.circuit_breakers.has('i-breaker-gone')).toBe(false);
+    expect(snapshot.circuit_breakers.get('i-breaker-live')).toMatchObject({ breaker_active: true });
+    expect(snapshot.recent_runtime_events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'orchestration.automation_fault.cleared',
+          issue_identifier: 'ABC-BREAKER-DONE'
+        }),
+        expect.objectContaining({
+          event: 'orchestration.automation_fault.cleared',
+          issue_identifier: 'ABC-BREAKER-GONE'
+        })
+      ])
+    );
   });
 
   it('requeues retry with explicit slot exhaustion reason when no slots are available', async () => {

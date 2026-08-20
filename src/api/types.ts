@@ -1825,7 +1825,7 @@ export interface LocalApiServerOptions {
       | {
           ok: true;
           issue_id: string;
-          status: 'started' | 'held';
+          status: 'started' | 'held' | 'cleared';
           result_code: string;
           message: string;
           dispatch_started: boolean;

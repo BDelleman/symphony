@@ -126,21 +126,32 @@ export async function coordinateReconcileRunningIssues(context: ReconciliationCo
 }
 
 export async function coordinateReconcileBlockedInputs(context: ReconciliationCoordinatorContext): Promise<void> {
-  if (context.state.blocked_inputs.size === 0) {
+  const blockedIssueIds = Array.from(context.state.blocked_inputs.keys());
+  // Breaker-only faults have no blocked-input entry, so they need their own sweep or
+  // they would survive forever once the issue leaves the automation's reach.
+  const breakerOnlyIssueIds = Array.from(context.state.circuit_breakers.values())
+    .filter(
+      (entry) =>
+        entry.breaker_active &&
+        !context.state.blocked_inputs.has(entry.issue_id) &&
+        !context.state.running.has(entry.issue_id) &&
+        !context.state.retry_attempts.has(entry.issue_id)
+    )
+    .map((entry) => entry.issue_id);
+  if (blockedIssueIds.length === 0 && breakerOnlyIssueIds.length === 0) {
     return;
   }
 
-  const blockedIssueIds = Array.from(context.state.blocked_inputs.keys());
   let refreshed: Issue[];
   try {
-    refreshed = await context.tracker.fetch_issue_states_by_ids(blockedIssueIds);
+    refreshed = await context.tracker.fetch_issue_states_by_ids([...blockedIssueIds, ...breakerOnlyIssueIds]);
   } catch (error) {
     context.logger?.log({
       level: 'warn',
       event: CANONICAL_EVENT.tracker.stateRefreshFailed,
       message: 'failed to refresh tracker states for blocked issues',
       context: {
-        issue_count: blockedIssueIds.length,
+        issue_count: blockedIssueIds.length + breakerOnlyIssueIds.length,
         error: error instanceof Error ? error.message : 'unknown'
       }
     });
@@ -228,7 +239,38 @@ export async function coordinateReconcileBlockedInputs(context: ReconciliationCo
         continue;
       }
       context.hooks.clearBlockedInput(issueId, issue ? 'issue_no_longer_active' : 'issue_not_found');
+      context.state.redispatch_progress?.delete(issueId);
+      await context.hooks.clearCircuitBreaker(issueId);
     }
+  }
+
+  for (const issueId of breakerOnlyIssueIds) {
+    const breaker = context.state.circuit_breakers.get(issueId);
+    if (!breaker?.breaker_active) {
+      continue;
+    }
+    const issue = refreshedById.get(issueId);
+    if (issue && isActiveState(issue.state, context.config) && !isTerminalState(issue.state, context.config)) {
+      continue;
+    }
+    context.state.redispatch_progress?.delete(issueId);
+    await context.hooks.clearCircuitBreaker(issueId);
+    context.hooks.recordRuntimeEvent({
+      event: CANONICAL_EVENT.orchestration.automationFaultCleared,
+      severity: 'info',
+      issue_identifier: breaker.issue_identifier,
+      detail: issue ? `terminal or inactive tracker state: ${issue.state}` : 'issue no longer exists in tracker'
+    });
+    context.logger?.log({
+      level: 'info',
+      event: CANONICAL_EVENT.orchestration.automationFaultCleared,
+      message: 'breaker-only automation fault cleared for terminal or inactive issue',
+      context: {
+        issue_id: issueId,
+        issue_identifier: breaker.issue_identifier,
+        tracker_state: issue?.state ?? null
+      }
+    });
   }
 }
 

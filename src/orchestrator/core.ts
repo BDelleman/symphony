@@ -65,7 +65,7 @@ import { coordinateWorkerExit, type WorkerExitCoordinatorContext } from './core/
 import { parseDynamicToolCapabilityMismatchDetail } from '../observability/dynamic-tool-capability';
 import { isKnownPhaseMarker, isTerminalPhaseMarker, phaseMarkerOrder, type PhaseMarker, type PhaseMarkerName } from '../observability';
 import { ThroughputTracker } from '../observability/throughput';
-import { computeFailureBackoffMs, shouldDispatchIssue } from './decisions';
+import { computeFailureBackoffMs, isActiveState, isTerminalState, shouldDispatchIssue } from './decisions';
 import {
   applyBudgetBlockedTerminationEvidence,
   applyBudgetTelemetryUnavailable,
@@ -2170,7 +2170,7 @@ export class OrchestratorCore {
     | {
         ok: true;
         issue_id: string;
-        status: 'started' | 'held';
+        status: 'started' | 'held' | 'cleared';
         result_code: string;
         message: string;
         dispatch_started: boolean;
@@ -2190,10 +2190,13 @@ export class OrchestratorCore {
       return { ok: false, code: 'issue_not_automation_fault', message: `Issue ${issue_identifier} has no active automation fault` };
     }
 
+    // A no-progress redispatch latch is part of the same automation fault, so it must not
+    // block the operator action: the terminal/inactive branch below clears both together.
     if (
       this.state.running.has(breaker.issue_id) ||
       this.state.retry_attempts.has(breaker.issue_id) ||
-      this.state.blocked_inputs.has(breaker.issue_id)
+      (this.state.blocked_inputs.has(breaker.issue_id) &&
+        this.state.blocked_inputs.get(breaker.issue_id)?.stop_reason_code !== REASON_CODES.operatorNoProgressRedispatchBlocked)
     ) {
       const preState = this.describeIssueRuntimeState(breaker.issue_id);
       this.recordOperatorAction(breaker.issue_id, {
@@ -2239,27 +2242,6 @@ export class OrchestratorCore {
       };
     };
 
-    const preflight = this.ports.dispatchPreflight();
-    if (!preflight.dispatch_allowed) {
-      this.state.health.dispatch_validation = 'failed';
-      this.state.health.last_error = preflight.reason ?? 'dispatch preflight rejected dispatch';
-      this.recordRuntimeEvent({
-        event: CANONICAL_EVENT.orchestration.dispatchValidationFailed,
-        severity: 'warn',
-        issue_identifier,
-        detail: this.state.health.last_error ?? undefined
-      });
-      return hold('dispatch_validation_failed', this.state.health.last_error ?? 'dispatch validation failed');
-    }
-    this.state.health.dispatch_validation = 'ok';
-    this.state.health.last_error = null;
-
-    const runtimeIdentityBlocker = this.runtimeIdentityDispatchBlockerDetail();
-    if (this.state.drain_mode.active || runtimeIdentityBlocker) {
-      const resultCode = runtimeIdentityBlocker ? 'runtime_identity_dispatch_blocked' : 'drain_mode_active';
-      return hold(resultCode, runtimeIdentityBlocker ?? 'Drain Mode is active; automation fault recovery is held until drain exits');
-    }
-
     let refreshedIssues: Issue[];
     try {
       refreshedIssues = await this.tracker.fetch_issue_states_by_ids([breaker.issue_id]);
@@ -2293,6 +2275,84 @@ export class OrchestratorCore {
         post_state: this.describeIssueRuntimeState(breaker.issue_id)
       });
       return { ok: false, code: 'issue_not_found', message: `Issue ${issue_identifier} no longer exists in tracker` };
+    }
+
+    // Terminal/inactive issues can never be redispatched, so their faults are cleared
+    // without passing the dispatch gates below; this keeps cleanup possible in Drain Mode.
+    if (!isActiveState(issue.state, this.config) || isTerminalState(issue.state, this.config)) {
+      this.clearBlockedInput(issue.id, isTerminalState(issue.state, this.config) ? 'terminal_state_cleanup' : 'issue_no_longer_active');
+      this.state.redispatch_progress?.delete(issue.id);
+      this.state.claimed.delete(issue.id);
+      await this.clearCircuitBreaker(issue.id);
+      this.recordRuntimeEvent({
+        event: CANONICAL_EVENT.orchestration.automationFaultCleared,
+        severity: 'info',
+        issue_identifier: issue.identifier,
+        detail: `terminal or inactive tracker state: ${issue.state}`,
+        reason_code: REASON_CODES.operatorClearAutomationFault
+      });
+      this.recordOperatorAction(issue.id, {
+        action: 'clear_automation_fault',
+        requested_at_ms: this.nowMs(),
+        result: 'accepted',
+        result_code: 'terminal_or_inactive_issue_cleared',
+        message: 'automation fault cleared because the issue is terminal or inactive',
+        actor: params.actor ?? null,
+        reason_note: reasonNote,
+        pre_state: preState,
+        post_state: this.describeIssueRuntimeState(issue.id)
+      });
+      this.ports.notifyObservers?.();
+      return {
+        ok: true,
+        issue_id: issue.id,
+        status: 'cleared',
+        result_code: 'terminal_or_inactive_issue_cleared',
+        message: 'automation fault cleared because the issue is terminal or inactive',
+        dispatch_started: false,
+        breaker_cleared: true
+      };
+    }
+
+    if (this.state.blocked_inputs.has(breaker.issue_id)) {
+      const currentState = this.describeIssueRuntimeState(breaker.issue_id);
+      this.recordOperatorAction(breaker.issue_id, {
+        action: 'clear_automation_fault',
+        requested_at_ms: this.nowMs(),
+        result: 'rejected',
+        result_code: 'unsupported_transition',
+        message: 'existing blocked input must use its normal operator action',
+        actor: params.actor ?? null,
+        reason_note: reasonNote,
+        pre_state: currentState,
+        post_state: currentState
+      });
+      return {
+        ok: false,
+        code: 'unsupported_transition',
+        message: `Issue ${issue_identifier} is running, retrying, or blocked on operator input`
+      };
+    }
+
+    const preflight = this.ports.dispatchPreflight();
+    if (!preflight.dispatch_allowed) {
+      this.state.health.dispatch_validation = 'failed';
+      this.state.health.last_error = preflight.reason ?? 'dispatch preflight rejected dispatch';
+      this.recordRuntimeEvent({
+        event: CANONICAL_EVENT.orchestration.dispatchValidationFailed,
+        severity: 'warn',
+        issue_identifier,
+        detail: this.state.health.last_error ?? undefined
+      });
+      return hold('dispatch_validation_failed', this.state.health.last_error ?? 'dispatch validation failed');
+    }
+    this.state.health.dispatch_validation = 'ok';
+    this.state.health.last_error = null;
+
+    const runtimeIdentityBlocker = this.runtimeIdentityDispatchBlockerDetail();
+    if (this.state.drain_mode.active || runtimeIdentityBlocker) {
+      const resultCode = runtimeIdentityBlocker ? 'runtime_identity_dispatch_blocked' : 'drain_mode_active';
+      return hold(resultCode, runtimeIdentityBlocker ?? 'Drain Mode is active; automation fault recovery is held until drain exits');
     }
 
     const eligibility = shouldDispatchIssue(issue, this.state, this.config, { skipClaimCheckForIssueId: issue.id });
