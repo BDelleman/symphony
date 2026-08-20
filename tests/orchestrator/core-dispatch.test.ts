@@ -374,6 +374,29 @@ describe('OrchestratorCore dispatch and backpressure', () => {
     expect(snapshot.retry_attempts.has('i-claim')).toBe(false);
   });
 
+  it('releases the dispatch claim after a non-retryable worker failure so the issue can dispatch again', async () => {
+    const harness = createHarness();
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([makeIssue({ id: 'i-nonretryable', identifier: 'ABC-NONRETRY' })]);
+    await harness.orchestrator.tick('interval');
+    expect(harness.orchestrator.getStateSnapshot().claimed.has('i-nonretryable')).toBe(true);
+
+    await harness.orchestrator.onWorkerExit('i-nonretryable', 'abnormal', 'claude_terminal_result_count:2', {
+      retryable: false
+    });
+
+    const snapshot = harness.orchestrator.getStateSnapshot();
+    expect(snapshot.running.has('i-nonretryable')).toBe(false);
+    expect(snapshot.claimed.has('i-nonretryable')).toBe(false);
+    expect(snapshot.retry_attempts.has('i-nonretryable')).toBe(false);
+
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([
+      makeIssue({ id: 'i-nonretryable', identifier: 'ABC-NONRETRY' })
+    ]);
+    await harness.orchestrator.tick('interval');
+
+    expect(harness.spawned.filter((entry) => entry.issue_id === 'i-nonretryable')).toHaveLength(2);
+  });
+
   it('prevents duplicate dispatch while overlapping ticks wait for worker spawn', async () => {
     const issue = makeIssue({ id: 'i-overlap', identifier: 'ABC-OVERLAP' });
     let releaseSpawn!: () => void;
