@@ -2593,6 +2593,12 @@ export class OrchestratorCore {
     if (normalized.includes(REASON_CODES.freshDispatchNoRoute)) {
       return REASON_CODES.freshDispatchNoRoute;
     }
+    if (normalized.includes(REASON_CODES.claudeSandboxRuntimeFailed)) {
+      return REASON_CODES.claudeSandboxRuntimeFailed;
+    }
+    if (normalized.includes('claude_permission_denied_under_sandbox')) {
+      return REASON_CODES.claudePermissionDenied;
+    }
     if (normalized.includes(REASON_CODES.unsafeWorkspaceRoot)) {
       return REASON_CODES.unsafeWorkspaceRoot;
     }

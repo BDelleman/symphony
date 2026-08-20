@@ -27,6 +27,7 @@ export const CLAUDE_SUPPORTED_VERSION = '2.1.224';
 const MAX_PROMPT_BYTES = 8 * 1024 * 1024;
 const MAX_PROTOCOL_LINE_BYTES = 8 * 1024 * 1024;
 const MAX_RESULT_DETAIL_BYTES = 16 * 1024;
+const MAX_TOOL_FAILURE_INSPECTION_BYTES = 64 * 1024;
 const HEARTBEAT_MS = 5_000;
 const NESTED_PROCESS_SCAN_MS = 1_000;
 const TERMINATION_GRACE_MS = 5_000;
@@ -92,6 +93,7 @@ interface ParsedProtocolState {
   unknownEventCount: number;
   lastEvent: string;
   protocolError: string | null;
+  runtimeFailure: string | null;
 }
 
 interface ClaudeSessionBinding {
@@ -1058,6 +1060,41 @@ function boundedTelemetryName(value: string): string {
   return trimUtf8(value.trim(), MAX_TELEMETRY_NAME_BYTES);
 }
 
+function boundedToolResultText(content: unknown): string {
+  if (typeof content === 'string') return trimUtf8(content, MAX_TOOL_FAILURE_INSPECTION_BYTES);
+  if (!Array.isArray(content)) return '';
+  let output = '';
+  for (const rawBlock of content) {
+    const block = asRecord(rawBlock);
+    if (!block || readString(block, 'type') !== 'text') continue;
+    const text = readString(block, 'text');
+    if (!text) continue;
+    output = trimUtf8(`${output}${output ? '\n' : ''}${text}`, MAX_TOOL_FAILURE_INSPECTION_BYTES);
+    if (Buffer.byteLength(output, 'utf8') >= MAX_TOOL_FAILURE_INSPECTION_BYTES) break;
+  }
+  return output;
+}
+
+function sandboxRuntimeFailureCategory(content: unknown): string | null {
+  const normalized = boundedToolResultText(content).toLowerCase();
+  if (!normalized) return null;
+  if (normalized.includes('sandboxing requires wsl2')) return 'wsl_sandbox_unsupported';
+  if (/sandbox(?:ing)? (?:initialization|startup) (?:failed|failure)/.test(normalized)) {
+    return 'sandbox_initialization_failed';
+  }
+  if (/sandbox (?:dependency|dependencies).*(?:missing|unavailable|not found)/.test(normalized)) {
+    return 'sandbox_dependency_unavailable';
+  }
+  if (
+    normalized.includes('bwrap:') &&
+    /(?:mount|namespace|unshare|sandbox)/.test(normalized) &&
+    /(?:can(?:not|'t)|failed|failure|operation not permitted|no such file or directory)/.test(normalized)
+  ) {
+    return 'bubblewrap_containment_failed';
+  }
+  return null;
+}
+
 function retryCategory(value: unknown): string {
   const normalized = boundedFailureSignal(value) ?? 'unknown';
   if (/429|rate.?limit/.test(normalized)) return 'rate_limit';
@@ -1645,15 +1682,30 @@ export class ClaudeCliRunner implements AgentRunner {
         });
       });
       let committed: 'cancelled' | 'timed_out' | null = null;
+      let terminationCause: 'cancelled' | 'timed_out' | 'protocol' | 'runtime' | null = null;
       let forcedKillSent = false;
       let resolveCloseDeadline: ((value: { code: null; signal: NodeJS.Signals; spawnError: string }) => void) | null = null;
       const closeDeadlinePromise = new Promise<{ code: null; signal: NodeJS.Signals; spawnError: string }>((resolve) => {
         resolveCloseDeadline = resolve;
       });
       let state: ParsedProtocolState;
-      const requestTermination = (cause: string, outcome: 'cancelled' | 'timed_out' | null = null) => {
-        if (outcome && !committed) committed = outcome;
-        if (!outcome && state && !state.protocolError) state.protocolError = cause;
+      const requestTermination = (
+        cause: string,
+        kind: 'cancelled' | 'timed_out' | 'protocol' | 'runtime'
+      ) => {
+        if (terminationCause) {
+          if (
+            kind === 'protocol' &&
+            (cause === 'claude_process_group_cleanup_failed' || cause === 'claude_escaped_descendant_cleanup_failed')
+          ) {
+            state.protocolError = cause;
+          }
+          return;
+        }
+        terminationCause = kind;
+        if (kind === 'cancelled' || kind === 'timed_out') committed = kind;
+        else if (kind === 'runtime') state.runtimeFailure = cause;
+        else state.protocolError = cause;
         if (terminationLifecycle === 'closed' || forceKillTimer || closeDeadlineTimer) return;
         terminationLifecycle = 'terminating';
         killProcessGroup(child?.pid, 'SIGTERM');
@@ -1667,7 +1719,7 @@ export class ClaudeCliRunner implements AgentRunner {
           resolveCloseDeadline?.({ code: null, signal: 'SIGKILL', spawnError: 'claude_process_close_timeout' });
         }, TERMINATION_GRACE_MS + PROCESS_CLOSE_GRACE_MS);
       };
-      deliveryFailureHandler = () => requestTermination(eventDeliveryError ?? 'claude_event_delivery_failed');
+      deliveryFailureHandler = () => requestTermination(eventDeliveryError ?? 'claude_event_delivery_failed', 'protocol');
       emit({
         event: CANONICAL_EVENT.agentRunner.processStarted,
         session_id: expectedSessionId ?? undefined,
@@ -1690,7 +1742,8 @@ export class ClaudeCliRunner implements AgentRunner {
         permissionDenialCount: 0,
         unknownEventCount: 0,
         lastEvent: CANONICAL_EVENT.agentRunner.processStarted,
-        protocolError: null
+        protocolError: null,
+        runtimeFailure: null
       };
       let stderrBytes = 0;
       const stderrHash = crypto.createHash('sha256');
@@ -1705,6 +1758,7 @@ export class ClaudeCliRunner implements AgentRunner {
       const observedModels = new Set<string>();
       const emittedReroutes = new Set<string>();
       const observedToolIds = new Set<string>();
+      const toolNamesById = new Map<string, string>();
       const observedPermissionDenialIds = new Set<string>();
       const toolCounts: Record<string, number> = {};
       const mcpCounts: Record<string, number> = {};
@@ -1712,7 +1766,11 @@ export class ClaudeCliRunner implements AgentRunner {
       let firstAssistantAtMs: number | null = null;
       const failProtocol = (code: string) => {
         if (state.protocolError) return;
-        requestTermination(code);
+        requestTermination(code, 'protocol');
+      };
+      const failRuntime = (code: string) => {
+        if (state.runtimeFailure) return;
+        requestTermination(code, 'runtime');
       };
       const parseLine = (line: string) => {
         if (!line.trim() || state.protocolError) return;
@@ -1850,6 +1908,7 @@ export class ClaudeCliRunner implements AgentRunner {
             detail: `claude_permission_denied:${deniedTool}`,
             reason_code: REASON_CODES.claudePermissionDenied
           });
+          failRuntime('claude_permission_denied_under_sandbox');
           return;
         }
         if (type === 'assistant') {
@@ -1946,6 +2005,7 @@ export class ClaudeCliRunner implements AgentRunner {
               }
               observedToolIds.add(toolId);
               const boundedToolName = boundedTelemetryName(toolName);
+              toolNamesById.set(toolId, boundedToolName);
               toolCounts[boundedToolName] = (toolCounts[boundedToolName] ?? 0) + 1;
               const mcpServer = mcpServerFromToolName(boundedToolName);
               if (mcpServer) mcpCounts[mcpServer] = (mcpCounts[mcpServer] ?? 0) + 1;
@@ -1982,14 +2042,29 @@ export class ClaudeCliRunner implements AgentRunner {
             const rawToolId = readString(block, 'tool_use_id') ?? readString(block, 'toolUseId');
             if (!rawToolId) continue;
             const toolId = crypto.createHash('sha256').update(rawToolId).digest('hex');
+            const toolName = toolNamesById.get(toolId);
             emit({
               event: block.is_error === true ? CANONICAL_EVENT.codex.toolCallFailed : CANONICAL_EVENT.codex.toolCallCompleted,
               session_id: state.sessionId ?? undefined,
               turn_id: turnId,
               detail: block.is_error === true ? 'claude_tool_failed' : 'claude_tool_completed',
               tool_call_id: toolId,
+              tool_name: toolName,
               tool_call_evidence_source: 'worker_event'
             });
+            if (block.is_error === true && toolName === 'Bash') {
+              const category = sandboxRuntimeFailureCategory(block.content);
+              if (category) {
+                emit({
+                  event: CANONICAL_EVENT.agentRunner.activity,
+                  session_id: state.sessionId ?? undefined,
+                  turn_id: turnId,
+                  detail: category,
+                  reason_code: REASON_CODES.claudeSandboxRuntimeFailed
+                });
+                failRuntime(REASON_CODES.claudeSandboxRuntimeFailed);
+              }
+            }
           }
           return;
         }
@@ -2047,7 +2122,7 @@ export class ClaudeCliRunner implements AgentRunner {
       }, NESTED_PROCESS_SCAN_MS);
 
       const terminate = (outcome: 'cancelled' | 'timed_out') => {
-        if (committed) return;
+        if (terminationCause) return;
         requestTermination(outcome, outcome);
       };
       const abortListener = () => terminate('cancelled');
@@ -2148,7 +2223,7 @@ export class ClaudeCliRunner implements AgentRunner {
             toolCounts,
             mcpCounts,
             updatedAt: usageObservedAt,
-            missingReason: state.protocolError ?? 'claude_terminal_missing'
+            missingReason: state.runtimeFailure ?? state.protocolError ?? 'claude_terminal_missing'
           });
       if (finalUsage) {
         finalUsage = {
@@ -2195,6 +2270,7 @@ export class ClaudeCliRunner implements AgentRunner {
           last_event: event,
           error_code: state.protocolError ?? (committed === 'timed_out' ? REASON_CODES.turnTimeout : REASON_CODES.workerCancelRequested),
           error_detail: [
+            state.runtimeFailure ? `runtime_failure=${state.runtimeFailure}` : null,
             state.protocolError ? `containment_failure=${state.protocolError}` : null,
             stderrDigest ? `stderr_bytes=${stderrBytes};stderr_sha256=${stderrDigest}` : null
           ].filter(Boolean).join(';') || undefined,
@@ -2222,6 +2298,7 @@ export class ClaudeCliRunner implements AgentRunner {
       const failure =
         close.spawnError ||
         eventDeliveryError ||
+        state.runtimeFailure ||
         state.protocolError ||
         (state.terminalResultCount !== 1 ? `claude_terminal_result_count:${state.terminalResultCount}` : null) ||
         (state.initCount !== 1 ? `claude_init_count:${state.initCount}` : null) ||
@@ -2256,7 +2333,7 @@ export class ClaudeCliRunner implements AgentRunner {
           requested_model: this.options.model,
           effective_model: state.effectiveModel,
           provider_usage: finalUsage ?? undefined,
-          retryable: Boolean(processCrash) && !state.protocolError
+          retryable: Boolean(processCrash) && !state.protocolError && !state.runtimeFailure
             ? true
             : isRetryableClaudeFailure(failure ?? 'claude_terminal_missing')
         };

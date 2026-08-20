@@ -750,6 +750,7 @@ export async function coordinateWorkerExit(
             reason,
             outcome: 'failed',
             retryable: false,
+            stop_reason_code: stopReasonCode,
             error: error ?? null
           }
         });
