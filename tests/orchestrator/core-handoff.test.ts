@@ -114,6 +114,36 @@ describe('OrchestratorCore handoff', () => {
     expect(harness.spawned).toHaveLength(1);
   });
 
+  it('preserves a non-retryable Claude sandbox failure as the stop reason', async () => {
+    const logs: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const harness = createHarness({
+      logger: {
+        log: ({ event, context }) => logs.push({ event, context: context ?? {} })
+      }
+    });
+    const issue = makeIssue({ id: 'i-claude-sandbox-failure', state: 'In Progress' });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([issue]);
+    await harness.orchestrator.tick('interval');
+
+    await harness.orchestrator.onWorkerExit(
+      issue.id,
+      'abnormal',
+      `${REASON_CODES.claudeSandboxRuntimeFailed}:claude_sandbox_bwrap_canary_failed`,
+      { retryable: false }
+    );
+
+    expect(harness.orchestrator.getStateSnapshot().retry_attempts.has(issue.id)).toBe(false);
+    expect(logs).toContainEqual(expect.objectContaining({
+      event: CANONICAL_EVENT.orchestration.workerExitHandled,
+      context: expect.objectContaining({
+        issue_id: issue.id,
+        outcome: 'failed',
+        retryable: false,
+        stop_reason_code: REASON_CODES.claudeSandboxRuntimeFailed
+      })
+    }));
+  });
+
   it('dispatches stale retry state in Agent Review as fresh without prior thread lineage', async () => {
     const harness = createHarness({
       configOverrides: {

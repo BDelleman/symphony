@@ -343,7 +343,7 @@ describe('forensics export bundle', () => {
     expect(bundle.spans.tool[0]).toMatchObject({ tool_name: 'exec_command' });
     expect(bundle.config_fingerprint.value).toMatch(/^[a-f0-9]{64}$/);
     expect(bundle.workflow_hash.value).toMatch(/^[a-f0-9]{64}$/);
-    expect(bundle.reason_taxonomy_version).toBe('2026-08-19.v1');
+    expect(bundle.reason_taxonomy_version).toBe('2026-08-20.v1');
   });
 
   it('exports redacted missing-output recovery lineage for offline review', () => {

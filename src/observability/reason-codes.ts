@@ -1,6 +1,6 @@
 import { DYNAMIC_TOOL_CONSOLE_RECOVERY_ACTION, UNSUPPORTED_DYNAMIC_TOOL_CONSOLE_RESUME_REASON_CODE } from './dynamic-tool-capability';
 
-export const REASON_CODE_REGISTRY_VERSION = '2026-08-19.v1';
+export const REASON_CODE_REGISTRY_VERSION = '2026-08-20.v1';
 
 export type ReasonCodeClassification =
   | 'healthy'
@@ -93,6 +93,7 @@ export const REASON_CODES = {
   codexModelRerouted: 'codex_model_rerouted',
   claudeModelObserved: 'claude_model_observed',
   claudePermissionDenied: 'claude_permission_denied',
+  claudeSandboxRuntimeFailed: 'claude_sandbox_runtime_failed',
   symphonyPhaseMarker: 'symphony_phase_marker',
   recoveredAfterRestart: 'recovered_after_restart',
   projectHistorySchemaHealthUnavailable: 'project_history_schema_health_unavailable',
@@ -851,6 +852,16 @@ export const CANONICAL_REASON_CODE_REGISTRY = {
     label: 'Claude Permission Denied',
     headline: 'Claude reported a denied operation',
     detail: 'The Claude runtime permission layer denied an operation during unattended execution.',
+    expected_transition: null
+  },
+  [REASON_CODES.claudeSandboxRuntimeFailed]: {
+    reason_code: REASON_CODES.claudeSandboxRuntimeFailed,
+    classification: 'failed',
+    actionability: 'required',
+    recommended_actions: ['Run Symphony doctor and repair the reported Claude sandbox failure before retrying'],
+    label: 'Claude Sandbox Runtime Failed',
+    headline: 'Claude could not start or retain its supervised sandbox',
+    detail: 'The Claude runtime stopped after its host sandbox preflight or a sandboxed Bash operation failed containment setup.',
     expected_transition: null
   },
   [REASON_CODES.projectHistorySchemaHealthUnavailable]: {

@@ -148,6 +148,14 @@ process.stdin.on('end', () => {
   }
   if (process.env.MOCK_MODE === 'missing-result') return;
   if (process.env.MOCK_MODE === 'crash-no-result') { process.exit(2); return; }
+  if (process.env.MOCK_BASH_TOOL_ERROR) {
+    process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'bash-error-message', model, usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [{ type: 'tool_use', id: 'bash-error-tool', name: 'Bash', input: { command: 'true' } }] } }) + '\\n');
+    const errorContent = process.env.MOCK_BASH_TOOL_ERROR_ARRAY === '1'
+      ? [{ type: 'text', text: process.env.MOCK_BASH_TOOL_ERROR }]
+      : process.env.MOCK_BASH_TOOL_ERROR;
+    process.stdout.write(JSON.stringify({ type: 'user', session_id: '${SESSION_ID}', message: { content: [{ type: 'tool_result', tool_use_id: 'bash-error-tool', is_error: true, content: errorContent }] } }) + '\\n');
+    if (process.env.MOCK_BASH_TOOL_ERROR_HANG === '1') { setInterval(() => {}, 1000); return; }
+  }
   if (process.env.MOCK_PARTIAL === '1') {
     process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-1', model, usage: { input_tokens: 4, output_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 0 }, content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'README.md' } }] } }) + '\\n');
     process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-1', model, usage: { input_tokens: 4, output_tokens: 3, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 }, content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'README.md' } }] } }) + '\\n');
@@ -353,6 +361,30 @@ describe('ClaudeCliRunner', () => {
     expect(result.error_code).toContain('claude_version_unsupported');
   });
 
+  it('fails the Linux sandbox canary before starting a Claude session', async () => {
+    const fixture = createFixture();
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-sandbox-bin-'));
+    fs.writeFileSync(
+      path.join(binDir, 'bwrap'),
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "bubblewrap 1"; exit 0; fi\nexit 1\n',
+      { mode: 0o755 }
+    );
+    fs.writeFileSync(path.join(binDir, 'socat'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      platform: 'linux',
+      env: fixtureEnv(fixture, { PATH: `${binDir}${path.delimiter}${process.env.PATH}` }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result).toMatchObject({ status: 'failed', retryable: false });
+    expect(result.error_code).toContain('claude_sandbox_runtime_failed:claude_sandbox_bwrap_canary_failed');
+    expect(fs.existsSync(fixture.argsFile)).toBe(false);
+  });
+
   it('rejects API-key routing unless explicitly approved', async () => {
     const fixture = createFixture();
     const result = await new ClaudeCliRunner({
@@ -416,6 +448,82 @@ describe('ClaudeCliRunner', () => {
       status: 'failed',
       error_code: 'claude_permission_denied_under_sandbox',
       provider_usage: { permission_denial_count: 1 }
+    });
+  });
+
+  it.each(['string', 'array'])('fails immediately on a %s bubblewrap tool failure without persisting output', async (shape) => {
+    const fixture = createFixture();
+    const events: AgentRunnerEvent[] = [];
+    const sensitiveOutput = "bwrap: Can't mount tmpfs on /newroot/root/.aws: No such file or directory";
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, {
+        MOCK_BASH_TOOL_ERROR: sensitiveOutput,
+        MOCK_BASH_TOOL_ERROR_ARRAY: shape === 'array' ? '1' : undefined,
+        MOCK_BASH_TOOL_ERROR_HANG: '1'
+      }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn({
+      ...startInput(fixture.root),
+      onEvent: (event) => events.push(event)
+    });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error_code: 'claude_sandbox_runtime_failed',
+      retryable: false,
+      provider_usage: { status: 'partial', input_tokens: 2, output_tokens: 1 }
+    });
+    expect(events).toContainEqual(expect.objectContaining({
+      detail: 'bubblewrap_containment_failed',
+      reason_code: 'claude_sandbox_runtime_failed'
+    }));
+    expect(JSON.stringify({ result, events })).not.toContain(sensitiveOutput);
+  });
+
+  it('does not turn an ordinary failed Bash command into a runtime failure', async () => {
+    const fixture = createFixture();
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_BASH_TOOL_ERROR: 'tests failed with exit code 1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result).toMatchObject({ status: 'completed', retryable: false });
+  });
+
+  it('preserves a runtime failure when cancellation races after containment failure', async () => {
+    const fixture = createFixture();
+    const controller = new AbortController();
+    const resultPromise = new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, {
+        MOCK_BASH_TOOL_ERROR: "bwrap: Can't mount tmpfs: No such file or directory",
+        MOCK_BASH_TOOL_ERROR_HANG: '1'
+      }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn({
+      ...startInput(fixture.root),
+      cancellationSignal: controller.signal,
+      onEvent: (event) => {
+        if (event.reason_code === 'claude_sandbox_runtime_failed') setImmediate(() => controller.abort());
+      }
+    });
+
+    const result = await resultPromise;
+    expect(result).toMatchObject({
+      status: 'failed',
+      error_code: 'claude_sandbox_runtime_failed',
+      retryable: false
     });
   });
 
