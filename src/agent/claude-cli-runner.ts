@@ -1688,7 +1688,24 @@ export class ClaudeCliRunner implements AgentRunner {
       const closeDeadlinePromise = new Promise<{ code: null; signal: NodeJS.Signals; spawnError: string }>((resolve) => {
         resolveCloseDeadline = resolve;
       });
-      let state: ParsedProtocolState;
+      const state: ParsedProtocolState = {
+        sessionId: null,
+        initSessionId: null,
+        effectiveModel: null,
+        capabilityFingerprint: null,
+        instructionFingerprint: null,
+        skillFingerprint: null,
+        terminalResult: null,
+        terminalResultCount: 0,
+        auxiliaryResultCount: 0,
+        initCount: 0,
+        apiRetryCount: 0,
+        permissionDenialCount: 0,
+        unknownEventCount: 0,
+        lastEvent: CANONICAL_EVENT.agentRunner.processStarted,
+        protocolError: null,
+        runtimeFailure: null
+      };
       const requestTermination = (
         cause: string,
         kind: 'cancelled' | 'timed_out' | 'protocol' | 'runtime'
@@ -1727,24 +1744,6 @@ export class ClaudeCliRunner implements AgentRunner {
         turn_id: turnId
       });
 
-      state = {
-        sessionId: null,
-        initSessionId: null,
-        effectiveModel: null,
-        capabilityFingerprint: null,
-        instructionFingerprint: null,
-        skillFingerprint: null,
-        terminalResult: null,
-        terminalResultCount: 0,
-        auxiliaryResultCount: 0,
-        initCount: 0,
-        apiRetryCount: 0,
-        permissionDenialCount: 0,
-        unknownEventCount: 0,
-        lastEvent: CANONICAL_EVENT.agentRunner.processStarted,
-        protocolError: null,
-        runtimeFailure: null
-      };
       let stderrBytes = 0;
       const stderrHash = crypto.createHash('sha256');
       child.stderr.on('data', (chunk: Buffer) => {
