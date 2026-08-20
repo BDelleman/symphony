@@ -3201,7 +3201,7 @@ async function addClaudeSmokeCheck(params: {
     reason: ready ? 'claude_smoke_ready' : 'claude_smoke_failed',
     summary: ready
       ? `Claude completed the supervised sandbox, GitHub, and Linear read/write/cleanup smoke for ${params.linearIssue}.`
-      : `Claude smoke failed with ${result.error_code ?? result.status}; observed ${linearToolCalls} Linear MCP tool call(s).`,
+      : `Claude smoke failed with ${result.error_code ?? cleanupResult?.error_code ?? cleanupResult?.status ?? result.status}; observed ${linearToolCalls} Linear MCP tool call(s).`,
     remediation: ready ? undefined : 'Inspect the Claude runner result and MCP scope, then rerun against the dedicated test issue.',
     details: {
       issueIdentifier: params.linearIssue,
@@ -3221,6 +3221,8 @@ async function addClaudeSmokeCheck(params: {
       finalMarkerCleanup,
       worktreeRemovalStatus,
       cleanupStatus: cleanupResult?.status ?? 'not_run',
+      cleanupErrorCode: cleanupResult?.error_code ?? null,
+      cleanupErrorDetail: cleanupResult?.error_detail ?? null,
       invocationError,
       providerUsageStatus: result.provider_usage?.status ?? 'unobserved',
       modelQuotaConsumed: true
