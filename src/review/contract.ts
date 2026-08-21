@@ -36,16 +36,20 @@ export function parseReviewOutcome(message: string | undefined): AgentReviewOutc
   if (!message) return null;
   if (!message.includes(REVIEW_OUTCOME_PREFIX)) return null;
   // The workflow instructs the agent to return the envelope alone, but agents
-  // still wrap it in a short summary often enough that exact-match parsing
-  // killed valid, receipt-verified reviews. The envelope is authenticated
-  // downstream against the receipt written by `review finalize`, so prose
-  // around it adds no forgery surface: tolerate surrounding lines and require
-  // exactly one line that is the envelope and nothing else. Anything more
-  // ambiguous — two envelopes, or an envelope sharing a line with other text —
-  // still fails closed.
+  // still wrap it in a short summary or markdown inline code often enough that
+  // exact-match parsing killed valid, receipt-verified reviews. The envelope is
+  // authenticated downstream against the receipt written by `review finalize`,
+  // so prose around it adds no forgery surface: tolerate surrounding lines,
+  // unwrap a symmetric backtick code span, and require exactly one line that is
+  // the envelope and nothing else. Anything more ambiguous — two envelopes, or
+  // an envelope sharing a line with other text — still fails closed.
   const markerLines = message
     .split(/\r?\n/)
-    .map((line) => line.trim())
+    .map((line) => {
+      const trimmed = line.trim();
+      const codeSpan = /^(`+)([^`]*)\1$/.exec(trimmed);
+      return codeSpan ? codeSpan[2]!.trim() : trimmed;
+    })
     .filter((line) => line.includes(REVIEW_OUTCOME_PREFIX));
   const envelope = markerLines[0]!;
   if (
