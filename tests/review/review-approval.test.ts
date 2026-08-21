@@ -101,6 +101,11 @@ describe('review approval contract', () => {
     expect(parseReviewOutcome('ordinary long response '.repeat(1000))).toBeNull();
     expect(parseReviewOutcome(`Review finalized with verdict \`pass\`.\n\n${encoded}`)).toEqual(outcome());
     expect(parseReviewOutcome(`${encoded}\ntrailing prose`)).toEqual(outcome());
+    expect(parseReviewOutcome(`\`${encoded}\``)).toEqual(outcome());
+    expect(parseReviewOutcome(`Review finalized.\n\n\`\`${encoded}\`\``)).toEqual(outcome());
+    expect(parseReviewOutcome(`\`\`\`\n${encoded}\n\`\`\``)).toEqual(outcome());
+    expect(() => parseReviewOutcome(`\`${encoded}`)).toThrow('review_approval_outcome_malformed');
+    expect(() => parseReviewOutcome(`\`prose ${encoded}\``)).toThrow('review_approval_outcome_malformed');
     expect(() => parseReviewOutcome(`${encoded} same-line trailing`)).toThrow('review_approval_outcome_malformed');
     expect(() => parseReviewOutcome(`prefix text ${encoded}`)).toThrow('review_approval_outcome_malformed');
     expect(() => parseReviewOutcome(`${encoded}\n${encoded}`)).toThrow('review_approval_outcome_malformed');
