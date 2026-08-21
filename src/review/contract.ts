@@ -55,6 +55,28 @@ export function parseReviewOutcome(message: string | undefined): AgentReviewOutc
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('review_approval_outcome_malformed');
   }
+  return coerceReviewOutcome(parsed);
+}
+
+// Runner-facing variant: a decorated or malformed envelope must not fail the
+// turn outright, because the orchestrator can still recover the outcome from
+// the workspace review capsule. The parse failure is surfaced alongside the
+// null outcome so the orchestrator can report it when no capsule receipt
+// exists either.
+export function tryParseReviewOutcome(
+  message: string | undefined
+): { outcome: AgentReviewOutcome | null; error: string | null } {
+  try {
+    return { outcome: parseReviewOutcome(message), error: null };
+  } catch (error) {
+    return { outcome: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export function coerceReviewOutcome(parsed: unknown): AgentReviewOutcome {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(REASON_CODES.reviewApprovalOutcomeInvalid);
+  }
   const value = parsed as Record<string, unknown>;
   if (
     value.version !== 1 ||
