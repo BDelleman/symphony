@@ -369,14 +369,16 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
     }
     const workspaceConflictError = await renderWorkspaceConflictError(error, workspacePath);
     const errorMessage = error instanceof Error ? error.message : 'unknown worker error';
+    const sensitiveWorkspaceFailure = workspaceSensitiveFailure(error);
     return {
       reason: 'abnormal',
       session_id: null,
       error: workspaceConflictError
+        ?? sensitiveWorkspaceFailure
         ?? (errorMessage.startsWith('review_approval_outcome_')
           ? REASON_CODES.reviewApprovalOutcomeInvalid
           : errorMessage),
-      retryable: errorMessage.startsWith('review_approval_outcome_') ? false : undefined
+      retryable: errorMessage.startsWith('review_approval_outcome_') || sensitiveWorkspaceFailure ? false : undefined
     };
   } finally {
     if (workspacePath) {
@@ -564,10 +566,14 @@ export async function runLocalWorkerRecoveryAttempt(
       };
     }
     const workspaceConflictError = await renderWorkspaceConflictError(error, workspacePath);
+    const sensitiveWorkspaceFailure = workspaceSensitiveFailure(error);
     return {
       reason: 'abnormal',
       session_id: null,
-      error: workspaceConflictError ?? (error instanceof Error ? error.message : 'unknown recovery worker error')
+      error: workspaceConflictError
+        ?? sensitiveWorkspaceFailure
+        ?? (error instanceof Error ? error.message : 'unknown recovery worker error'),
+      retryable: sensitiveWorkspaceFailure ? false : undefined
     };
   } finally {
     if (workspacePath) {
@@ -695,6 +701,13 @@ function parseWorkspaceConflictError(error: unknown): { message: string } | null
   }
 
   return null;
+}
+
+function workspaceSensitiveFailure(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+  const maybe = error as { code?: unknown; message?: unknown };
+  if (maybe.code !== 'workspace_sensitive_file_detected' || typeof maybe.message !== 'string') return null;
+  return `workspace_sensitive_file_detected:${maybe.message}`;
 }
 
 function inferConflictFilesFromMessage(message: string): Array<{ path: string; status: 'staged' | 'unstaged' | 'unknown' }> {
