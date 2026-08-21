@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import path from 'node:path';
 
 import { WorkspaceError } from './errors';
@@ -17,6 +18,8 @@ import type {
 
 const SANITIZE_PATTERN = /[^A-Za-z0-9._-]/g;
 const TEMP_ARTIFACTS = ['tmp', '.elixir_ls'];
+const VCS_DIRECTORIES = new Set(['.git', '.hg', '.jj', '.svn']);
+const VENV_SCAN_MAX_ENTRIES = 50_000;
 const EPHEMERAL_FILE_EXACT = new Set(['.symphony-provision.json']);
 const EPHEMERAL_PREFIXES = ['output/playwright/'];
 const SENTINEL_UI_PATH = 'src/api/dashboard-assets.ts';
@@ -374,6 +377,7 @@ export class WorkspaceManager {
   async prepareAttempt(workspacePath: string, options: WorkspacePrepareAttemptOptions = {}): Promise<void> {
     const resolved = path.resolve(workspacePath);
     this.assertLaunchSafety({ workspacePath: resolved, cwd: resolved });
+    await this.removeEscapedVirtualenvs(resolved);
     this.assertNoSensitiveFiles(resolved);
 
     for (const artifact of TEMP_ARTIFACTS) {
@@ -383,6 +387,80 @@ export class WorkspaceManager {
 
     await this.runHookOrThrow('before_run', resolved);
     this.assertNoSensitiveFiles(resolved);
+  }
+
+  // Python virtualenvs symlink their interpreter outside the managed workspace
+  // (a system interpreter, or a sandbox-session-scoped install that no longer
+  // exists on reuse), so a reused workspace that carries one can never pass the
+  // fail-closed sensitive-file audit: every redispatch fails with
+  // symlink_escape and the issue loops without operator-visible remediation.
+  // Virtualenvs are rebuildable attempt artifacts, so any venv whose
+  // interpreter links dangle or resolve outside the workspace is removed before
+  // auditing. Venvs whose links stay inside the workspace (or that were built
+  // with --copies) are kept, and escaped symlinks anywhere else still fail the
+  // audit closed.
+  private async removeEscapedVirtualenvs(workspacePath: string): Promise<void> {
+    const removed: Array<{ path: string; action: 'remove' }> = [];
+    const pending = [''];
+    let scanned = 0;
+    while (pending.length > 0) {
+      const relativeDirectory = pending.pop()!;
+      const absoluteDirectory = relativeDirectory ? path.join(workspacePath, relativeDirectory) : workspacePath;
+      let entries: Dirent[];
+      try {
+        entries = await fs.readdir(absoluteDirectory, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      if (relativeDirectory && entries.some((entry) => entry.isFile() && entry.name === 'pyvenv.cfg')) {
+        if (await this.virtualenvEscapesWorkspace(workspacePath, relativeDirectory)) {
+          await fs.rm(absoluteDirectory, { recursive: true, force: true });
+          removed.push({ path: relativeDirectory.replace(/\\/g, '/'), action: 'remove' });
+        }
+        continue;
+      }
+      for (const entry of entries) {
+        scanned += 1;
+        if (scanned > VENV_SCAN_MAX_ENTRIES) return;
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        if (VCS_DIRECTORIES.has(entry.name)) continue;
+        pending.push(relativeDirectory ? path.join(relativeDirectory, entry.name) : entry.name);
+      }
+    }
+    if (removed.length > 0) {
+      this.onPreflightResult?.({
+        identifier: path.basename(workspacePath),
+        workspace_path: workspacePath,
+        status: 'cleaned',
+        cleaned_files: removed,
+        conflict_files: [],
+        resolution_hints: []
+      });
+    }
+  }
+
+  private async virtualenvEscapesWorkspace(workspacePath: string, venvRelative: string): Promise<boolean> {
+    for (const binDirectory of ['bin', 'Scripts']) {
+      const absoluteBin = path.join(workspacePath, venvRelative, binDirectory);
+      let entries: Dirent[];
+      try {
+        entries = await fs.readdir(absoluteBin, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.isSymbolicLink()) continue;
+        let resolvedTarget: string;
+        try {
+          resolvedTarget = await fs.realpath(path.join(absoluteBin, entry.name));
+        } catch {
+          return true;
+        }
+        const relativeTarget = path.relative(workspacePath, resolvedTarget);
+        if (relativeTarget.startsWith('..') || path.isAbsolute(relativeTarget)) return true;
+      }
+    }
+    return false;
   }
 
   private assertNoSensitiveFiles(workspacePath: string): void {
