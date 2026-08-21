@@ -13,6 +13,7 @@ import { buildCodexSpawnCommand } from '../codex/command-builder';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { WorkerCompletionReason } from './types';
+import type { AgentReviewOutcome, ReviewApprovalResult } from '../review';
 
 const DEFAULT_CONTINUATION_PROMPT =
   'Continue on the same thread for this issue. Focus on incremental progress and report outcomes clearly.';
@@ -20,6 +21,7 @@ const DEFAULT_CONTINUATION_PROMPT =
 export interface LocalWorkerRunInput {
   issue: Issue;
   attempt: number | null;
+  symphonyAttemptId: string;
   worker_host?: string;
   workspaceManager: WorkspaceManager;
   workspace: WorkspaceInfo;
@@ -30,6 +32,13 @@ export interface LocalWorkerRunInput {
   resumeContext?: string | null;
   recoverWorkspaceAttemptResidue?: boolean;
   issueStateFetcher: (issue_ids: string[]) => Promise<Issue[]>;
+  reviewOutcomeHandler?: (params: {
+    issue: Issue;
+    outcome: AgentReviewOutcome;
+    workspace: WorkspaceInfo;
+    symphonyAttemptId: string;
+    sessionId: string | null;
+  }) => Promise<ReviewApprovalResult>;
   onCodexEvent?: (event: CodexRunnerEvent) => void;
   onAgentEvent?: (event: AgentRunnerEvent) => void;
   cancellationSignal?: AbortSignal;
@@ -125,7 +134,10 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
             ? (input.config.agent_runtime?.claude_command ?? 'claude')
             : codexSpawnCommand.command,
         commandArgs: agentRunner.runtime === 'claude-cli' ? [] : codexSpawnCommand.args,
-        commandEnv: agentRunner.runtime === 'claude-cli' ? undefined : codexSpawnCommand.env,
+        commandEnv:
+          agentRunner.runtime === 'claude-cli'
+            ? undefined
+            : { ...codexSpawnCommand.env, SYMPHONY_ATTEMPT_ID: input.symphonyAttemptId },
         workspaceCwd: workspace.path,
         workerHost: input.worker_host,
         prompt,
@@ -145,7 +157,8 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
           project_identity: input.config.workspace.provisioner.repo_root ?? input.config.workspace.root,
           issue_id: currentIssue.id,
           issue_identifier: currentIssue.identifier,
-          attempt: input.attempt
+          attempt: input.attempt,
+          symphony_attempt_id: input.symphonyAttemptId
         }
       };
       const turnResult: AgentRunResult | undefined =
@@ -214,6 +227,40 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
         };
       }
       lastSessionId = turnResult.session_id;
+
+      if (input.config.review_approval && isSameState(currentIssue.state, 'Agent Review')) {
+        if (!turnResult.review_outcome) {
+          return {
+            reason: 'abnormal',
+            session_id: lastSessionId,
+            error: REASON_CODES.reviewApprovalOutcomeInvalid,
+            retryable: false
+          };
+        }
+        if (!input.reviewOutcomeHandler) {
+          return {
+            reason: 'abnormal',
+            session_id: lastSessionId,
+            error: REASON_CODES.reviewApprovalSupervisorUnavailable,
+            retryable: false
+          };
+        }
+        const approval = await input.reviewOutcomeHandler({
+          issue: currentIssue,
+          outcome: turnResult.review_outcome,
+          workspace,
+          symphonyAttemptId: input.symphonyAttemptId,
+          sessionId: turnResult.session_id
+        });
+        if (!approval.ok) {
+          return {
+            reason: 'abnormal',
+            session_id: lastSessionId,
+            error: approval.reason_code ?? 'review_approval_failed',
+            retryable: false
+          };
+        }
+      }
 
       let refreshedIssues: Issue[];
       try {
@@ -321,10 +368,15 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
       };
     }
     const workspaceConflictError = await renderWorkspaceConflictError(error, workspacePath);
+    const errorMessage = error instanceof Error ? error.message : 'unknown worker error';
     return {
       reason: 'abnormal',
       session_id: null,
-      error: workspaceConflictError ?? (error instanceof Error ? error.message : 'unknown worker error')
+      error: workspaceConflictError
+        ?? (errorMessage.startsWith('review_approval_outcome_')
+          ? REASON_CODES.reviewApprovalOutcomeInvalid
+          : errorMessage),
+      retryable: errorMessage.startsWith('review_approval_outcome_') ? false : undefined
     };
   } finally {
     if (workspacePath) {
@@ -344,6 +396,14 @@ export async function runLocalWorkerRecoveryAttempt(
   let workspacePath: string | null = null;
 
   try {
+    if (input.config.review_approval && isSameState(input.issue.state, 'Agent Review')) {
+      return {
+        reason: 'abnormal',
+        session_id: input.previousSessionId,
+        error: REASON_CODES.reviewApprovalOutcomeInvalid,
+        retryable: false
+      };
+    }
     if (input.config.agent_runtime?.selected === 'claude-cli') {
       return {
         reason: 'abnormal',

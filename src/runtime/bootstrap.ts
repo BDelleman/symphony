@@ -48,6 +48,7 @@ import {
   type WorkflowDefinition
 } from '../workflow';
 import { WorkspaceManager, createWorkspaceProvisioner } from '../workspace';
+import { ReviewApprovalCoordinator } from '../review';
 
 interface RuntimeTimer {
   timeout: NodeJS.Timeout;
@@ -629,6 +630,10 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
     fetch_candidate_issues: async () => tracker.fetch_candidate_issues(),
     fetch_issues_by_states: async (state_names) => tracker.fetch_issues_by_states(state_names),
     fetch_issue_states_by_ids: async (issue_ids) => tracker.fetch_issue_states_by_ids(issue_ids),
+    fetch_issue_comments: async (issue_id) => {
+      if (!tracker.fetch_issue_comments) throw new Error('review_approval_comment_read_unsupported');
+      return tracker.fetch_issue_comments(issue_id);
+    },
     create_comment: async (issue_id, body) => tracker.create_comment(issue_id, body),
     update_issue_state: async (issue_id, state_name) => tracker.update_issue_state(issue_id, state_name)
   };
@@ -1104,6 +1109,19 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
           supportedVersion: agentRuntimeConfig.claude_supported_version
         })
       : new CodexAgentRunner(codexRunner);
+  const reviewApprovalCoordinator = effectiveConfig.review_approval
+    ? new ReviewApprovalCoordinator({
+        tracker: trackerProxy,
+        projectRoot: startupProjectRoot,
+        workspaceRoot: effectiveConfig.workspace.root,
+        managedWorkspaceRoot: effectiveConfig.workspace.root,
+        baseRef: effectiveConfig.workspace.provisioner.base_ref,
+        env: process.env,
+        fetchFn: options.fetchFn,
+        logger,
+        actionLedger: persistenceStore ?? undefined
+      })
+    : null;
   let orchestrator: OrchestratorCore;
   let apiServer: LocalApiServer | null = null;
   let runtimeStarted = false;
@@ -1116,6 +1134,9 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
     logger,
     promptTemplate: workflowDefinition.prompt_template,
     issueStateFetcher: async (issue_ids) => tracker.fetch_issue_states_by_ids(issue_ids),
+    reviewOutcomeHandler: reviewApprovalCoordinator
+      ? (params) => reviewApprovalCoordinator.process(params)
+      : undefined,
     onWorkerExit: async ({ issue_id, reason, error, completion_reason, refreshed_state, worker_instance_id, session_id, retryable }) => {
       await orchestrator.onWorkerExit(issue_id, reason, error, {
         completion_reason,
@@ -1212,6 +1233,9 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
       }
       if (JSON.stringify(nextConfig.agent_runtime) !== JSON.stringify(agentRuntimeConfig)) {
         throw new Error('workflow_restart_required:agent_runtime_changed');
+      }
+      if (JSON.stringify(nextConfig.review_approval) !== JSON.stringify(effectiveConfig.review_approval)) {
+        throw new Error('workflow_restart_required:review_approval_changed');
       }
 
       applyRuntimeConfig(nextConfig, nextPath, nextDefinition);
@@ -1543,6 +1567,8 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
             listRunHistory: (limit) => (persistenceStore ? persistenceStore.listRunHistory(limit) : []),
             listCompletedProviderUsageTotals: (excludeIssueRunIds) =>
               persistenceStore ? persistenceStore.listCompletedProviderUsageTotals(excludeIssueRunIds) : [],
+            listReviewApprovalActions: (issueIdentifier, limit) =>
+              persistenceStore ? persistenceStore.listReviewApprovalActions(issueIdentifier, limit) : [],
             reconstructThreadLineage: (threadId) => (persistenceStore ? persistenceStore.reconstructThreadLineage(threadId) : null),
             reconstructLatestThreadLineageByIssueIdentifier: (issueIdentifier) =>
               persistenceStore ? persistenceStore.reconstructLatestThreadLineageByIssueIdentifier(issueIdentifier) : null,
@@ -1827,6 +1853,18 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
         breaker_entries: breakerEntries,
         operator_actions: operatorActions
       });
+    }
+
+    if (reviewApprovalCoordinator) {
+      const reconciliation = await reviewApprovalCoordinator.reconcilePendingActions();
+      if (reconciliation.recovered > 0 || reconciliation.superseded > 0) {
+        logger.log({
+          level: 'info',
+          event: CANONICAL_EVENT.reviewApproval.routeCompleted,
+          message: 'reconciled durable review approval actions before worker dispatch',
+          context: reconciliation
+        });
+      }
     }
 
     const startupSnapshot = orchestrator.getStateSnapshot();

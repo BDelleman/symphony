@@ -1,4 +1,5 @@
 import type { CodexRunner } from '../codex';
+import { parseReviewOutcome } from '../review';
 import type { AgentRunResult, AgentRunner, AgentRunnerEvent, AgentRunnerStartInput } from './types';
 
 export class CodexAgentRunner implements AgentRunner {
@@ -38,7 +39,8 @@ export class CodexAgentRunner implements AgentRunner {
       cancellation_outcome: result.cancellation_outcome,
       input_required_payload: result.input_required_payload,
       requested_model: result.requested_model,
-      effective_model: result.effective_model
+      effective_model: result.effective_model,
+      review_outcome: parseReviewOutcome(result.last_agent_message)
     };
   }
 }

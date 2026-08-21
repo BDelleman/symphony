@@ -2491,6 +2491,8 @@ export class LocalApiServer {
                   this.diagnosticsSource?.reconstructLatestThreadLineageByIssueIdentifier?.(issueIdentifier) ??
                   null
               });
+              payload.review_approval_actions =
+                this.diagnosticsSource?.listReviewApprovalActions?.(issueIdentifier, 20) ?? [];
               this.enrichLiveTokenFallbackIssue(payload);
               this.logger?.log({
                 level: 'info',
@@ -2522,6 +2524,8 @@ export class LocalApiServer {
                   this.diagnosticsSource?.reconstructLatestThreadLineageByIssueIdentifier?.(issueIdentifier) ??
                   null
               });
+              payload.review_approval_actions =
+                this.diagnosticsSource?.listReviewApprovalActions?.(issueIdentifier, 20) ?? [];
               this.enrichLiveTokenFallbackIssue(payload);
               this.logger?.log({
                 level: 'info',

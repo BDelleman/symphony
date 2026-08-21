@@ -58,6 +58,16 @@ describe('ConfigResolver', () => {
     expect(config.logging.max_files).toBe(5);
     expect(config.validation?.ui_evidence_profile).toBe('baseline');
     expect(config.runtime_update?.github_eligibility.mode).toBe('required');
+    expect(config.review_approval).toBeUndefined();
+  });
+
+  it('resolves the fixed GitHub App review approval contract', () => {
+    const resolver = new ConfigResolver({ env: {}, homedir: () => '/home/tester', tmpdir: () => '/tmp' });
+    const config = resolver.resolve({
+      config: { review_approval: { provider: 'github_app', required: true } },
+      prompt_template: 'prompt'
+    });
+    expect(config.review_approval).toEqual({ provider: 'github_app', required: true });
   });
 
   it('resolves budget controls with defaults for optional policy fields', () => {

@@ -29,6 +29,7 @@ export type ValidationErrorCode =
   | 'invalid_agent_max_concurrent_agents'
   | 'invalid_agent_max_turns'
   | 'invalid_agent_runtime'
+  | 'invalid_review_approval'
   | 'invalid_claude_command'
   | 'invalid_claude_model'
   | 'invalid_claude_network_allowed_domains'
@@ -125,6 +126,11 @@ export interface AgentRuntimeConfig {
   claude_supported_version: '2.1.224';
 }
 
+export interface ReviewApprovalConfig {
+  provider: 'github_app';
+  required: boolean;
+}
+
 export type BudgetHardLimitPolicy = 'block_requires_resume' | 'terminate_attempt';
 
 export interface BudgetConfig {
@@ -219,6 +225,7 @@ export interface EffectiveConfig {
   hooks: HooksConfig;
   agent: AgentConfig;
   agent_runtime?: AgentRuntimeConfig;
+  review_approval?: ReviewApprovalConfig;
   budget?: BudgetConfig;
   codex: CodexConfig;
   persistence: PersistenceConfig;

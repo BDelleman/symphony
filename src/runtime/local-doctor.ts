@@ -62,6 +62,12 @@ import {
   SqlitePersistenceStore
 } from '../persistence';
 import { REASON_CODES } from '../observability';
+import {
+  GitHubAppApprovalBroker,
+  parseGitHubRemote,
+  stripReviewerCredentials,
+  SUPERVISOR_REVIEWER_ENV_NAMES
+} from '../review';
 
 const CLAUDE_NON_SUBSCRIPTION_ENV_NAMES = [
   'ANTHROPIC_API_KEY',
@@ -2104,7 +2110,23 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
         repairable += 1;
       }
     }
-    return { databaseExists: true, active: rows.length, repairable, ambiguous, error: null };
+    const staleRunProjectionCount = Number((db!.prepare(
+      `SELECT COUNT(*) AS count
+       FROM runs
+       JOIN history_identity_projection ON history_identity_projection.source_table = 'runs'
+         AND history_identity_projection.source_id = runs.run_id
+       JOIN issue_run ON issue_run.issue_run_id = history_identity_projection.issue_run_id
+       WHERE runs.ended_at IS NULL
+         AND issue_run.ended_at IS NOT NULL
+         AND issue_run.status <> 'running'`
+    ).get() as { count: number }).count);
+    return {
+      databaseExists: true,
+      active: rows.length + staleRunProjectionCount,
+      repairable: repairable + staleRunProjectionCount,
+      ambiguous,
+      error: null
+    };
   } catch (error) {
     return {
       databaseExists: true,
@@ -2226,6 +2248,79 @@ function addCodexCommandCheck(checks: DoctorFinding[], effectiveConfig: Effectiv
     remediation: executablePath ? undefined : 'Install Codex or set codex.command to an executable command before starting agents.',
     details: { command, executablePath }
   });
+}
+
+async function addReviewApprovalCheck(
+  checks: DoctorFinding[],
+  effectiveConfig: EffectiveConfig,
+  env: NodeJS.ProcessEnv,
+  projectRoot: string
+): Promise<void> {
+  if (!effectiveConfig.review_approval) return;
+  let repository: string | null = null;
+  try {
+    const remote = spawnSync('git', ['remote', 'get-url', 'origin'], {
+      cwd: projectRoot,
+      env: { PATH: env.PATH },
+      encoding: 'utf8',
+      shell: false,
+      timeout: 10_000,
+      maxBuffer: 64 * 1024
+    });
+    repository = remote.status === 0 ? parseGitHubRemote(remote.stdout.trim()) : null;
+    if (!repository) throw new Error('review_approval_repository_invalid');
+    const appId = env.SYMPHONY_REVIEWER_APP_ID?.trim();
+    const installationId = env.SYMPHONY_REVIEWER_INSTALLATION_ID?.trim();
+    if (!appId || !installationId) throw new Error('review_approval_credentials_missing');
+    const broker = new GitHubAppApprovalBroker({
+      appId,
+      installationId,
+      privateKeyPath: env.SYMPHONY_REVIEWER_PRIVATE_KEY_PATH,
+      privateKey: env.SYMPHONY_REVIEWER_PRIVATE_KEY,
+      projectRoot,
+      workspaceRoot: effectiveConfig.workspace.root,
+      managedWorkspaceRoot: effectiveConfig.workspace.root,
+      operatorToken: env.GH_TOKEN ?? env.GITHUB_TOKEN
+    });
+    const probe = await broker.probe(repository);
+    const childEnvironment = stripReviewerCredentials(env);
+    const leakedNames = SUPERVISOR_REVIEWER_ENV_NAMES.filter((name) => childEnvironment[name] !== undefined);
+    if (leakedNames.length > 0) throw new Error('review_approval_worker_environment_leak');
+    addCheck(checks, {
+      id: 'review_approval.github_app',
+      title: 'Supervisor GitHub App review approval is ready',
+      status: probe.inline_key ? 'warning' : 'ok',
+      reason: probe.inline_key ? 'review_approval_inline_key_deprecated' : 'review_approval_ready',
+      summary: probe.inline_key
+        ? `Reviewer App ${probe.identity.slug} is ready for ${repository}, but inline private-key configuration is deprecated.`
+        : `Reviewer App ${probe.identity.slug} is ready for ${repository} and isolated from worker environments.`,
+      remediation: probe.inline_key
+        ? 'Move the reviewer private key to a mode-0600 file outside the project and managed workspace roots.'
+        : undefined,
+      details: {
+        repository,
+        appSlug: probe.identity.slug,
+        appLogin: probe.identity.login,
+        operatorLogin: probe.operator_login,
+        installationId: probe.identity.installation_id,
+        keyConfiguration: probe.inline_key ? 'inline_deprecated' : 'path',
+        keyPath: probe.key_path,
+        permissions: probe.permissions,
+        reviewerVariablesExcludedFromWorkers: true
+      }
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message.split(':', 1)[0] : REASON_CODES.reviewApprovalCredentialsInvalid;
+    addCheck(checks, {
+      id: 'review_approval.github_app',
+      title: 'Supervisor GitHub App review approval is ready',
+      status: 'failure',
+      reason,
+      summary: 'The supervisor reviewer App configuration or repository capability failed validation.',
+      remediation: 'Fix the reviewer App ID, installation, mode-0600 key path, repository access, and operator identity, then rerun doctor.',
+      details: { repository, reviewerVariablesExcludedFromWorkers: true }
+    });
+  }
 }
 
 function inspectClaudeUserSettings(
@@ -2568,7 +2663,10 @@ function addClaudeRuntimeChecks(
       workspace: projectRoot,
       projectRoot,
       projectSensitivePaths: sensitiveAudit.violations.map((violation) => violation.absolutePath),
-      home: env.HOME?.trim() || os.homedir()
+      home: env.HOME?.trim() || os.homedir(),
+      additionalProtectedPaths: env.SYMPHONY_REVIEWER_PRIVATE_KEY_PATH
+        ? [env.SYMPHONY_REVIEWER_PRIVATE_KEY_PATH]
+        : []
     }));
     sandboxPolicyCounts = {
       existing: snapshot.protectedPaths.length,
@@ -3502,6 +3600,12 @@ export async function runLocalDoctor(options: RunLocalDoctorOptions): Promise<{
         } else {
           addCodexCommandCheck(checks, workflowValidation.effectiveConfig, dashboardEnv);
         }
+        await addReviewApprovalCheck(
+          checks,
+          workflowValidation.effectiveConfig,
+          dashboardEnv,
+          resolved.currentProjectRoot
+        );
         addWorkspaceChecks(checks, resolved, workflowValidation.effectiveConfig);
         addManagedWorkspaceSensitiveFileCheck({
           checks,

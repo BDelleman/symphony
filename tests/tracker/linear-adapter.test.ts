@@ -283,6 +283,23 @@ describe('LinearTrackerAdapter', () => {
     expect(requests[0].variables).toEqual({ issueIds: ['i-refresh'] });
   });
 
+  it('reads every Linear comment page for receipt validation', async () => {
+    const requests: FakeRequest[] = [];
+    const adapter = createAdapterWithQueuedResponses([
+      new Response(JSON.stringify({ data: { issue: { comments: {
+        nodes: [{ id: 'c1', body: 'one', createdAt: null, updatedAt: null }],
+        pageInfo: { hasNextPage: true, endCursor: 'next' }
+      } } } }), { status: 200 }),
+      new Response(JSON.stringify({ data: { issue: { comments: {
+        nodes: [{ id: 'c2', body: 'two', createdAt: null, updatedAt: null }],
+        pageInfo: { hasNextPage: false, endCursor: null }
+      } } } }), { status: 200 })
+    ], requests);
+
+    expect((await adapter.fetch_issue_comments('issue-1')).map((comment) => comment.id)).toEqual(['c1', 'c2']);
+    expect(requests.map((request) => request.variables.after)).toEqual([null, 'next']);
+  });
+
   it('retries transient state-refresh request/status failures only', async () => {
     const requestRetryRequests: FakeRequest[] = [];
     const requestRetryAdapter = createAdapterWithQueuedResponses(
@@ -499,6 +516,7 @@ describe('LinearTrackerAdapter', () => {
     await adapter.fetch_candidate_issues();
 
     expect(requests[0].query).toContain('query IssuesByAssignee');
+    expect(requests[0].query).toContain('$assigneeId: ID!');
     expect(requests[0].variables).toMatchObject({
       assigneeId: 'user-123'
     });

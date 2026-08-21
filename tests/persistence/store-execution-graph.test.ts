@@ -241,6 +241,54 @@ describe('SqlitePersistenceStore execution graph', () => {
       status: 'failed',
       reason_code: 'recovered_after_restart'
     });
+    expect(store.listRunHistory().find((run) => run.run_id === started.run_id)).toMatchObject({
+      ended_at: '2026-04-11T10:05:00.000Z',
+      terminal_status: 'failed',
+      terminal_reason_code: 'worker_crashed'
+    });
+    expect(store.reconstructTicketTimeline(durableIdentity).terminal_outcomes).toEqual([
+      expect.objectContaining({ outcome: 'failed', reason_code: 'recovered_after_restart' })
+    ]);
+  });
+
+  it('repairs an open legacy run whose normalized execution graph is already terminal', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-run-projection-reconcile-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'runtime.sqlite');
+    const durableIdentity = identity({ issue_id: 'i-run-projection', issue_identifier: 'ABC-RUN-PROJECTION' });
+    const store = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    stores.push(store);
+    const started = store.recordRunStarted({
+      issue_id: 'i-run-projection',
+      issue_identifier: 'ABC-RUN-PROJECTION',
+      identity: durableIdentity,
+      started_at: '2026-04-11T10:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    const db = openDatabase(dbPath);
+    try {
+      db.prepare(
+        `UPDATE attempt SET ended_at = ?, status = ?, process_status = ?, workflow_outcome = ? WHERE attempt_id = ?`
+      ).run('2026-04-11T10:05:00.000Z', 'failed', 'failed', 'failed', started.attempt_id);
+      db.prepare(
+        `UPDATE issue_run SET ended_at = ?, status = ?, process_status = ?, workflow_outcome = ? WHERE issue_run_id = ?`
+      ).run('2026-04-11T10:05:00.000Z', 'failed', 'failed', 'failed', started.issue_run_id);
+    } finally {
+      db.close();
+    }
+
+    expect(store.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 1, ambiguous: 0 });
+    expect(store.listRunHistory().find((run) => run.run_id === started.run_id)).toMatchObject({
+      ended_at: '2026-04-11T10:05:00.000Z',
+      terminal_status: 'failed',
+      workflow_outcome: 'failed',
+      terminal_reason_code: 'recovered_after_restart'
+    });
+    expect(store.reconstructTicketTimeline(durableIdentity).terminal_outcomes).toEqual([
+      expect.objectContaining({ outcome: 'failed', reason_code: 'recovered_after_restart' })
+    ]);
+    expect(store.reconcileExecutionGraphAfterRestart()).toEqual({ recovered: 0, ambiguous: 0 });
   });
 
   it('repairs a pre-init failure from its terminal runner event', async () => {
