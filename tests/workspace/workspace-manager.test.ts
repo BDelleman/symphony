@@ -188,6 +188,69 @@ describe('WorkspaceManager', () => {
     expect(await exists(path.join(workspace.path, '.elixir_ls'))).toBe(false);
   });
 
+  it('removes a virtualenv whose interpreter symlink escapes the workspace', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const preflightResults: Array<{ status: string; cleaned_files: Array<{ path: string; action: string }> }> = [];
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { timeout_ms: 1000 },
+      onPreflightResult: (result) => preflightResults.push(result)
+    });
+    const workspace = await manager.ensureWorkspace('ABC-VENV-ESCAPE');
+    const venvBin = path.join(workspace.path, '.venv', 'bin');
+    await fs.mkdir(venvBin, { recursive: true });
+    await fs.writeFile(path.join(workspace.path, '.venv', 'pyvenv.cfg'), 'home = /outside\n', 'utf8');
+    await fs.symlink(process.execPath, path.join(venvBin, 'python'));
+
+    await manager.prepareAttempt(workspace.path);
+
+    expect(await exists(path.join(workspace.path, '.venv'))).toBe(false);
+    expect(preflightResults).toContainEqual(
+      expect.objectContaining({
+        status: 'cleaned',
+        cleaned_files: [{ path: '.venv', action: 'remove' }]
+      })
+    );
+  });
+
+  it('removes a virtualenv whose interpreter symlink dangles', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { timeout_ms: 1000 }
+    });
+    const workspace = await manager.ensureWorkspace('ABC-VENV-DANGLING');
+    const venvBin = path.join(workspace.path, 'services', 'api', '.venv', 'bin');
+    await fs.mkdir(venvBin, { recursive: true });
+    await fs.writeFile(path.join(workspace.path, 'services', 'api', '.venv', 'pyvenv.cfg'), 'home = /gone\n', 'utf8');
+    await fs.symlink(path.join(root, 'session-tmp-removed', 'python3.14'), path.join(venvBin, 'python'));
+
+    await manager.prepareAttempt(workspace.path);
+
+    expect(await exists(path.join(workspace.path, 'services', 'api', '.venv'))).toBe(false);
+  });
+
+  it('keeps a virtualenv whose interpreter stays inside the workspace', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { timeout_ms: 1000 }
+    });
+    const workspace = await manager.ensureWorkspace('ABC-VENV-INTERNAL');
+    const venvBin = path.join(workspace.path, '.venv', 'bin');
+    await fs.mkdir(venvBin, { recursive: true });
+    await fs.writeFile(path.join(workspace.path, '.venv', 'pyvenv.cfg'), 'home = .\n', 'utf8');
+    await fs.writeFile(path.join(workspace.path, 'interpreter'), '#!/bin/true\n', 'utf8');
+    await fs.symlink(path.join('..', '..', 'interpreter'), path.join(venvBin, 'python'));
+
+    await manager.prepareAttempt(workspace.path);
+
+    expect(await exists(path.join(workspace.path, '.venv', 'bin', 'python'))).toBe(true);
+  });
+
   it('fails closed before hooks when a managed workspace contains credential material', async () => {
     const root = await makeTempRoot();
     cleanupPaths.push(root);
