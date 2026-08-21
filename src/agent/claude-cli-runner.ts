@@ -1905,6 +1905,58 @@ export class ClaudeCliRunner implements AgentRunner {
         }
 
         if (type === 'system' && subtype === 'init') {
+          if (!sessionId) {
+            failProtocol('claude_init_session_missing');
+            return;
+          }
+          const activeServers = activeMcpServers(payload);
+          const effectiveModel = readString(payload, 'model');
+          if (!effectiveModel) {
+            failProtocol('claude_init_model_missing');
+            return;
+          }
+          const instructionFingerprint = hashInitSurface(payload, [
+            'claude_md',
+            'instructions',
+            'instruction_sources',
+            'commands',
+            'slash_commands'
+          ]);
+          const skillFingerprint = hashInitSurface(payload, ['skills', 'agents', 'plugins']);
+          const capabilityFingerprint = stableConfigurationHash([
+            buildCapabilityFingerprint(payload, activeServers),
+            instructionFingerprint,
+            skillFingerprint
+          ]);
+          const unexpectedServers = [...activeServers].filter((name) => !allowedMcpServers.has(name));
+          const missingServers = [...requiredMcpServers].filter((name) => !activeServers.has(name));
+          if (unexpectedServers.length > 0) {
+            failProtocol(`claude_unapproved_mcp_exposed:${unexpectedServers.sort().join(',')}`);
+            return;
+          }
+          if (missingServers.length > 0) {
+            failProtocol(`claude_required_mcp_missing:${missingServers.sort().join(',')}`);
+            return;
+          }
+          if (state.initCount > state.terminalResultCount) {
+            if (
+              state.initSessionId !== sessionId ||
+              state.effectiveModel !== effectiveModel ||
+              state.capabilityFingerprint !== capabilityFingerprint
+            ) {
+              failProtocol('claude_duplicate_init_mismatch');
+              return;
+            }
+            emit({
+              event: CANONICAL_EVENT.agentRunner.activity,
+              session_id: state.sessionId ?? undefined,
+              thread_id: state.sessionId ? `claude:${state.sessionId}` : undefined,
+              turn_id: turnId,
+              detail: 'claude_duplicate_init_ignored',
+              process_liveness_only: true
+            });
+            return;
+          }
           state.initCount += 1;
           const isContinuationInit = state.initCount > 1;
           const previousRoundFingerprint = state.capabilityFingerprint;
@@ -1916,31 +1968,12 @@ export class ClaudeCliRunner implements AgentRunner {
             state.continuationCount += 1;
             state.terminalResult = null;
           }
-          if (!sessionId) {
-            failProtocol('claude_init_session_missing');
-            return;
-          }
           state.initSessionId = sessionId;
-          const activeServers = activeMcpServers(payload);
-          state.effectiveModel = readString(payload, 'model');
-          if (!state.effectiveModel) {
-            failProtocol('claude_init_model_missing');
-            return;
-          }
+          state.effectiveModel = effectiveModel;
           observedModels.add(state.effectiveModel);
-          state.instructionFingerprint = hashInitSurface(payload, [
-            'claude_md',
-            'instructions',
-            'instruction_sources',
-            'commands',
-            'slash_commands'
-          ]);
-          state.skillFingerprint = hashInitSurface(payload, ['skills', 'agents', 'plugins']);
-          state.capabilityFingerprint = stableConfigurationHash([
-            buildCapabilityFingerprint(payload, activeServers),
-            state.instructionFingerprint,
-            state.skillFingerprint
-          ]);
+          state.instructionFingerprint = instructionFingerprint;
+          state.skillFingerprint = skillFingerprint;
+          state.capabilityFingerprint = capabilityFingerprint;
           if (isContinuationInit && previousRoundFingerprint && previousRoundFingerprint !== state.capabilityFingerprint) {
             failProtocol('claude_capability_fingerprint_drift');
             return;
@@ -1957,16 +1990,6 @@ export class ClaudeCliRunner implements AgentRunner {
               failProtocol('claude_session_collision');
               return;
             }
-          }
-          const unexpectedServers = [...activeServers].filter((name) => !allowedMcpServers.has(name));
-          const missingServers = [...requiredMcpServers].filter((name) => !activeServers.has(name));
-          if (unexpectedServers.length > 0) {
-            failProtocol(`claude_unapproved_mcp_exposed:${unexpectedServers.sort().join(',')}`);
-            return;
-          }
-          if (missingServers.length > 0) {
-            failProtocol(`claude_required_mcp_missing:${missingServers.sort().join(',')}`);
-            return;
           }
           if (isContinuationInit) {
             emit({

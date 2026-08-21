@@ -141,6 +141,10 @@ process.stdin.on('end', () => {
   }
   if (process.env.MOCK_MODE === 'crash-before-init') { process.exit(2); return; }
   if (process.env.MOCK_MODE !== 'no-init') process.stdout.write(JSON.stringify(init) + '\\n');
+  if (process.env.MOCK_DUPLICATE_INIT_BEFORE_RESULT === '1') process.stdout.write(JSON.stringify(init) + '\\n');
+  if (process.env.MOCK_DUPLICATE_INIT_MISMATCH === '1') {
+    process.stdout.write(JSON.stringify(Object.assign({}, init, { model: 'claude-opus-4-6' })) + '\\n');
+  }
   if (process.env.MOCK_MODE === 'escaped-process') {
     const { spawn } = require('node:child_process');
     const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
@@ -428,6 +432,37 @@ describe('ClaudeCliRunner', () => {
     }).startSessionAndRunTurn(startInput(fixture.root));
 
     expect(result).toMatchObject({ status: 'failed', error_code: 'claude_terminal_result_count:2', retryable: false });
+  });
+
+  it('deduplicates an identical repeated init before the terminal result', async () => {
+    const fixture = createFixture();
+    const events: AgentRunnerEvent[] = [];
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_DUPLICATE_INIT_BEFORE_RESULT: '1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn({ ...startInput(fixture.root), onEvent: (event) => events.push(event) });
+
+    expect(result.status).toBe('completed');
+    expect(events.filter((event) => event.event === 'agent_runner.session.started')).toHaveLength(1);
+    expect(events.some((event) => event.detail === 'claude_duplicate_init_ignored')).toBe(true);
+  });
+
+  it('fails closed when a repeated init changes the capability surface', async () => {
+    const fixture = createFixture();
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_DUPLICATE_INIT_MISMATCH: '1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result).toMatchObject({ status: 'failed', error_code: 'claude_duplicate_init_mismatch', retryable: false });
   });
 
   it('accepts an init-delimited continuation turn and treats the last result as authoritative', async () => {
