@@ -323,6 +323,7 @@ describe('ClaudeCliRunner', () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-project-'));
     const unrelatedCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-unrelated-'));
     const workspace = path.join(projectRoot, '.symphony', 'system', 'workspaces', 'ABC-1');
+    fs.mkdirSync(path.join(path.dirname(projectRoot), '.symphony-quarantine'), { recursive: true });
     fs.mkdirSync(workspace, { recursive: true });
     fs.writeFileSync(path.join(projectRoot, '.env.local'), 'SECRET=not-for-agent\n');
     fs.writeFileSync(path.join(projectRoot, '.npmrc'), 'token=not-for-agent\n');
@@ -1143,7 +1144,9 @@ describe('ClaudeCliRunner', () => {
       projectRoot: gitFixture.root,
       model: 'claude-sonnet-4-6',
       allowNonSubscriptionAuth: false,
-      env: fixtureEnv(gitFixture, { PATH: `${gitFixture.root}:${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin` }),
+      env: fixtureEnv(gitFixture, {
+        PATH: `${gitFixture.root}:${gitFixture.sandboxBinDir}:${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`
+      }),
       homedir: () => gitFixture.root
     }).startSessionAndRunTurn(startInput(gitFixture.root));
     expect(gitResult.status).toBe('completed');
