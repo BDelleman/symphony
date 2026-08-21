@@ -374,9 +374,10 @@ describe('OrchestratorCore dispatch and backpressure', () => {
     expect(snapshot.retry_attempts.has('i-claim')).toBe(false);
   });
 
-  it('releases the dispatch claim after a non-retryable worker failure so the issue can dispatch again', async () => {
+  it('suppresses non-retryable failure redispatch until an operator explicitly resumes it', async () => {
     const harness = createHarness();
-    harness.tracker.fetch_candidate_issues.mockResolvedValue([makeIssue({ id: 'i-nonretryable', identifier: 'ABC-NONRETRY' })]);
+    const issue = makeIssue({ id: 'i-nonretryable', identifier: 'ABC-NONRETRY' });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([issue]);
     await harness.orchestrator.tick('interval');
     expect(harness.orchestrator.getStateSnapshot().claimed.has('i-nonretryable')).toBe(true);
 
@@ -386,14 +387,23 @@ describe('OrchestratorCore dispatch and backpressure', () => {
 
     const snapshot = harness.orchestrator.getStateSnapshot();
     expect(snapshot.running.has('i-nonretryable')).toBe(false);
-    expect(snapshot.claimed.has('i-nonretryable')).toBe(false);
+    expect(snapshot.claimed.has('i-nonretryable')).toBe(true);
     expect(snapshot.retry_attempts.has('i-nonretryable')).toBe(false);
+    expect(snapshot.blocked_inputs.get('i-nonretryable')).toMatchObject({
+      stop_reason_code: REASON_CODES.workerExitAbnormal,
+      stop_reason_detail: 'claude_terminal_result_count:2',
+      requires_manual_resume: true
+    });
+    expect(snapshot.circuit_breakers.get('i-nonretryable')?.breaker_active).toBe(true);
 
-    harness.tracker.fetch_candidate_issues.mockResolvedValue([
-      makeIssue({ id: 'i-nonretryable', identifier: 'ABC-NONRETRY' })
-    ]);
+    harness.tracker.fetch_issue_states_by_ids.mockResolvedValue([issue]);
     await harness.orchestrator.tick('interval');
+    expect(harness.spawned.filter((entry) => entry.issue_id === 'i-nonretryable')).toHaveLength(1);
 
+    await expect(harness.orchestrator.resumeBlockedIssue('ABC-NONRETRY', null, null, {
+      actor: 'operator@example.test',
+      reason_note: 'runtime configuration corrected'
+    })).resolves.toEqual({ ok: true, issue_id: 'i-nonretryable' });
     expect(harness.spawned.filter((entry) => entry.issue_id === 'i-nonretryable')).toHaveLength(2);
   });
 
