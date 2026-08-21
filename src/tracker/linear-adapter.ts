@@ -303,7 +303,7 @@ query Issues($projectSlug: String!, $stateNames: [String!], $after: String, $fir
 
 export function buildIssuesByAssigneeQuery(): string {
   return `
-query IssuesByAssignee($projectSlug: String!, $stateNames: [String!], $assigneeId: String!, $after: String, $first: Int!) {
+query IssuesByAssignee($projectSlug: String!, $stateNames: [String!], $assigneeId: ID!, $after: String, $first: Int!) {
   issues(
     filter: {
       project: { slugId: { eq: $projectSlug } }

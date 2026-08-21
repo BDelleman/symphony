@@ -516,6 +516,7 @@ describe('LinearTrackerAdapter', () => {
     await adapter.fetch_candidate_issues();
 
     expect(requests[0].query).toContain('query IssuesByAssignee');
+    expect(requests[0].query).toContain('$assigneeId: ID!');
     expect(requests[0].variables).toMatchObject({
       assigneeId: 'user-123'
     });
