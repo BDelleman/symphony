@@ -180,13 +180,19 @@ process.stdin.on('end', () => {
   if (process.env.MOCK_MODE === 'empty-usage') { result.usage = {}; delete result.total_cost_usd; }
   if (process.env.MOCK_PERMISSION_DENIAL === '1') result.permission_denials = [{ tool_name: 'Bash' }];
   if (process.env.MOCK_MODE === 'mismatched-session') result.session_id = '223e4567-e89b-42d3-a456-426614174000';
+  if (process.env.MOCK_FIRST_RESULT_ERROR === '1') { result.subtype = 'error_during_execution'; result.is_error = true; }
   process.stdout.write(JSON.stringify(result) + '\\n');
   if (process.env.MOCK_AUXILIARY_RESULT === '1') process.stdout.write(JSON.stringify({ type: 'result', subtype: 'prompt_suggestion', session_id: '${SESSION_ID}' }) + '\\n');
   if (process.env.MOCK_DUPLICATE_RESULT === '1') process.stdout.write(JSON.stringify(result) + '\\n');
   if (process.env.MOCK_CONTINUATION_TURN === '1') {
     process.stdout.write(JSON.stringify(init) + '\\n');
-    process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-continuation', model, usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [] } }) + '\\n');
-    process.stdout.write(JSON.stringify(Object.assign({}, result, { result: 'continued-done' })) + '\\n');
+    if (process.env.MOCK_CONTINUATION_NO_RESULT !== '1') {
+      process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-continuation', model, usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [] } }) + '\\n');
+      process.stdout.write(JSON.stringify(Object.assign({}, result, {
+        subtype: 'success', is_error: false, result: 'continued-done', num_turns: 2, total_cost_usd: 0.004,
+        usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 1, cache_creation_input_tokens: 2 }
+      })) + '\\n');
+    }
   }
   if (process.env.MOCK_MODE === 'nonzero') process.exitCode = 2;
 });
@@ -436,11 +442,54 @@ describe('ClaudeCliRunner', () => {
       homedir: () => fixture.root
     }).startSessionAndRunTurn({ ...startInput(fixture.root), onEvent: (event) => events.push(event) });
 
-    expect(result).toMatchObject({ status: 'completed', last_agent_message: 'continued-done' });
+    expect(result).toMatchObject({
+      status: 'completed',
+      last_agent_message: 'continued-done',
+      provider_usage: {
+        input_tokens: 17,
+        output_tokens: 7,
+        cache_read_tokens: 3,
+        cache_creation_tokens: 3,
+        provider_turn_count: 5
+      }
+    });
+    expect(result.provider_usage?.estimated_cost_usd).toBeCloseTo(0.0163);
     expect(
       events.some((event) => typeof event.detail === 'string' && event.detail.startsWith('claude_continuation_turn:'))
     ).toBe(true);
     expect(events.filter((event) => event.event === 'agent_runner.session.started')).toHaveLength(1);
+  });
+
+  it('fails closed when a continuation init has no matching result', async () => {
+    const fixture = createFixture();
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_CONTINUATION_TURN: '1', MOCK_CONTINUATION_NO_RESULT: '1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result).toMatchObject({ status: 'failed', error_code: 'claude_terminal_result_count:1', retryable: false });
+  });
+
+  it('does not let a later successful continuation mask an earlier failed result', async () => {
+    const fixture = createFixture();
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_FIRST_RESULT_ERROR: '1', MOCK_CONTINUATION_TURN: '1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error_code: 'claude_terminal_error_during_execution',
+      provider_usage: { input_tokens: 17, output_tokens: 7, provider_turn_count: 5 }
+    });
   });
 
   it('fails closed and counts a system permission_denied event', async () => {
