@@ -60,6 +60,8 @@ Start here for a practical end-to-end workflow:
 	`docs/playbooks/integrate-your-application.md`
 5. Monitoring and recovery runbook:
 	`docs/playbooks/operations-runbook.md`
+6. Personal workflow overrides without editing the committed `WORKFLOW.md`:
+	`docs/playbooks/local-workflow-override.md`
 
 Workflow preset examples for prompt and tracker configuration:
 

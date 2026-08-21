@@ -725,9 +725,10 @@ export async function coordinateWorkerExit(
       }
 
       if (details.retryable === false) {
+        const stopReasonDetail = error ?? `worker exited: ${reason}`;
         context.hooks.emitPhaseMarker(issue_id, {
           phase: 'failed',
-          detail: error ?? `worker exited: ${reason}`,
+          detail: stopReasonDetail,
           attempt: running.retry_attempt,
           thread_id: running.thread_id,
           session_id: running.session_id
@@ -737,8 +738,35 @@ export async function coordinateWorkerExit(
           'failed',
           'failed',
           stopReasonCode,
-          error ?? `worker exited: ${reason}`
+          stopReasonDetail
         );
+        await context.hooks.scheduleBlockedInput({
+          issue_id,
+          issue_identifier: running.identifier,
+          attempt: running.retry_attempt + 1,
+          issue_run_id: running.issue_run_id ?? null,
+          previous_attempt_id: running.attempt_id ?? null,
+          worker_host: running.worker_host ?? null,
+          workspace_path: running.workspace_path ?? null,
+          provisioner_type: running.provisioner_type ?? null,
+          branch_name: running.branch_name ?? null,
+          repo_root: running.repo_root ?? null,
+          workspace_exists: running.workspace_exists,
+          workspace_git_status: running.workspace_git_status,
+          workspace_provisioned: running.workspace_provisioned,
+          workspace_is_git_worktree: running.workspace_is_git_worktree,
+          copy_ignored_applied: running.copy_ignored_applied,
+          copy_ignored_status: running.copy_ignored_status,
+          copy_ignored_summary: running.copy_ignored_summary,
+          stop_reason_code: stopReasonCode,
+          stop_reason_detail: stopReasonDetail,
+          session_console: running.recent_events,
+          previous_thread_id: running.thread_id,
+          previous_turn_id: running.turn_id,
+          previous_session_id: running.session_id,
+          required_actions: ['Correct the non-retryable failure', 'Resume the issue explicitly'],
+          apply_circuit_breaker: true
+        });
         context.logger?.log({
           level: 'error',
           event: CANONICAL_EVENT.orchestration.workerExitHandled,

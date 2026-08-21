@@ -5,7 +5,8 @@ import { spawnSync } from 'node:child_process';
 
 import { describe, expect, it } from 'vitest';
 
-import { ClaudeCliRunner, isClaudeSandboxShellLauncher, type AgentRunnerEvent } from '../../src/agent';
+import { ClaudeCliRunner, type AgentRunnerEvent } from '../../src/agent';
+import { isClaudeSandboxShellLauncher } from '../../src/agent/claude-cli-runner';
 
 const SESSION_ID = '123e4567-e89b-42d3-a456-426614174000';
 const NON_SUBSCRIPTION_SELECTORS = [
@@ -27,8 +28,10 @@ function createFixture(): {
   settingsFile: string;
   mcpFile: string;
   envFile: string;
+  sandboxBinDir: string;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-runner-'));
+  const sandboxBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-sandbox-bin-'));
   const command = path.join(root, 'claude');
   const argsFile = path.join(root, 'args.json');
   const promptFile = path.join(root, 'prompt.txt');
@@ -177,13 +180,19 @@ process.stdin.on('end', () => {
   if (process.env.MOCK_MODE === 'empty-usage') { result.usage = {}; delete result.total_cost_usd; }
   if (process.env.MOCK_PERMISSION_DENIAL === '1') result.permission_denials = [{ tool_name: 'Bash' }];
   if (process.env.MOCK_MODE === 'mismatched-session') result.session_id = '223e4567-e89b-42d3-a456-426614174000';
+  if (process.env.MOCK_FIRST_RESULT_ERROR === '1') { result.subtype = 'error_during_execution'; result.is_error = true; }
   process.stdout.write(JSON.stringify(result) + '\\n');
   if (process.env.MOCK_AUXILIARY_RESULT === '1') process.stdout.write(JSON.stringify({ type: 'result', subtype: 'prompt_suggestion', session_id: '${SESSION_ID}' }) + '\\n');
   if (process.env.MOCK_DUPLICATE_RESULT === '1') process.stdout.write(JSON.stringify(result) + '\\n');
   if (process.env.MOCK_CONTINUATION_TURN === '1') {
     process.stdout.write(JSON.stringify(init) + '\\n');
-    process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-continuation', model, usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [] } }) + '\\n');
-    process.stdout.write(JSON.stringify(Object.assign({}, result, { result: 'continued-done' })) + '\\n');
+    if (process.env.MOCK_CONTINUATION_NO_RESULT !== '1') {
+      process.stdout.write(JSON.stringify({ type: 'assistant', session_id: '${SESSION_ID}', message: { id: 'msg-continuation', model, usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [] } }) + '\\n');
+      process.stdout.write(JSON.stringify(Object.assign({}, result, {
+        subtype: 'success', is_error: false, result: 'continued-done', num_turns: 2, total_cost_usd: 0.004,
+        usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 1, cache_creation_input_tokens: 2 }
+      })) + '\\n');
+    }
   }
   if (process.env.MOCK_MODE === 'nonzero') process.exitCode = 2;
 });
@@ -205,14 +214,20 @@ process.exit(1);
 `,
     { mode: 0o755 }
   );
-  return { root, command, argsFile, promptFile, settingsFile, mcpFile, envFile };
+  fs.writeFileSync(
+    path.join(sandboxBinDir, 'bwrap'),
+    '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "bubblewrap test"; fi\nexit 0\n',
+    { mode: 0o755 }
+  );
+  fs.writeFileSync(path.join(sandboxBinDir, 'socat'), '#!/bin/sh\necho "socat test"\nexit 0\n', { mode: 0o755 });
+  return { root, command, argsFile, promptFile, settingsFile, mcpFile, envFile, sandboxBinDir };
 }
 
 function fixtureEnv(fixture: ReturnType<typeof createFixture>, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     ...Object.fromEntries(NON_SUBSCRIPTION_SELECTORS.map((name) => [name, undefined])),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: undefined,
-    PATH: process.env.PATH,
+    PATH: `${fixture.sandboxBinDir}${path.delimiter}${process.env.PATH ?? ''}`,
     MOCK_ARGS_FILE: fixture.argsFile,
     MOCK_PROMPT_FILE: fixture.promptFile,
     MOCK_SETTINGS_FILE: fixture.settingsFile,
@@ -319,6 +334,7 @@ describe('ClaudeCliRunner', () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-project-'));
     const unrelatedCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-unrelated-'));
     const workspace = path.join(projectRoot, '.symphony', 'system', 'workspaces', 'ABC-1');
+    fs.mkdirSync(path.join(path.dirname(projectRoot), '.symphony-quarantine'), { recursive: true });
     fs.mkdirSync(workspace, { recursive: true });
     fs.writeFileSync(path.join(projectRoot, '.env.local'), 'SECRET=not-for-agent\n');
     fs.writeFileSync(path.join(projectRoot, '.npmrc'), 'token=not-for-agent\n');
@@ -426,11 +442,56 @@ describe('ClaudeCliRunner', () => {
       homedir: () => fixture.root
     }).startSessionAndRunTurn({ ...startInput(fixture.root), onEvent: (event) => events.push(event) });
 
-    expect(result).toMatchObject({ status: 'completed', last_agent_message: 'continued-done' });
+    expect(result).toMatchObject({
+      status: 'completed',
+      last_agent_message: 'continued-done',
+      provider_usage: {
+        input_tokens: 17,
+        output_tokens: 7,
+        cache_read_tokens: 3,
+        cache_creation_tokens: 3,
+        provider_turn_count: 5
+      }
+    });
+    expect(result.provider_usage?.estimated_cost_usd).toBeCloseTo(0.0163);
     expect(
       events.some((event) => typeof event.detail === 'string' && event.detail.startsWith('claude_continuation_turn:'))
     ).toBe(true);
     expect(events.filter((event) => event.event === 'agent_runner.session.started')).toHaveLength(1);
+  });
+
+  it('fails closed when a continuation init has no matching result', async () => {
+    const fixture = createFixture();
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_CONTINUATION_TURN: '1', MOCK_CONTINUATION_NO_RESULT: '1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result).toMatchObject({ status: 'failed', error_code: 'claude_terminal_result_count:1', retryable: false });
+  });
+
+  it('does not let a later successful continuation mask an earlier failed result', async () => {
+    const fixture = createFixture();
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_FIRST_RESULT_ERROR: '1', MOCK_CONTINUATION_TURN: '1' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn(startInput(fixture.root));
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error_code: 'claude_terminal_error_during_execution'
+    });
+    expect(result.provider_usage?.input_tokens).toBeGreaterThanOrEqual(10);
+    expect(result.provider_usage?.output_tokens).toBeGreaterThanOrEqual(4);
+    expect(result.provider_usage?.provider_turn_count).toBeGreaterThanOrEqual(3);
   });
 
   it('fails closed and counts a system permission_denied event', async () => {
@@ -1158,7 +1219,9 @@ describe('ClaudeCliRunner', () => {
       projectRoot: gitFixture.root,
       model: 'claude-sonnet-4-6',
       allowNonSubscriptionAuth: false,
-      env: fixtureEnv(gitFixture, { PATH: `${gitFixture.root}:${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin` }),
+      env: fixtureEnv(gitFixture, {
+        PATH: `${gitFixture.root}:${gitFixture.sandboxBinDir}:${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`
+      }),
       homedir: () => gitFixture.root
     }).startSessionAndRunTurn(startInput(gitFixture.root));
     expect(gitResult.status).toBe('completed');
@@ -1521,20 +1584,21 @@ describe('ClaudeCliRunner', () => {
 describe('isClaudeSandboxShellLauncher', () => {
   it('recognizes the CLI sandbox shell supervisor argv observed from claude 2.1.224', () => {
     expect(isClaudeSandboxShellLauncher(
-      "/proc/self/fd/3 /bin/bash -c source /home/user/.claude/shell-snapshots/snapshot-bash-1787240351764-gigf9j.sh 2>/dev/null || true && eval 'gh pr view 503 --json state'"
+      ['/proc/self/fd/3', '/bin/bash', '-c', "source /home/user/.claude/shell-snapshots/snapshot-bash-1787240351764-gigf9j.sh 2>/dev/null || true && eval 'gh pr view 503 --json state'"]
     )).toBe(true);
-    expect(isClaudeSandboxShellLauncher('/proc/self/fd/11 /usr/bin/bash -c ls')).toBe(true);
-    expect(isClaudeSandboxShellLauncher('/proc/self/fd/3 /bin/sh -c ls')).toBe(true);
+    expect(isClaudeSandboxShellLauncher(['/proc/self/fd/11', '/usr/bin/bash', '-c', 'ls'])).toBe(true);
+    expect(isClaudeSandboxShellLauncher(['/proc/self/fd/3', '/bin/sh', '-c', 'ls'])).toBe(true);
   });
 
   it('does not exempt real claude invocations or near-miss argv shapes', () => {
     expect(isClaudeSandboxShellLauncher(
-      '/home/user/.local/share/claude/versions/2.1.224 --print --model claude-sonnet-4-6'
+      ['/home/user/.local/share/claude/versions/2.1.224', '--print', '--model', 'claude-sonnet-4-6']
     )).toBe(false);
-    expect(isClaudeSandboxShellLauncher('/proc/self/fd/3 --print --model claude-sonnet-4-6')).toBe(false);
-    expect(isClaudeSandboxShellLauncher('/bin/bash -c ls')).toBe(false);
-    expect(isClaudeSandboxShellLauncher('/proc/self/fd/x /bin/bash -c ls')).toBe(false);
-    expect(isClaudeSandboxShellLauncher('/proc/self/fd/3 /bin/bash ls')).toBe(false);
-    expect(isClaudeSandboxShellLauncher('')).toBe(false);
+    expect(isClaudeSandboxShellLauncher(['/proc/self/fd/3', '--print', '--model', 'claude-sonnet-4-6'])).toBe(false);
+    expect(isClaudeSandboxShellLauncher(['/bin/bash', '-c', 'ls'])).toBe(false);
+    expect(isClaudeSandboxShellLauncher(['/proc/self/fd/x', '/bin/bash', '-c', 'ls'])).toBe(false);
+    expect(isClaudeSandboxShellLauncher(['/proc/self/fd/3', '/bin/bash', 'ls'])).toBe(false);
+    expect(isClaudeSandboxShellLauncher(['/proc/self/fd/3 /bin/bash -c', '--print', 'prompt'])).toBe(false);
+    expect(isClaudeSandboxShellLauncher([])).toBe(false);
   });
 });
