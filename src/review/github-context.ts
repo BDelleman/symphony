@@ -25,6 +25,12 @@ interface GitHubClientOptions {
   apiBase?: string;
 }
 
+interface GhApiFetchOptions {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  execute?: (args: string[], input?: string) => string;
+}
+
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (value && typeof value === 'object') {
@@ -83,6 +89,37 @@ export function resolveGitHubToken(env: NodeJS.ProcessEnv = process.env): string
   } catch {
     throw new Error('review_approval_github_auth_unavailable');
   }
+}
+
+export function createGhApiFetch(options: GhApiFetchOptions): typeof fetch {
+  const execute = options.execute ?? ((args: string[], input?: string) => execFileSync('gh', args, {
+    cwd: options.cwd,
+    env: options.env,
+    input,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'ignore'],
+    timeout: 30_000,
+    maxBuffer: 8 * 1024 * 1024
+  }));
+  return (async (input: string | URL | Request, init: RequestInit = {}) => {
+    const rawUrl = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:' || url.hostname !== 'api.github.com' || url.username || url.password) {
+      throw new Error('review_approval_github_cli_host_invalid');
+    }
+    const endpoint = `${url.pathname}${url.search}`;
+    const method = (init.method ?? 'GET').toUpperCase();
+    const body = typeof init.body === 'string' ? init.body : undefined;
+    const args = endpoint === '/graphql'
+      ? ['api', 'graphql', '--input', '-']
+      : ['api', '--method', method, endpoint, ...(body ? ['--input', '-'] : [])];
+    try {
+      const output = execute(args, body);
+      return new Response(output || 'null', { status: 200, headers: { 'content-type': 'application/json' } });
+    } catch {
+      throw new Error('review_approval_github_cli_failed');
+    }
+  }) as typeof fetch;
 }
 
 export class GitHubReviewClient {

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { encodeReviewOutcome, normalizeReviewMarkdown, receiptSha256, reviewSha256 } from './contract';
-import { GitHubReviewClient, parseGitHubRemote } from './github-context';
+import { createGhApiFetch, GitHubReviewClient, parseGitHubRemote } from './github-context';
 import type { AgentReviewOutcome, ReviewReceiptV2, ReviewRoute, ReviewVerdict } from './types';
 
 interface FinalizeOptions {
@@ -74,7 +74,10 @@ export async function finalizeAgentReview(options: FinalizeOptions): Promise<Fin
   const reviewBody = normalizeReviewMarkdown(fs.readFileSync(bodyPath, 'utf8'));
   assertReviewBody(reviewBody);
 
-  const client = options.client ?? new GitHubReviewClient({ token: options.env.GH_TOKEN ?? options.env.GITHUB_TOKEN });
+  const client = options.client ?? new GitHubReviewClient({
+    token: options.env.GH_TOKEN ?? options.env.GITHUB_TOKEN,
+    fetchFn: createGhApiFetch({ cwd: root, env: options.env })
+  });
   const reviewerLogin = options.env.SYMPHONY_REVIEWER_APP_LOGIN ?? 'symphony-reviewer[bot]';
   const snapshot = await client.fetchSnapshot(repository, options.pr, reviewerLogin);
   if (snapshot.state !== 'open' || snapshot.draft) throw new Error('review_finalize_pr_not_ready');

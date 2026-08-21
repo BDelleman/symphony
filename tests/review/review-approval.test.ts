@@ -20,11 +20,41 @@ import {
   type GitHubPullRequestSnapshot,
   type ReviewReceiptV2
 } from '../../src/review';
+import { createGhApiFetch } from '../../src/review/github-context';
 import type { Issue, TrackerAdapter } from '../../src/tracker';
 
 const dirs: string[] = [];
 const baseSha = 'a'.repeat(40);
 const headSha = 'b'.repeat(40);
+
+describe('worker GitHub transport', () => {
+  it('routes reads through gh api without exposing tokens in argv', async () => {
+    const calls: Array<{ args: string[]; input?: string }> = [];
+    const fetchFn = createGhApiFetch({
+      cwd: '/tmp',
+      env: { GH_TOKEN: 'secret' },
+      execute: (args, input) => {
+        calls.push({ args, input });
+        return JSON.stringify({ data: { repository: {} } });
+      }
+    });
+
+    await expect((await fetchFn('https://api.github.com/repos/acme/repo/pulls/1')).json()).resolves.toEqual({
+      data: { repository: {} }
+    });
+    await fetchFn('https://api.github.com/graphql', {
+      method: 'POST',
+      body: JSON.stringify({ query: 'query Test { viewer { login } }', variables: {} })
+    });
+
+    expect(calls[0]).toEqual({ args: ['api', '--method', 'GET', '/repos/acme/repo/pulls/1'], input: undefined });
+    expect(calls[1]?.args).toEqual(['api', 'graphql', '--input', '-']);
+    expect(calls.flatMap((call) => call.args)).not.toContain('secret');
+    await expect(fetchFn('http://api.github.com/repos/acme/repo')).rejects.toThrow(
+      'review_approval_github_cli_host_invalid'
+    );
+  });
+});
 
 function outcome(overrides: Partial<AgentReviewOutcome> = {}): AgentReviewOutcome {
   return {
