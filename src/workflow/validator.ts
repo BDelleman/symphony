@@ -137,6 +137,37 @@ export class ConfigValidator {
       }
     }
 
+    if (effectiveConfig.review_approval) {
+      if (
+        effectiveConfig.review_approval.provider !== 'github_app' ||
+        effectiveConfig.review_approval.required !== true ||
+        effectiveConfig.tracker.kind !== 'linear'
+      ) {
+        return {
+          ok: false,
+          error_code: 'invalid_review_approval',
+          message: 'review_approval requires provider=github_app, required=true, and tracker.kind=linear',
+          at
+        };
+      }
+      if (!effectiveConfig.tracker.fresh_dispatch_states.some((state) => state.trim().toLowerCase() === 'agent review')) {
+        return {
+          ok: false,
+          error_code: 'invalid_review_approval',
+          message: 'review_approval requires Agent Review in tracker.fresh_dispatch_states',
+          at
+        };
+      }
+      if (!effectiveConfig.persistence.enabled) {
+        return {
+          ok: false,
+          error_code: 'invalid_review_approval',
+          message: 'review_approval requires persistence.enabled=true for durable supervisor actions',
+          at
+        };
+      }
+    }
+
     const githubLinkingMode = effectiveConfig.tracker.github_linking?.mode ?? 'off';
     if (githubLinkingMode !== 'off' && githubLinkingMode !== 'warn' && githubLinkingMode !== 'required') {
       return {

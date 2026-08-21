@@ -1,6 +1,6 @@
 import { DYNAMIC_TOOL_CONSOLE_RECOVERY_ACTION, UNSUPPORTED_DYNAMIC_TOOL_CONSOLE_RESUME_REASON_CODE } from './dynamic-tool-capability';
 
-export const REASON_CODE_REGISTRY_VERSION = '2026-08-20.v1';
+export const REASON_CODE_REGISTRY_VERSION = '2026-08-21.v1';
 
 export type ReasonCodeClassification =
   | 'healthy'
@@ -94,6 +94,12 @@ export const REASON_CODES = {
   claudeModelObserved: 'claude_model_observed',
   claudePermissionDenied: 'claude_permission_denied',
   claudeSandboxRuntimeFailed: 'claude_sandbox_runtime_failed',
+  reviewApprovalOutcomeInvalid: 'review_approval_outcome_invalid',
+  reviewApprovalContextMismatch: 'review_approval_context_mismatch',
+  reviewApprovalCredentialsInvalid: 'review_approval_credentials_invalid',
+  reviewApprovalGithubFailed: 'review_approval_github_failed',
+  reviewApprovalReadbackFailed: 'review_approval_readback_failed',
+  reviewApprovalSupervisorUnavailable: 'review_approval_supervisor_unavailable',
   symphonyPhaseMarker: 'symphony_phase_marker',
   recoveredAfterRestart: 'recovered_after_restart',
   projectHistorySchemaHealthUnavailable: 'project_history_schema_health_unavailable',
@@ -863,6 +869,66 @@ export const CANONICAL_REASON_CODE_REGISTRY = {
     headline: 'Claude could not start or retain its supervised sandbox',
     detail: 'The Claude runtime stopped after its host sandbox preflight or a sandboxed Bash operation failed containment setup.',
     expected_transition: null
+  },
+  [REASON_CODES.reviewApprovalOutcomeInvalid]: {
+    reason_code: REASON_CODES.reviewApprovalOutcomeInvalid,
+    classification: 'failed',
+    actionability: 'required',
+    recommended_actions: ['Rerun a fresh Agent Review and require the installed review finalization command'],
+    label: 'Review Outcome Invalid',
+    headline: 'Agent Review did not produce a valid supervisor request',
+    detail: 'The provider completed, but its terminal review envelope was missing, malformed, duplicated, or did not match the supervised attempt.',
+    expected_transition: 'Issue remains in Agent Review until a fresh valid review completes'
+  },
+  [REASON_CODES.reviewApprovalContextMismatch]: {
+    reason_code: REASON_CODES.reviewApprovalContextMismatch,
+    classification: 'failed',
+    actionability: 'required',
+    recommended_actions: ['Refresh the PR and rerun Agent Review on the exact current head'],
+    label: 'Review Context Mismatch',
+    headline: 'Reviewed evidence no longer matches live state',
+    detail: 'The supervisor rejected the request because issue, PR, head, checks, feedback, workspace, or receipt evidence changed or was ambiguous.',
+    expected_transition: 'Issue remains in Agent Review pending a fresh exact-head review'
+  },
+  [REASON_CODES.reviewApprovalCredentialsInvalid]: {
+    reason_code: REASON_CODES.reviewApprovalCredentialsInvalid,
+    classification: 'failed',
+    actionability: 'required',
+    recommended_actions: ['Fix the reviewer GitHub App configuration and rerun symphony doctor'],
+    label: 'Reviewer Credentials Invalid',
+    headline: 'Supervisor reviewer identity is not ready',
+    detail: 'The reviewer App key, installation, repository association, permissions, or identity separation did not validate.',
+    expected_transition: 'Issue remains in Agent Review until operator configuration is repaired'
+  },
+  [REASON_CODES.reviewApprovalGithubFailed]: {
+    reason_code: REASON_CODES.reviewApprovalGithubFailed,
+    classification: 'failed',
+    actionability: 'required',
+    recommended_actions: ['Inspect GitHub availability and App permissions, then retry the supervisor gate'],
+    label: 'Reviewer GitHub Request Failed',
+    headline: 'GitHub App approval could not complete',
+    detail: 'The supervisor could not validate, submit, or query the exact-head GitHub review.',
+    expected_transition: 'Issue remains in Agent Review; no Human Review fallback is used'
+  },
+  [REASON_CODES.reviewApprovalReadbackFailed]: {
+    reason_code: REASON_CODES.reviewApprovalReadbackFailed,
+    classification: 'failed',
+    actionability: 'required',
+    recommended_actions: ['Inspect the exact-head App review and Linear state before retrying'],
+    label: 'Review Approval Readback Failed',
+    headline: 'Supervisor action could not be confirmed',
+    detail: 'An approval or route may have succeeded, but the required exact-state readback did not confirm it.',
+    expected_transition: 'Supervisor reconciliation reuses confirmed work or leaves the issue in Agent Review'
+  },
+  [REASON_CODES.reviewApprovalSupervisorUnavailable]: {
+    reason_code: REASON_CODES.reviewApprovalSupervisorUnavailable,
+    classification: 'failed',
+    actionability: 'required',
+    recommended_actions: ['Restore the Symphony supervisor and durable history store, then rerun Agent Review'],
+    label: 'Review Supervisor Unavailable',
+    headline: 'Supervisor review gate is unavailable',
+    detail: 'The post-turn coordinator or its required durable capability was unavailable.',
+    expected_transition: 'Issue remains in Agent Review'
   },
   [REASON_CODES.projectHistorySchemaHealthUnavailable]: {
     reason_code: REASON_CODES.projectHistorySchemaHealthUnavailable,

@@ -430,6 +430,7 @@ export class ConfigResolver {
     const copyIgnored = asRecord(workspace.copy_ignored);
     const hooks = asRecord(config.hooks);
     const agent = asRecord(config.agent);
+    const reviewApproval = asRecord(config.review_approval);
     const dispatchBackpressure = asRecord(agent.dispatch_backpressure);
     const budget = asRecord(config.budget);
     const codex = asRecord(config.codex);
@@ -706,6 +707,14 @@ export class ConfigResolver {
         ].sort(),
         claude_supported_version: '2.1.224'
       },
+      ...(Object.keys(reviewApproval).length > 0
+        ? {
+            review_approval: {
+              provider: readString(reviewApproval.provider, '') as 'github_app',
+              required: reviewApproval.required === true
+            }
+          }
+        : {}),
       budget: {
         ...(budget.per_run_total_tokens !== undefined
           ? { per_run_total_tokens: readIntStrict(budget.per_run_total_tokens, Number.NaN) }

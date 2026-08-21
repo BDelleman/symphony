@@ -35,12 +35,21 @@ export interface Issue {
   has_github_issue_link?: boolean;
   created_at: Date | null;
   updated_at: Date | null;
+  version?: number | null;
+}
+
+export interface TrackerComment {
+  id: string;
+  body: string;
+  created_at: Date | null;
+  updated_at: Date | null;
 }
 
 export interface TrackerAdapter {
   fetch_candidate_issues(): Promise<Issue[]>;
   fetch_issues_by_states(state_names: string[]): Promise<Issue[]>;
   fetch_issue_states_by_ids(issue_ids: string[]): Promise<Issue[]>;
+  fetch_issue_comments?(issue_id: string): Promise<TrackerComment[]>;
   create_comment(issue_id: string, body: string): Promise<void>;
   update_issue_state(issue_id: string, state_name: string): Promise<void>;
 }
