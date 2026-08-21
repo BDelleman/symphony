@@ -22,7 +22,7 @@ import type {
   AgentRunnerStartInput,
   ProviderUsage
 } from './types';
-import { parseReviewOutcome } from '../review';
+import { tryParseReviewOutcome } from '../review';
 import { stripReviewerCredentials } from '../review/credential-boundary';
 
 export const CLAUDE_SUPPORTED_VERSION = '2.1.224';
@@ -2525,6 +2525,7 @@ export class ClaudeCliRunner implements AgentRunner {
         });
       }
       const resultText = readString(terminal, 'result');
+      const reviewOutcome = tryParseReviewOutcome(resultText ?? undefined);
       const completionDelivered = emit({
         event: CANONICAL_EVENT.agentRunner.turnCompleted,
         session_id: sessionId,
@@ -2558,7 +2559,8 @@ export class ClaudeCliRunner implements AgentRunner {
         turn_id: turnId,
         last_event: CANONICAL_EVENT.agentRunner.turnCompleted,
         last_agent_message: resultText ? trimUtf8(resultText, MAX_RESULT_DETAIL_BYTES) : undefined,
-        review_outcome: parseReviewOutcome(resultText ?? undefined),
+        review_outcome: reviewOutcome.outcome,
+        review_outcome_error: reviewOutcome.error,
         provider_usage: providerUsage,
         requested_model: this.options.model,
         effective_model: state.effectiveModel,

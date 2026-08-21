@@ -1,3 +1,4 @@
+export * from './capsule';
 export * from './contract';
 export * from './coordinator';
 export * from './credential-boundary';

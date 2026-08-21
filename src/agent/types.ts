@@ -112,6 +112,7 @@ export interface AgentRunResult {
   effective_model?: string | null;
   retryable?: boolean;
   review_outcome?: AgentReviewOutcome | null;
+  review_outcome_error?: string | null;
 }
 
 export interface AgentRunner {

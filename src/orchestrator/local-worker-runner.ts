@@ -14,6 +14,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { WorkerCompletionReason } from './types';
 import type { AgentReviewOutcome, ReviewApprovalResult } from '../review';
+import { readCapsuleReviewOutcome, reviewOutcomesEqual } from '../review';
 
 const DEFAULT_CONTINUATION_PROMPT =
   'Continue on the same thread for this issue. Focus on incremental progress and report outcomes clearly.';
@@ -229,13 +230,52 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
       lastSessionId = turnResult.session_id;
 
       if (input.config.review_approval && isSameState(currentIssue.state, 'Agent Review')) {
-        if (!turnResult.review_outcome) {
+        // The receipt capsule written by `review finalize` is the authoritative
+        // transport for the review outcome; the envelope in the agent's final
+        // message is a cross-check. This keeps a finalized review alive when the
+        // agent decorates or omits the envelope, while a disagreement between
+        // the two transports still fails closed.
+        let capsuleOutcome: AgentReviewOutcome | null = null;
+        try {
+          capsuleOutcome = readCapsuleReviewOutcome({
+            workspacePath: workspace.path,
+            symphonyAttemptId: input.symphonyAttemptId
+          });
+        } catch (error) {
           return {
             reason: 'abnormal',
             session_id: lastSessionId,
-            error: REASON_CODES.reviewApprovalOutcomeInvalid,
+            error: error instanceof Error ? error.message : String(error),
             retryable: false
           };
+        }
+        const envelopeOutcome = turnResult.review_outcome ?? null;
+        if (envelopeOutcome && capsuleOutcome && !reviewOutcomesEqual(envelopeOutcome, capsuleOutcome)) {
+          return {
+            reason: 'abnormal',
+            session_id: lastSessionId,
+            error: 'review_approval_outcome_conflict',
+            retryable: false
+          };
+        }
+        const reviewOutcome = capsuleOutcome ?? envelopeOutcome;
+        if (!reviewOutcome) {
+          return {
+            reason: 'abnormal',
+            session_id: lastSessionId,
+            error: turnResult.review_outcome_error ?? REASON_CODES.reviewApprovalOutcomeInvalid,
+            retryable: false
+          };
+        }
+        if (!envelopeOutcome) {
+          emitCompatibilityEvent({
+            event: CANONICAL_EVENT.agentRunner.activity,
+            timestamp: new Date().toISOString(),
+            codex_app_server_pid: null,
+            detail: `review_outcome_recovered_from_capsule${
+              turnResult.review_outcome_error ? `: ${turnResult.review_outcome_error}` : ''
+            }`
+          });
         }
         if (!input.reviewOutcomeHandler) {
           return {
@@ -247,7 +287,7 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
         }
         const approval = await input.reviewOutcomeHandler({
           issue: currentIssue,
-          outcome: turnResult.review_outcome,
+          outcome: reviewOutcome,
           workspace,
           symphonyAttemptId: input.symphonyAttemptId,
           sessionId: turnResult.session_id
