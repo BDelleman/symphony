@@ -99,7 +99,10 @@ describe('review approval contract', () => {
     const encoded = encodeReviewOutcome(outcome());
     expect(parseReviewOutcome(encoded)).toEqual(outcome());
     expect(parseReviewOutcome('ordinary long response '.repeat(1000))).toBeNull();
-    expect(() => parseReviewOutcome(`${encoded}\ntrailing`)).toThrow('review_approval_outcome_malformed');
+    expect(parseReviewOutcome(`Review finalized with verdict \`pass\`.\n\n${encoded}`)).toEqual(outcome());
+    expect(parseReviewOutcome(`${encoded}\ntrailing prose`)).toEqual(outcome());
+    expect(() => parseReviewOutcome(`${encoded} same-line trailing`)).toThrow('review_approval_outcome_malformed');
+    expect(() => parseReviewOutcome(`prefix text ${encoded}`)).toThrow('review_approval_outcome_malformed');
     expect(() => parseReviewOutcome(`${encoded}\n${encoded}`)).toThrow('review_approval_outcome_malformed');
     expect(() => parseReviewOutcome(encodeReviewOutcome(outcome({ verdict: 'blocked', route: 'merging' })))).toThrow(
       'review_approval_outcome_route_mismatch'

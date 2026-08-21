@@ -35,20 +35,36 @@ export function encodeReviewOutcome(outcome: AgentReviewOutcome): string {
 export function parseReviewOutcome(message: string | undefined): AgentReviewOutcome | null {
   if (!message) return null;
   if (!message.includes(REVIEW_OUTCOME_PREFIX)) return null;
-  if (Buffer.byteLength(message, 'utf8') > MAX_REVIEW_OUTCOME_BYTES) {
+  // The workflow instructs the agent to return the envelope alone, but agents
+  // still wrap it in a short summary often enough that exact-match parsing
+  // killed valid, receipt-verified reviews. The envelope is authenticated
+  // downstream against the receipt written by `review finalize`, so prose
+  // around it adds no forgery surface: tolerate surrounding lines and require
+  // exactly one line that is the envelope and nothing else. Anything more
+  // ambiguous — two envelopes, or an envelope sharing a line with other text —
+  // still fails closed.
+  const markerLines = message
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.includes(REVIEW_OUTCOME_PREFIX));
+  const envelope = markerLines[0]!;
+  if (
+    markerLines.length !== 1
+    || !envelope.startsWith(REVIEW_OUTCOME_PREFIX)
+    || envelope.indexOf(REVIEW_OUTCOME_PREFIX) !== envelope.lastIndexOf(REVIEW_OUTCOME_PREFIX)
+  ) {
+    throw new Error('review_approval_outcome_malformed');
+  }
+  if (Buffer.byteLength(envelope, 'utf8') > MAX_REVIEW_OUTCOME_BYTES) {
     throw new Error('review_approval_outcome_oversized');
   }
-  const trimmed = message.trim();
-  if (
-    !trimmed.startsWith(REVIEW_OUTCOME_PREFIX)
-    || trimmed.includes('\n')
-    || trimmed.indexOf(REVIEW_OUTCOME_PREFIX) !== trimmed.lastIndexOf(REVIEW_OUTCOME_PREFIX)
-  ) {
+  const payload = envelope.slice(REVIEW_OUTCOME_PREFIX.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(payload)) {
     throw new Error('review_approval_outcome_malformed');
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(Buffer.from(trimmed.slice(REVIEW_OUTCOME_PREFIX.length), 'base64url').toString('utf8'));
+    parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
   } catch {
     throw new Error('review_approval_outcome_malformed');
   }
