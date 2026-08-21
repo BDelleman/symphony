@@ -29,6 +29,7 @@ export function claudeSandboxProtectedPathCandidates(params: {
   projectRoot: string;
   projectSensitivePaths: string[];
   home: string;
+  additionalProtectedPaths?: string[];
 }): string[] {
   return [
     path.dirname(params.executable),
@@ -57,6 +58,7 @@ export function claudeSandboxProtectedPathCandidates(params: {
     path.join(params.home, '.yarnrc'),
     path.join(params.home, '.yarnrc.yml'),
     ...params.projectSensitivePaths,
+    ...(params.additionalProtectedPaths ?? []),
     path.join(path.dirname(params.projectRoot), '.symphony-quarantine')
   ];
 }

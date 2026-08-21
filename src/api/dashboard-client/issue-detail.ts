@@ -487,6 +487,16 @@ export async function loadIssue(identifier: any, options?: any) {
       if (payload.operator_explainer) {
         summaryParts.push('Actionability: ' + payload.operator_explainer.actionability);
       }
+      const latestReviewApproval = Array.isArray(payload.review_approval_actions)
+        ? payload.review_approval_actions[0]
+        : null;
+      if (latestReviewApproval) {
+        summaryParts.push('Review approval: ' + latestReviewApproval.status);
+        summaryParts.push('Review route: ' + (latestReviewApproval.effective_route || latestReviewApproval.requested_route));
+        summaryParts.push('Review head: ' + latestReviewApproval.head_sha.slice(0, 12));
+        summaryParts.push('Reviewer App: ' + (latestReviewApproval.app_login || 'pending'));
+        summaryParts.push('Review gate updated: ' + latestReviewApproval.updated_at);
+      }
       const runningOrRetry = payload.running || payload.retry || payload.blocked;
       if (runningOrRetry && runningOrRetry.provisioner_type) {
         summaryParts.push('Provisioner: ' + runningOrRetry.provisioner_type);

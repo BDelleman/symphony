@@ -11,6 +11,7 @@ import type { WorkspaceManager } from '../workspace';
 import type { WorkspaceInfo } from '../workspace';
 import type { SpawnWorkerResult, WorkerExitDetails, WorkerTerminationResult } from './types';
 import { runLocalWorkerAttempt, runLocalWorkerRecoveryAttempt } from './local-worker-runner';
+import type { AgentReviewOutcome, ReviewApprovalResult } from '../review';
 
 interface WorkerHandle {
   issue_id: string;
@@ -40,6 +41,13 @@ export interface LocalRunnerBridgeOptions {
   promptTemplate: string;
   renderPrompt?: (params: { issue: Issue; attempt: number | null }) => Promise<string>;
   issueStateFetcher?: (issue_ids: string[]) => Promise<Issue[]>;
+  reviewOutcomeHandler?: (params: {
+    issue: Issue;
+    outcome: AgentReviewOutcome;
+    workspace: WorkspaceInfo;
+    symphonyAttemptId: string;
+    sessionId: string | null;
+  }) => Promise<ReviewApprovalResult>;
   logger?: StructuredLogger;
   onWorkerExit?: (
     params: { issue_id: string; reason: 'normal' | 'abnormal'; error?: string; worker_handle?: unknown } & WorkerExitDetails
@@ -55,6 +63,7 @@ export class LocalRunnerBridge {
   private renderPrompt: (params: { issue: Issue; attempt: number | null }) => Promise<string>;
   private readonly logger?: StructuredLogger;
   private readonly issueStateFetcher: (issue_ids: string[]) => Promise<Issue[]>;
+  private readonly reviewOutcomeHandler?: LocalRunnerBridgeOptions['reviewOutcomeHandler'];
   private readonly onWorkerExit?: LocalRunnerBridgeOptions['onWorkerExit'];
   private readonly onWorkerEvent?: LocalRunnerBridgeOptions['onWorkerEvent'];
   private nextWorkerSequence = 0;
@@ -74,6 +83,7 @@ export class LocalRunnerBridge {
     }
     this.logger = options.logger;
     this.issueStateFetcher = options.issueStateFetcher ?? (async () => []);
+    this.reviewOutcomeHandler = options.reviewOutcomeHandler;
     this.onWorkerExit = options.onWorkerExit;
     this.onWorkerEvent = options.onWorkerEvent;
   }
@@ -400,6 +410,7 @@ export class LocalRunnerBridge {
     const result = await runLocalWorkerAttempt({
       issue,
       attempt,
+      symphonyAttemptId: workerInstanceId,
       worker_host: worker_host ?? undefined,
       workspaceManager: this.workspaceManager,
       workspace,
@@ -410,6 +421,7 @@ export class LocalRunnerBridge {
       resumeContext: resume_context,
       recoverWorkspaceAttemptResidue,
       issueStateFetcher: this.issueStateFetcher,
+      reviewOutcomeHandler: this.reviewOutcomeHandler,
       cancellationSignal,
       onAgentEvent: (event) => {
         if (event.worker_process_pid !== undefined && event.worker_process_pid !== null) {
@@ -491,6 +503,7 @@ export class LocalRunnerBridge {
     const result = await runLocalWorkerRecoveryAttempt({
       issue: params.issue,
       attempt: params.attempt,
+      symphonyAttemptId: workerInstanceId,
       worker_host: worker_host ?? undefined,
       workspaceManager: this.workspaceManager,
       workspace,

@@ -302,8 +302,57 @@ function historyMigrations(): HistoryMigration[] {
       apply: (context) => {
         ensureProviderUsageObservabilityV2(context.db, context.recordHistoryHealthMetadata);
       }
+    },
+    {
+      version: 15,
+      name: 'review_approval_action_v1',
+      apply: (context) => {
+        createReviewApprovalActionTable(context.db);
+      }
     }
   ];
+}
+
+function createReviewApprovalActionTable(db: PersistenceDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS review_approval_action (
+      action_key TEXT PRIMARY KEY,
+      project_key TEXT,
+      issue_id TEXT NOT NULL,
+      issue_identifier TEXT NOT NULL,
+      issue_run_id TEXT,
+      attempt_id TEXT,
+      thread_id TEXT,
+      turn_id TEXT,
+      symphony_attempt_id TEXT NOT NULL,
+      repository TEXT NOT NULL,
+      pr_number INTEGER NOT NULL,
+      base_sha TEXT NOT NULL,
+      head_sha TEXT NOT NULL,
+      receipt_sha256 TEXT NOT NULL,
+      review_artifact_sha256 TEXT NOT NULL,
+      github_context_sha256 TEXT NOT NULL,
+      requested_route TEXT NOT NULL,
+      effective_route TEXT,
+      app_slug TEXT,
+      app_login TEXT,
+      github_review_id INTEGER,
+      github_review_state TEXT,
+      status TEXT NOT NULL CHECK (status IN (
+        'pending_validation', 'approval_pending', 'approved', 'routing_pending', 'routed', 'failed', 'superseded'
+      )),
+      reason_code TEXT,
+      created_at TEXT NOT NULL,
+      validated_at TEXT,
+      approved_at TEXT,
+      routed_at TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS review_approval_action_nonterminal_idx
+      ON review_approval_action(status, updated_at);
+    CREATE INDEX IF NOT EXISTS review_approval_action_attempt_idx
+      ON review_approval_action(symphony_attempt_id, updated_at);
+  `);
 }
 
 function ensureProviderUsageObservabilityV2(

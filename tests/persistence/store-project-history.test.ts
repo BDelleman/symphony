@@ -506,7 +506,7 @@ describe('SqlitePersistenceStore project history', () => {
       nowMs: () => Date.parse('2026-04-11T10:00:00.000Z')
     });
     stores.push(storeA);
-    expect(storeA.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
+    expect(storeA.historySchemaHealth()).toMatchObject({ applied_version: 15, status: 'healthy' });
     storeA.close();
     stores.pop();
 
@@ -531,7 +531,7 @@ describe('SqlitePersistenceStore project history', () => {
     });
 
     expect(storeB.historySchemaHealth()).toMatchObject({
-      applied_version: 14,
+      applied_version: 15,
       status: 'degraded',
       degraded_reason_code: 'history_write_failed',
       degraded_detail: 'appendTicketTerminalOutcome: history_terminal_outcome_write_failed'

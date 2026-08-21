@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { CodexRunnerError } from '../errors';
 import { buildSshSpawnArgs } from '../ssh-target';
+import { stripReviewerCredentials } from '../../review/credential-boundary';
 
 interface RunnerProcess {
   pid?: number | null;
@@ -25,6 +26,9 @@ type SpawnProcess = (params: {
 
 const PROCESS_CANCEL_GRACE_MS = 500;
 const PROCESS_CANCEL_FORCE_SETTLE_MS = 100;
+function workerEnvironment(overrides: Record<string, string> | undefined): NodeJS.ProcessEnv {
+  return stripReviewerCredentials({ ...process.env, ...(overrides ?? {}) });
+}
 
 function renderShellCommand(command: string, args?: string[], env?: Record<string, string>): string {
   const commandWithArgs = args ? [command, ...args].map(shellEscape).join(' ') : command;
@@ -45,7 +49,8 @@ function defaultSpawnProcess(params: {
   if (workerHost) {
     const remoteCommand = `cd ${shellEscape(params.cwd)} && exec ${renderShellCommand(params.command, params.args, params.env)}`;
     const child: ChildProcessWithoutNullStreams = spawn('ssh', buildSshSpawnArgs(workerHost, remoteCommand), {
-      stdio: ['pipe', 'pipe', 'pipe']
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: workerEnvironment(undefined)
     });
 
     return child;
@@ -55,14 +60,12 @@ function defaultSpawnProcess(params: {
     ? spawn(params.command, params.args, {
         cwd: params.cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          ...(params.env ?? {})
-        }
+        env: workerEnvironment(params.env)
       })
     : spawn('bash', ['-lc', params.command], {
         cwd: params.cwd,
-        stdio: ['pipe', 'pipe', 'pipe']
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: workerEnvironment(params.env)
       });
 
   return child;

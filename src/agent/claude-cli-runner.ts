@@ -22,6 +22,8 @@ import type {
   AgentRunnerStartInput,
   ProviderUsage
 } from './types';
+import { parseReviewOutcome } from '../review';
+import { stripReviewerCredentials } from '../review/credential-boundary';
 
 export const CLAUDE_SUPPORTED_VERSION = '2.1.224';
 const MAX_PROMPT_BYTES = 8 * 1024 * 1024;
@@ -1210,7 +1212,8 @@ function buildChildEnvironment(
   workspace: string,
   home: string,
   model: string,
-  allowNonSubscriptionAuth: boolean
+  allowNonSubscriptionAuth: boolean,
+  symphonyAttemptId: string | undefined
 ): NodeJS.ProcessEnv {
   const output: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(base)) {
@@ -1236,7 +1239,8 @@ function buildChildEnvironment(
   output.ANTHROPIC_MODEL = model;
   output.DISABLE_AUTOUPDATER = '1';
   output.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
-  return output;
+  if (symphonyAttemptId) output.SYMPHONY_ATTEMPT_ID = symphonyAttemptId;
+  return stripReviewerCredentials(output);
 }
 
 interface ProcessRow {
@@ -1598,7 +1602,8 @@ export class ClaudeCliRunner implements AgentRunner {
         workspace,
         home,
         this.options.model,
-        this.options.allowNonSubscriptionAuth
+        this.options.allowNonSubscriptionAuth,
+        input.runBinding?.symphony_attempt_id
       );
       if (!sshAgent) delete childEnv.SSH_AUTH_SOCK;
       else childEnv.SSH_AUTH_SOCK = sshAgent.socketPath;
@@ -1630,7 +1635,10 @@ export class ClaudeCliRunner implements AgentRunner {
         workspace,
         projectRoot,
         projectSensitivePaths,
-        home
+        home,
+        additionalProtectedPaths: this.env.SYMPHONY_REVIEWER_PRIVATE_KEY_PATH
+          ? [this.env.SYMPHONY_REVIEWER_PRIVATE_KEY_PATH]
+          : []
       }));
       let sandboxRuntimeFingerprint = `platform:${this.platform}`;
       if (this.platform === 'linux') {
@@ -2524,6 +2532,7 @@ export class ClaudeCliRunner implements AgentRunner {
         turn_id: turnId,
         last_event: CANONICAL_EVENT.agentRunner.turnCompleted,
         last_agent_message: resultText ? trimUtf8(resultText, MAX_RESULT_DETAIL_BYTES) : undefined,
+        review_outcome: parseReviewOutcome(resultText ?? undefined),
         provider_usage: providerUsage,
         requested_model: this.options.model,
         effective_model: state.effectiveModel,
