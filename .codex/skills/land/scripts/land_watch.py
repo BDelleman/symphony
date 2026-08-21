@@ -40,6 +40,7 @@ class WatchOptions:
     expected_base: str | None
     json_output: bool
     timeout_seconds: int
+    require_reviewer_app_approval: bool
 
 
 @dataclass
@@ -499,6 +500,24 @@ def filter_blocking_reviews(
     ]
 
 
+def require_reviewer_app_approval(reviews: list[dict[str, Any]], head_sha: str) -> None:
+    expected_login = os.environ.get(
+        "SYMPHONY_REVIEWER_APP_LOGIN",
+        "symphony-reviewer[bot]",
+    ).strip().lower()
+    matching = [
+        review
+        for review in reviews
+        if review.get("user", {}).get("login", "").lower() == expected_login
+        and review.get("state") == "APPROVED"
+        and review.get("commit_id") == head_sha
+    ]
+    if not matching:
+        raise RuntimeError(
+            f"reviewer_app_exact_head_approval_missing:login={expected_login}:head={head_sha}",
+        )
+
+
 def is_merge_conflicting(pr: PrInfo) -> bool:
     return pr.mergeable == "CONFLICTING" or pr.merge_state == "DIRTY"
 
@@ -681,6 +700,8 @@ async def watch_pr(options: WatchOptions) -> dict[str, Any]:
     if pending_checks or failed_checks:
         raise RuntimeError(f"required_checks_not_ready:{','.join(failures) if failures else 'pending'}")
     await assert_no_review_feedback(current.number)
+    if options.mode == "landing-readiness" and options.require_reviewer_app_approval:
+        require_reviewer_app_approval(await get_reviews(current.number), head_sha)
     return {
         "status": "ready",
         "mode": options.mode,
@@ -704,6 +725,7 @@ def parse_args() -> WatchOptions:
     )
     parser.add_argument("--expected-head")
     parser.add_argument("--expected-base")
+    parser.add_argument("--require-reviewer-app-approval", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument(
         "--timeout-seconds",
@@ -719,6 +741,7 @@ def parse_args() -> WatchOptions:
         expected_base=args.expected_base,
         json_output=args.json_output,
         timeout_seconds=args.timeout_seconds,
+        require_reviewer_app_approval=args.require_reviewer_app_approval,
     )
 
 
