@@ -28,8 +28,10 @@ function createFixture(): {
   settingsFile: string;
   mcpFile: string;
   envFile: string;
+  sandboxBinDir: string;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-runner-'));
+  const sandboxBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-claude-sandbox-bin-'));
   const command = path.join(root, 'claude');
   const argsFile = path.join(root, 'args.json');
   const promptFile = path.join(root, 'prompt.txt');
@@ -201,14 +203,20 @@ process.exit(1);
 `,
     { mode: 0o755 }
   );
-  return { root, command, argsFile, promptFile, settingsFile, mcpFile, envFile };
+  fs.writeFileSync(
+    path.join(sandboxBinDir, 'bwrap'),
+    '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "bubblewrap test"; fi\nexit 0\n',
+    { mode: 0o755 }
+  );
+  fs.writeFileSync(path.join(sandboxBinDir, 'socat'), '#!/bin/sh\necho "socat test"\nexit 0\n', { mode: 0o755 });
+  return { root, command, argsFile, promptFile, settingsFile, mcpFile, envFile, sandboxBinDir };
 }
 
 function fixtureEnv(fixture: ReturnType<typeof createFixture>, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     ...Object.fromEntries(NON_SUBSCRIPTION_SELECTORS.map((name) => [name, undefined])),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: undefined,
-    PATH: process.env.PATH,
+    PATH: `${fixture.sandboxBinDir}${path.delimiter}${process.env.PATH ?? ''}`,
     MOCK_ARGS_FILE: fixture.argsFile,
     MOCK_PROMPT_FILE: fixture.promptFile,
     MOCK_SETTINGS_FILE: fixture.settingsFile,
