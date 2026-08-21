@@ -23,9 +23,10 @@ normal PR. Delete the override once its contents land upstream.
 
 Symphony resolves the workflow file in this precedence order:
 
-1. Explicit CLI flag: `symphony dashboard --workflow <path>`
-2. `SYMPHONY_WORKFLOW_PATH` environment variable
-3. Default: `WORKFLOW.md` in the project root
+1. Positional workflow path, when the command supports one
+2. Explicit `--workflow <path>` flag
+3. Ambient `SYMPHONY_WORKFLOW_PATH` process environment variable
+4. Default: `WORKFLOW.md` in the current directory
 
 The project root, the effective `.env` file, relative workspace paths, and
 project-local portable skill paths are all derived from the directory
@@ -59,27 +60,24 @@ All commands run from the project root.
    git check-ignore WORKFLOW.local.md && echo ok
    ```
 
-3. Point Symphony at the override:
+3. Point each Symphony command at the override explicitly:
 
-   - Dashboard: pass the flag explicitly. An explicit `--workflow` flag beats
-     every other source, so make sure any start command or script you use
-     names the override, not the canonical file:
+   ```bash
+   symphony setup --workflow ./WORKFLOW.local.md --yes
+   symphony doctor --workflow ./WORKFLOW.local.md
+   symphony dashboard --workflow ./WORKFLOW.local.md
+   ```
 
-     ```bash
-     symphony dashboard --workflow ./WORKFLOW.local.md
-     ```
+   Keep the same flag in aliases or start scripts. Alternatively, export an
+   ambient variable before running any of the commands:
 
-   - `.env`: set `SYMPHONY_WORKFLOW_PATH=<absolute path to WORKFLOW.local.md>`
-     so startup scripts that load `.env` resolve the override when no flag is
-     given.
+   ```bash
+   export SYMPHONY_WORKFLOW_PATH="$PWD/WORKFLOW.local.md"
+   ```
 
-   - Doctor and setup: these read the process environment only, never `.env`.
-     Prefix the variable or define a shell alias:
-
-     ```bash
-     SYMPHONY_WORKFLOW_PATH="$PWD/WORKFLOW.local.md" symphony doctor
-     SYMPHONY_WORKFLOW_PATH="$PWD/WORKFLOW.local.md" symphony setup --yes
-     ```
+   Do not put `SYMPHONY_WORKFLOW_PATH` in the project `.env`. Symphony must
+   resolve the workflow before it knows which project `.env` to load, so that
+   file cannot select its own workflow.
 
 ## Caveats
 
@@ -93,10 +91,10 @@ All commands run from the project root.
 
 - **Consent re-binding.** High-trust setup consent binds to the workflow
   content. Every edit to `WORKFLOW.local.md` invalidates recorded consent;
-  re-run `symphony setup --yes` (with `SYMPHONY_WORKFLOW_PATH` set) after
-  each edit.
+  re-run `symphony setup --workflow ./WORKFLOW.local.md --yes` after each
+  edit.
 
-- **Wrong-file confusion.** Running doctor without the environment variable,
+- **Wrong-file confusion.** Running doctor without the workflow flag or ambient variable,
   or starting the dashboard with `--workflow ./WORKFLOW.md`, validates the
   canonical file and reports its blockers, not yours. If doctor output
   suddenly disagrees with your configuration, check the `workflow:` line in
@@ -111,6 +109,5 @@ abandon the experiment):
 rm WORKFLOW.local.md
 ```
 
-Then remove the `SYMPHONY_WORKFLOW_PATH` line from `.env`, any shell alias,
-and the global ignore entry. The canonical workflow takes over with no
-residue.
+Then unset `SYMPHONY_WORKFLOW_PATH`, remove any shell alias and the global
+ignore entry. The canonical workflow takes over with no residue.
