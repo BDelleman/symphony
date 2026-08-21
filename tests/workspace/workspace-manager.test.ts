@@ -195,6 +195,7 @@ describe('WorkspaceManager', () => {
     const manager = new WorkspaceManager({
       root,
       hooks: { timeout_ms: 1000 },
+      runGit: fakeGit(),
       onPreflightResult: (result) => preflightResults.push(result)
     });
     const workspace = await manager.ensureWorkspace('ABC-VENV-ESCAPE');
@@ -219,7 +220,8 @@ describe('WorkspaceManager', () => {
     cleanupPaths.push(root);
     const manager = new WorkspaceManager({
       root,
-      hooks: { timeout_ms: 1000 }
+      hooks: { timeout_ms: 1000 },
+      runGit: fakeGit()
     });
     const workspace = await manager.ensureWorkspace('ABC-VENV-DANGLING');
     const venvBin = path.join(workspace.path, 'services', 'api', '.venv', 'bin');
@@ -249,6 +251,46 @@ describe('WorkspaceManager', () => {
     await manager.prepareAttempt(workspace.path);
 
     expect(await exists(path.join(workspace.path, '.venv', 'bin', 'python'))).toBe(true);
+  });
+
+  it('does not delete a tracked virtualenv with an escaped interpreter', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { timeout_ms: 1000 },
+      runGit: vi.fn(async ({ args }) => args[0] === 'ls-files' ? '.venv/pyvenv.cfg\n' : '')
+    });
+    const workspace = await manager.ensureWorkspace('ABC-VENV-TRACKED');
+    const venvBin = path.join(workspace.path, '.venv', 'bin');
+    await fs.mkdir(venvBin, { recursive: true });
+    await fs.writeFile(path.join(workspace.path, '.venv', 'pyvenv.cfg'), 'home = /outside\n', 'utf8');
+    await fs.symlink(process.execPath, path.join(venvBin, 'python'));
+
+    await expect(manager.prepareAttempt(workspace.path)).rejects.toMatchObject({
+      code: 'workspace_sensitive_file_detected'
+    });
+    expect(await exists(path.join(workspace.path, '.venv', 'pyvenv.cfg'))).toBe(true);
+  });
+
+  it('does not delete a differently named directory that resembles a virtualenv', async () => {
+    const root = await makeTempRoot();
+    cleanupPaths.push(root);
+    const manager = new WorkspaceManager({
+      root,
+      hooks: { timeout_ms: 1000 },
+      runGit: fakeGit()
+    });
+    const workspace = await manager.ensureWorkspace('ABC-VENV-FIXTURE');
+    const fixtureRoot = path.join(workspace.path, 'fixtures', 'python-env');
+    await fs.mkdir(path.join(fixtureRoot, 'bin'), { recursive: true });
+    await fs.writeFile(path.join(fixtureRoot, 'pyvenv.cfg'), 'home = /outside\n', 'utf8');
+    await fs.symlink(process.execPath, path.join(fixtureRoot, 'bin', 'python'));
+
+    await expect(manager.prepareAttempt(workspace.path)).rejects.toMatchObject({
+      code: 'workspace_sensitive_file_detected'
+    });
+    expect(await exists(path.join(fixtureRoot, 'pyvenv.cfg'))).toBe(true);
   });
 
   it('fails closed before hooks when a managed workspace contains credential material', async () => {
