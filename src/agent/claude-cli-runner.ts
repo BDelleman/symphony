@@ -85,8 +85,11 @@ interface ParsedProtocolState {
   instructionFingerprint: string | null;
   skillFingerprint: string | null;
   terminalResult: Record<string, unknown> | null;
+  primaryResults: Record<string, unknown>[];
+  terminalFailure: string | null;
   terminalResultCount: number;
   auxiliaryResultCount: number;
+  continuationCount: number;
   initCount: number;
   apiRetryCount: number;
   permissionDenialCount: number;
@@ -744,6 +747,65 @@ function usageFromResult(
     reconciliation_delta: reconciliationDelta,
     model_usage: modelUsage
   };
+}
+
+function aggregateTerminalResults(results: readonly Record<string, unknown>[]): Record<string, unknown> | null {
+  const last = results.at(-1);
+  if (!last) return null;
+  const aggregate: Record<string, unknown> = { ...last };
+  const usageKeys = [
+    'input_tokens',
+    'output_tokens',
+    'cache_read_input_tokens',
+    'cache_creation_input_tokens'
+  ] as const;
+  const usage: Record<string, number> = {};
+  for (const key of usageKeys) {
+    const values = results.map((result) => readTokenCount(asRecord(result.usage) ?? {}, key));
+    if (values.every((value): value is number => value !== null)) {
+      usage[key] = values.reduce((sum, value) => sum + value, 0);
+    }
+  }
+  aggregate.usage = usage;
+
+  const turns = results.map((result) => readTokenCount(result, 'num_turns'));
+  if (turns.every((value): value is number => value !== null)) {
+    aggregate.num_turns = turns.reduce((sum, value) => sum + value, 0);
+  } else {
+    delete aggregate.num_turns;
+  }
+  const costs = results.map((result) => readNonNegativeNumber(result, 'total_cost_usd'));
+  if (costs.every((value): value is number => value !== null)) {
+    aggregate.total_cost_usd = costs.reduce((sum, value) => sum + value, 0);
+  } else {
+    delete aggregate.total_cost_usd;
+  }
+
+  const perModel = new Map<string, ReturnType<typeof modelUsageFromResult>[number]>();
+  for (const result of results) {
+    for (const modelUsage of modelUsageFromResult(result)) {
+      const previous = perModel.get(modelUsage.model);
+      perModel.set(modelUsage.model, {
+        model: modelUsage.model,
+        input_tokens: (previous?.input_tokens ?? 0) + modelUsage.input_tokens,
+        output_tokens: (previous?.output_tokens ?? 0) + modelUsage.output_tokens,
+        cache_read_tokens: (previous?.cache_read_tokens ?? 0) + modelUsage.cache_read_tokens,
+        cache_creation_tokens: (previous?.cache_creation_tokens ?? 0) + modelUsage.cache_creation_tokens,
+        estimated_cost_usd:
+          previous?.estimated_cost_usd === null || modelUsage.estimated_cost_usd === null
+            ? null
+            : (previous?.estimated_cost_usd ?? 0) + modelUsage.estimated_cost_usd
+      });
+    }
+  }
+  aggregate.modelUsage = Object.fromEntries([...perModel].map(([model, modelUsage]) => [model, {
+    inputTokens: modelUsage.input_tokens,
+    outputTokens: modelUsage.output_tokens,
+    cacheReadInputTokens: modelUsage.cache_read_tokens,
+    cacheCreationInputTokens: modelUsage.cache_creation_tokens,
+    costUSD: modelUsage.estimated_cost_usd
+  }]));
+  return aggregate;
 }
 
 function effectiveModelsFromResult(result: Record<string, unknown>, initModel: string | null): string[] {
@@ -1713,7 +1775,7 @@ export class ClaudeCliRunner implements AgentRunner {
         });
       });
       let committed: 'cancelled' | 'timed_out' | null = null;
-      let terminationCause: 'cancelled' | 'timed_out' | 'protocol' | 'runtime' | null = null;
+      let terminationCause: 'cancelled' | 'timed_out' | 'protocol' | 'runtime' | 'provider' | null = null;
       let forcedKillSent = false;
       let resolveCloseDeadline: ((value: { code: null; signal: NodeJS.Signals; spawnError: string }) => void) | null = null;
       const closeDeadlinePromise = new Promise<{ code: null; signal: NodeJS.Signals; spawnError: string }>((resolve) => {
@@ -1727,8 +1789,11 @@ export class ClaudeCliRunner implements AgentRunner {
         instructionFingerprint: null,
         skillFingerprint: null,
         terminalResult: null,
+        primaryResults: [],
+        terminalFailure: null,
         terminalResultCount: 0,
         auxiliaryResultCount: 0,
+        continuationCount: 0,
         initCount: 0,
         apiRetryCount: 0,
         permissionDenialCount: 0,
@@ -1739,7 +1804,7 @@ export class ClaudeCliRunner implements AgentRunner {
       };
       const requestTermination = (
         cause: string,
-        kind: 'cancelled' | 'timed_out' | 'protocol' | 'runtime'
+        kind: 'cancelled' | 'timed_out' | 'protocol' | 'runtime' | 'provider'
       ) => {
         if (terminationCause) {
           if (
@@ -1753,6 +1818,7 @@ export class ClaudeCliRunner implements AgentRunner {
         terminationCause = kind;
         if (kind === 'cancelled' || kind === 'timed_out') committed = kind;
         else if (kind === 'runtime') state.runtimeFailure = cause;
+        else if (kind === 'provider') state.terminalFailure = cause;
         else state.protocolError = cause;
         if (terminationLifecycle === 'closed' || forceKillTimer || closeDeadlineTimer) return;
         terminationLifecycle = 'terminating';
@@ -1832,9 +1898,15 @@ export class ClaudeCliRunner implements AgentRunner {
 
         if (type === 'system' && subtype === 'init') {
           state.initCount += 1;
-          if (state.initCount > 1) {
+          const isContinuationInit = state.initCount > 1;
+          const previousRoundFingerprint = state.capabilityFingerprint;
+          if (isContinuationInit && state.terminalResultCount !== state.initCount - 1) {
             failProtocol(`claude_init_count:${state.initCount}`);
             return;
+          }
+          if (isContinuationInit) {
+            state.continuationCount += 1;
+            state.terminalResult = null;
           }
           if (!sessionId) {
             failProtocol('claude_init_session_missing');
@@ -1861,6 +1933,10 @@ export class ClaudeCliRunner implements AgentRunner {
             state.instructionFingerprint,
             state.skillFingerprint
           ]);
+          if (isContinuationInit && previousRoundFingerprint && previousRoundFingerprint !== state.capabilityFingerprint) {
+            failProtocol('claude_capability_fingerprint_drift');
+            return;
+          }
           if (expectedSessionId) {
             const previousFingerprint = this.capabilityFingerprintBySession.get(expectedSessionId);
             if (previousFingerprint && previousFingerprint !== state.capabilityFingerprint) {
@@ -1884,6 +1960,16 @@ export class ClaudeCliRunner implements AgentRunner {
             failProtocol(`claude_required_mcp_missing:${missingServers.sort().join(',')}`);
             return;
           }
+          if (isContinuationInit) {
+            emit({
+              event: CANONICAL_EVENT.agentRunner.activity,
+              session_id: state.sessionId ?? undefined,
+              thread_id: state.sessionId ? `claude:${state.sessionId}` : undefined,
+              turn_id: turnId,
+              detail: `claude_continuation_turn:${state.continuationCount}`
+            });
+            return;
+          }
           emit({
             event: CANONICAL_EVENT.agentRunner.sessionStarted,
             session_id: state.sessionId ?? undefined,
@@ -1899,16 +1985,35 @@ export class ClaudeCliRunner implements AgentRunner {
             state.auxiliaryResultCount += 1;
             return;
           }
-          if (state.initCount !== 1 || !state.initSessionId) {
+          if (state.initCount < 1 || !state.initSessionId) {
             failProtocol('claude_result_before_init');
             return;
           }
-          state.terminalResultCount += 1;
-          if (state.terminalResultCount > 1) {
-            failProtocol(`claude_terminal_result_count:${state.terminalResultCount}`);
+          if (state.terminalResultCount >= state.initCount) {
+            failProtocol(`claude_terminal_result_count:${state.terminalResultCount + 1}`);
             return;
           }
+          state.terminalResultCount += 1;
           state.terminalResult = payload;
+          state.primaryResults.push(payload);
+          const resultSessionId = readString(payload, 'session_id');
+          if (!resultSessionId) {
+            failProtocol('claude_terminal_session_missing');
+            return;
+          }
+          const permissionDenials = Array.isArray(payload.permission_denials) ? payload.permission_denials.length : 0;
+          if (permissionDenials > 0) {
+            state.permissionDenialCount += permissionDenials;
+            failRuntime('claude_permission_denied_under_sandbox');
+            return;
+          }
+          const resultSubtype = readString(payload, 'subtype');
+          const apiErrorStatus = boundedFailureSignal(payload.api_error_status);
+          const terminalReason = boundedFailureSignal(payload.terminal_reason ?? payload.stop_reason);
+          const resultFailure = resultSubtype !== 'success'
+            ? `claude_terminal_${resultSubtype ?? 'unknown'}${apiErrorStatus ? `:api_status=${apiErrorStatus}` : ''}${terminalReason ? `:reason=${terminalReason}` : ''}`
+            : payload.is_error !== false ? 'claude_terminal_is_error' : null;
+          if (resultFailure) requestTermination(resultFailure, 'provider');
           return;
         }
         if (type === 'system' && subtype === 'api_retry') {
@@ -2207,11 +2312,9 @@ export class ClaudeCliRunner implements AgentRunner {
         }
       }
       const stderrDigest = stderrBytes > 0 ? stderrHash.digest('hex') : null;
-      const terminal = state.terminalResult;
-      const terminalPermissionDenials = terminal && Array.isArray(terminal.permission_denials)
-        ? terminal.permission_denials.length
-        : 0;
-      const permissionDenials = Math.max(state.permissionDenialCount, terminalPermissionDenials);
+      const terminal = state.primaryResults.at(-1) ?? null;
+      const aggregateTerminal = aggregateTerminalResults(state.primaryResults);
+      const permissionDenials = state.permissionDenialCount;
       const usageObservedAt = this.now().toISOString();
       const refreshedPartialUsage = partialUsageSnapshot(
         assistantSteps,
@@ -2227,9 +2330,9 @@ export class ClaudeCliRunner implements AgentRunner {
           auxiliaryResultCount: state.auxiliaryResultCount
         }
       );
-      let finalUsage = terminal
+      let finalUsage = aggregateTerminal
         ? usageFromResult(
-            terminal,
+            aggregateTerminal,
             state.effectiveModel,
             refreshedPartialUsage,
             state.apiRetryCount,
@@ -2314,13 +2417,6 @@ export class ClaudeCliRunner implements AgentRunner {
         };
       }
 
-      const terminalSubtype = terminal ? readString(terminal, 'subtype') : null;
-      const apiErrorStatus = terminal ? boundedFailureSignal(terminal.api_error_status) : null;
-      const terminalReason = terminal ? boundedFailureSignal(terminal.terminal_reason ?? terminal.stop_reason) : null;
-      const terminalFailure = terminalSubtype !== 'success'
-        ? `claude_terminal_${terminalSubtype ?? 'unknown'}${apiErrorStatus ? `:api_status=${apiErrorStatus}` : ''}${terminalReason ? `:reason=${terminalReason}` : ''}`
-        : null;
-      const isError = terminal?.is_error !== false;
       const terminalSession = terminal ? readString(terminal, 'session_id') : null;
       const processCrash = close.spawnError || close.code !== 0
         ? `claude_process_exit:${close.code ?? close.signal ?? 'unknown'}`
@@ -2330,16 +2426,15 @@ export class ClaudeCliRunner implements AgentRunner {
         eventDeliveryError ||
         state.runtimeFailure ||
         state.protocolError ||
-        (state.terminalResultCount !== 1 ? `claude_terminal_result_count:${state.terminalResultCount}` : null) ||
-        (state.initCount !== 1 ? `claude_init_count:${state.initCount}` : null) ||
+        state.terminalFailure ||
+        (state.terminalResultCount !== state.initCount ? `claude_terminal_result_count:${state.terminalResultCount}` : null) ||
+        (state.initCount < 1 ? `claude_init_count:${state.initCount}` : null) ||
         (!state.capabilityFingerprint ? 'claude_init_missing' : null) ||
         (!state.sessionId ? 'claude_session_id_missing' : null) ||
         (!state.initSessionId ? 'claude_init_session_missing' : null) ||
         (state.initSessionId !== state.sessionId ? 'claude_init_session_mismatch' : null) ||
         (!terminalSession ? 'claude_terminal_session_missing' : null) ||
         (terminalSession !== state.sessionId ? 'claude_terminal_session_mismatch' : null) ||
-        terminalFailure ||
-        (isError ? 'claude_terminal_is_error' : null) ||
         (permissionDenials > 0 ? 'claude_permission_denied_under_sandbox' : null) ||
         processCrash;
 
@@ -2363,7 +2458,9 @@ export class ClaudeCliRunner implements AgentRunner {
           requested_model: this.options.model,
           effective_model: state.effectiveModel,
           provider_usage: finalUsage ?? undefined,
-          retryable: Boolean(processCrash) && !state.protocolError && !state.runtimeFailure
+          retryable: state.terminalFailure
+            ? isRetryableClaudeFailure(state.terminalFailure)
+            : Boolean(processCrash) && !state.protocolError && !state.runtimeFailure
             ? true
             : isRetryableClaudeFailure(failure ?? 'claude_terminal_missing')
         };
@@ -2374,7 +2471,7 @@ export class ClaudeCliRunner implements AgentRunner {
       this.retainSessionBinding(sessionId, binding, fingerprint);
 
       const providerUsage = finalUsage!;
-      for (const observedModel of effectiveModelsFromResult(terminal, state.effectiveModel)) {
+      for (const observedModel of effectiveModelsFromResult(aggregateTerminal ?? terminal, state.effectiveModel)) {
         if (observedModel === this.options.model) continue;
         if (emittedReroutes.has(observedModel)) continue;
         emit({
