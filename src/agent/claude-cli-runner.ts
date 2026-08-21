@@ -1232,13 +1232,24 @@ function descendantProcessRows(rootPid: number | undefined, rows = readProcessRo
 // this exact launcher shape is exempt: a real nested claude invocation carries
 // claude-style argv, and any nested claude spawned inside the sandboxed shell
 // still appears as its own descendant row and fails closed.
-export function isClaudeSandboxShellLauncher(args: string): boolean {
-  const argv = args.trim().split(/\s+/);
+export function isClaudeSandboxShellLauncher(argv: readonly string[]): boolean {
   return (
     /^\/proc\/self\/fd\/\d+$/.test(argv[0] ?? '') &&
     ['/bin/bash', '/usr/bin/bash', '/bin/sh', '/usr/bin/sh'].includes(argv[1] ?? '') &&
     argv[2] === '-c'
   );
+}
+
+function readLinuxProcessArgv(pid: number): string[] | null {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    if (!raw) return null;
+    const argv = raw.split('\0');
+    if (argv.at(-1) === '') argv.pop();
+    return argv.length > 0 ? argv : null;
+  } catch {
+    return null;
+  }
 }
 
 function findNestedClaudeDescendant(rootPid: number | undefined, executable: string, rows = readProcessRows()): number | null {
@@ -1252,10 +1263,13 @@ function findNestedClaudeDescendant(rootPid: number | undefined, executable: str
     }
   };
   for (const row of descendantProcessRows(rootPid, rows)) {
-    if (isClaudeSandboxShellLauncher(row.args)) continue;
     if (process.platform === 'linux') {
       try {
-        if (fs.realpathSync(`/proc/${row.pid}/exe`) === executable) return row.pid;
+        if (fs.realpathSync(`/proc/${row.pid}/exe`) === executable) {
+          const argv = readLinuxProcessArgv(row.pid);
+          if (row.ppid === rootPid && argv && isClaudeSandboxShellLauncher(argv)) continue;
+          return row.pid;
+        }
       } catch {
         // The process may have exited between ps and /proc inspection.
       }
