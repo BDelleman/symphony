@@ -1,5 +1,5 @@
 import type { CodexRunner } from '../codex';
-import { parseReviewOutcome } from '../review';
+import { tryParseReviewOutcome } from '../review';
 import type { AgentRunResult, AgentRunner, AgentRunnerEvent, AgentRunnerStartInput } from './types';
 
 export class CodexAgentRunner implements AgentRunner {
@@ -26,6 +26,7 @@ export class CodexAgentRunner implements AgentRunner {
         : undefined
     });
 
+    const reviewOutcome = tryParseReviewOutcome(result.last_agent_message);
     return {
       runtime: this.runtime,
       status: result.status,
@@ -40,7 +41,8 @@ export class CodexAgentRunner implements AgentRunner {
       input_required_payload: result.input_required_payload,
       requested_model: result.requested_model,
       effective_model: result.effective_model,
-      review_outcome: parseReviewOutcome(result.last_agent_message)
+      review_outcome: reviewOutcome.outcome,
+      review_outcome_error: reviewOutcome.error
     };
   }
 }
