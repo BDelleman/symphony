@@ -1751,6 +1751,83 @@ describe('local symphony command router', () => {
     });
   });
 
+  it('repairs an open legacy run projection for a terminal execution graph', async () => {
+    const { repoRoot, binDir } = await createDoctorRepo();
+    const projectRoot = await createDoctorProject();
+    const dbPath = path.join(projectRoot, '.symphony', 'system', 'runtime.sqlite');
+    const identity = buildDurableIdentity({
+      projectRoot,
+      workflowPath: path.join(projectRoot, 'WORKFLOW.md'),
+      workflowHash: { status: 'present', value: 'workflow-hash' },
+      repositoryRemote: { status: 'missing', reason: 'repository_remote_unavailable' },
+      trackerKind: 'memory',
+      trackerScope: null,
+      remoteIssueId: 'doctor-history-projection',
+      humanIssueIdentifier: 'DOC-HISTORY-PROJECTION'
+    });
+    const store = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    const started = store.recordRunStarted({
+      issue_id: 'doctor-history-projection',
+      issue_identifier: 'DOC-HISTORY-PROJECTION',
+      identity,
+      started_at: '2026-08-18T10:00:00.000Z',
+      attempt_number: 0,
+      status: 'running'
+    });
+    store.close();
+    const sqlite = require('node:sqlite') as {
+      DatabaseSync: new (path: string) => {
+        close(): void;
+        prepare(sql: string): { run(...args: unknown[]): unknown };
+      };
+    };
+    const db = new sqlite.DatabaseSync(dbPath);
+    try {
+      db.prepare('UPDATE attempt SET ended_at = ?, status = ? WHERE attempt_id = ?')
+        .run('2026-08-18T10:05:00.000Z', 'failed', started.attempt_id);
+      db.prepare('UPDATE issue_run SET ended_at = ?, status = ? WHERE issue_run_id = ?')
+        .run('2026-08-18T10:05:00.000Z', 'failed', started.issue_run_id);
+    } finally {
+      db.close();
+    }
+
+    const inspectHarness = createHarness({ repoRoot });
+    inspectHarness.deps.cwd = projectRoot;
+    inspectHarness.deps.env = { PATH: binDir };
+    await runCommandRouter({
+      argv: ['doctor', '--json', '--i-understand-that-this-will-be-running-without-the-usual-guardrails'],
+      deps: inspectHarness.deps
+    });
+    expect(doctorFinding(JSON.parse(inspectHarness.stdout), 'history.execution_graph_reconciliation')).toMatchObject({
+      status: 'failure',
+      reason: 'history_orphan_reconciliation_required',
+      details: { activeCount: 1, repairableCount: 1, ambiguousCount: 0 }
+    });
+
+    const fixHarness = createHarness({ repoRoot });
+    fixHarness.deps.cwd = projectRoot;
+    fixHarness.deps.env = { PATH: binDir };
+    await runCommandRouter({
+      argv: ['doctor', '--json', '--fix', '--yes', '--i-understand-that-this-will-be-running-without-the-usual-guardrails'],
+      deps: fixHarness.deps
+    });
+    expect(doctorFinding(JSON.parse(fixHarness.stdout), 'history.execution_graph_reconciliation')).toMatchObject({
+      status: 'ok',
+      reason: 'history_execution_graph_reconciled',
+      details: { activeCount: 0, repairableCount: 0, ambiguousCount: 0 }
+    });
+    const repairedStore = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
+    try {
+      expect(repairedStore.listRunHistory().find((run) => run.run_id === started.run_id)).toMatchObject({
+        terminal_status: 'failed',
+        workflow_outcome: 'failed',
+        terminal_reason_code: 'recovered_after_restart'
+      });
+    } finally {
+      repairedStore.close();
+    }
+  });
+
   it('reports environment-variable provenance for doctor env overrides', async () => {
     const { repoRoot, binDir } = await createDoctorRepo();
     const projectRoot = await createDoctorProject();

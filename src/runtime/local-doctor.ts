@@ -2110,7 +2110,23 @@ function auditHistoryReconciliation(dbPath: string): HistoryReconciliationAudit 
         repairable += 1;
       }
     }
-    return { databaseExists: true, active: rows.length, repairable, ambiguous, error: null };
+    const staleRunProjectionCount = Number((db!.prepare(
+      `SELECT COUNT(*) AS count
+       FROM runs
+       JOIN history_identity_projection ON history_identity_projection.source_table = 'runs'
+         AND history_identity_projection.source_id = runs.run_id
+       JOIN issue_run ON issue_run.issue_run_id = history_identity_projection.issue_run_id
+       WHERE runs.ended_at IS NULL
+         AND issue_run.ended_at IS NOT NULL
+         AND issue_run.status <> 'running'`
+    ).get() as { count: number }).count);
+    return {
+      databaseExists: true,
+      active: rows.length + staleRunProjectionCount,
+      repairable: repairable + staleRunProjectionCount,
+      ambiguous,
+      error: null
+    };
   } catch (error) {
     return {
       databaseExists: true,

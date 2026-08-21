@@ -186,6 +186,62 @@ export class SqlitePersistenceStore {
     return this.readHistorySchemaHealth();
   }
 
+  private appendRecoveredTerminalOutcomeIfMissing(params: {
+    issue_run_id: string;
+    outcome: RunTerminalStatus;
+    recorded_at: string;
+    reason_detail: string;
+  }): void {
+    const existing = this.db
+      .prepare('SELECT 1 FROM history_ticket_terminal_outcome WHERE issue_run_id = ? LIMIT 1')
+      .get(params.issue_run_id);
+    if (existing) return;
+    const latestAttempt = this.db
+      .prepare('SELECT attempt_id FROM attempt WHERE issue_run_id = ? ORDER BY attempt_number DESC LIMIT 1')
+      .get(params.issue_run_id) as { attempt_id: string } | undefined;
+    this.executionGraphWriter.appendTicketTerminalOutcome({
+      terminal_outcome_id: `terminal_outcome:recovered:${params.issue_run_id}`,
+      issue_run_id: params.issue_run_id,
+      attempt_id: latestAttempt?.attempt_id ?? null,
+      outcome: params.outcome,
+      reason_code: REASON_CODES.recoveredAfterRestart,
+      reason_detail: params.reason_detail,
+      recorded_at: params.recorded_at
+    });
+  }
+
+  private closeOpenLegacyRunProjections(params: {
+    issue_run_id: string;
+    ended_at: string;
+    terminal_status: RunTerminalStatus;
+    process_status: string;
+    workflow_outcome: string;
+    reason_detail: string;
+  }): number {
+    this.db
+      .prepare(
+        `UPDATE runs SET
+          ended_at = ?, completed_at = ?, terminal_status = ?, process_status = ?, workflow_outcome = ?,
+          terminal_reason_code = ?, terminal_reason_detail = ?
+         WHERE ended_at IS NULL AND run_id IN (
+           SELECT source_id
+           FROM history_identity_projection
+           WHERE source_table = 'runs' AND issue_run_id = ?
+         )`
+      )
+      .run(
+        params.ended_at,
+        params.ended_at,
+        params.terminal_status,
+        params.process_status,
+        params.workflow_outcome,
+        REASON_CODES.recoveredAfterRestart,
+        params.reason_detail,
+        params.issue_run_id
+      );
+    return Number((this.db.prepare('SELECT changes() AS changes').get() as { changes: number }).changes);
+  }
+
   reconcileExecutionGraphAfterRestart(): { recovered: number; ambiguous: number } {
     const rows = this.db
       .prepare(
@@ -330,8 +386,62 @@ export class SqlitePersistenceStore {
           reason_code: REASON_CODES.recoveredAfterRestart,
           reason_detail: recoveryDetail
         });
+        this.appendRecoveredTerminalOutcomeIfMissing({
+          issue_run_id: row.issue_run_id,
+          outcome: recoveryStatus,
+          recorded_at: endedAt,
+          reason_detail: recoveryDetail
+        });
+        this.closeOpenLegacyRunProjections({
+          issue_run_id: row.issue_run_id,
+          ended_at: endedAt,
+          terminal_status: recoveryStatus,
+          process_status: recoveryStatus,
+          workflow_outcome: recoveryStatus,
+          reason_detail: recoveryDetail
+        });
       });
       recovered += 1;
+    }
+    const staleRunProjections = this.db
+      .prepare(
+        `SELECT DISTINCT issue_run.issue_run_id, issue_run.ended_at, issue_run.status,
+          issue_run.process_status, issue_run.workflow_outcome
+         FROM issue_run
+         JOIN history_identity_projection ON history_identity_projection.issue_run_id = issue_run.issue_run_id
+           AND history_identity_projection.source_table = 'runs'
+         JOIN runs ON runs.run_id = history_identity_projection.source_id
+         WHERE issue_run.ended_at IS NOT NULL
+           AND issue_run.status <> 'running'
+           AND runs.ended_at IS NULL`
+      )
+      .all() as Array<{
+      issue_run_id: string;
+      ended_at: string;
+      status: RunTerminalStatus;
+      process_status: string | null;
+      workflow_outcome: string | null;
+    }>;
+    for (const row of staleRunProjections) {
+      const recoveryDetail = 'Closed from the provably terminal execution graph during startup reconciliation.';
+      let repaired = 0;
+      this.transaction(() => {
+        this.appendRecoveredTerminalOutcomeIfMissing({
+          issue_run_id: row.issue_run_id,
+          outcome: row.status,
+          recorded_at: row.ended_at,
+          reason_detail: recoveryDetail
+        });
+        repaired = this.closeOpenLegacyRunProjections({
+          issue_run_id: row.issue_run_id,
+          ended_at: row.ended_at,
+          terminal_status: row.status,
+          process_status: row.process_status ?? row.status,
+          workflow_outcome: row.workflow_outcome ?? row.status,
+          reason_detail: recoveryDetail
+        });
+      });
+      recovered += repaired;
     }
     if (ambiguous > 0) {
       this.recordHistorySchemaState({
