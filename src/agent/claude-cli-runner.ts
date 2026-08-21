@@ -8,6 +8,12 @@ import { StringDecoder } from 'node:string_decoder';
 import { CANONICAL_EVENT } from '../observability/events';
 import { REASON_CODES } from '../observability/reason-codes';
 import { auditSensitiveWorkspaceFiles } from '../workspace/sensitive-files';
+import {
+  claudeSandboxProtectedPathCandidates,
+  createClaudeSandboxPathSnapshot,
+  probeClaudeSandboxRuntime,
+  type ClaudeSandboxPathSnapshot
+} from './claude-sandbox';
 import type {
   AgentRunResult,
   AgentRunner,
@@ -21,6 +27,7 @@ export const CLAUDE_SUPPORTED_VERSION = '2.1.224';
 const MAX_PROMPT_BYTES = 8 * 1024 * 1024;
 const MAX_PROTOCOL_LINE_BYTES = 8 * 1024 * 1024;
 const MAX_RESULT_DETAIL_BYTES = 16 * 1024;
+const MAX_TOOL_FAILURE_INSPECTION_BYTES = 64 * 1024;
 const HEARTBEAT_MS = 5_000;
 const NESTED_PROCESS_SCAN_MS = 1_000;
 const TERMINATION_GRACE_MS = 5_000;
@@ -78,14 +85,18 @@ interface ParsedProtocolState {
   instructionFingerprint: string | null;
   skillFingerprint: string | null;
   terminalResult: Record<string, unknown> | null;
+  primaryResults: Record<string, unknown>[];
+  terminalFailure: string | null;
   terminalResultCount: number;
   auxiliaryResultCount: number;
+  continuationCount: number;
   initCount: number;
   apiRetryCount: number;
   permissionDenialCount: number;
   unknownEventCount: number;
   lastEvent: string;
   protocolError: string | null;
+  runtimeFailure: string | null;
 }
 
 interface ClaudeSessionBinding {
@@ -738,6 +749,65 @@ function usageFromResult(
   };
 }
 
+function aggregateTerminalResults(results: readonly Record<string, unknown>[]): Record<string, unknown> | null {
+  const last = results.at(-1);
+  if (!last) return null;
+  const aggregate: Record<string, unknown> = { ...last };
+  const usageKeys = [
+    'input_tokens',
+    'output_tokens',
+    'cache_read_input_tokens',
+    'cache_creation_input_tokens'
+  ] as const;
+  const usage: Record<string, number> = {};
+  for (const key of usageKeys) {
+    const values = results.map((result) => readTokenCount(asRecord(result.usage) ?? {}, key));
+    if (values.every((value): value is number => value !== null)) {
+      usage[key] = values.reduce((sum, value) => sum + value, 0);
+    }
+  }
+  aggregate.usage = usage;
+
+  const turns = results.map((result) => readTokenCount(result, 'num_turns'));
+  if (turns.every((value): value is number => value !== null)) {
+    aggregate.num_turns = turns.reduce((sum, value) => sum + value, 0);
+  } else {
+    delete aggregate.num_turns;
+  }
+  const costs = results.map((result) => readNonNegativeNumber(result, 'total_cost_usd'));
+  if (costs.every((value): value is number => value !== null)) {
+    aggregate.total_cost_usd = costs.reduce((sum, value) => sum + value, 0);
+  } else {
+    delete aggregate.total_cost_usd;
+  }
+
+  const perModel = new Map<string, ReturnType<typeof modelUsageFromResult>[number]>();
+  for (const result of results) {
+    for (const modelUsage of modelUsageFromResult(result)) {
+      const previous = perModel.get(modelUsage.model);
+      perModel.set(modelUsage.model, {
+        model: modelUsage.model,
+        input_tokens: (previous?.input_tokens ?? 0) + modelUsage.input_tokens,
+        output_tokens: (previous?.output_tokens ?? 0) + modelUsage.output_tokens,
+        cache_read_tokens: (previous?.cache_read_tokens ?? 0) + modelUsage.cache_read_tokens,
+        cache_creation_tokens: (previous?.cache_creation_tokens ?? 0) + modelUsage.cache_creation_tokens,
+        estimated_cost_usd:
+          previous?.estimated_cost_usd === null || modelUsage.estimated_cost_usd === null
+            ? null
+            : (previous?.estimated_cost_usd ?? 0) + modelUsage.estimated_cost_usd
+      });
+    }
+  }
+  aggregate.modelUsage = Object.fromEntries([...perModel].map(([model, modelUsage]) => [model, {
+    inputTokens: modelUsage.input_tokens,
+    outputTokens: modelUsage.output_tokens,
+    cacheReadInputTokens: modelUsage.cache_read_tokens,
+    cacheCreationInputTokens: modelUsage.cache_creation_tokens,
+    costUSD: modelUsage.estimated_cost_usd
+  }]));
+  return aggregate;
+}
+
 function effectiveModelsFromResult(result: Record<string, unknown>, initModel: string | null): string[] {
   return [...new Set([initModel, ...modelUsageFromResult(result).map((usage) => usage.model)].filter((model): model is string => Boolean(model)))];
 }
@@ -867,44 +937,14 @@ function stableConfigurationHash(parts: unknown[]): string {
 function buildSandboxSettings(params: {
   executable: string;
   workspace: string;
-  projectRoot: string;
-  projectSensitivePaths: string[];
-  home: string;
   sessionTemp: string;
+  protectedPathSnapshot: ClaudeSandboxPathSnapshot;
   networkAllowedDomains: string[];
   sshAuthSock: string | null;
   allowedMcpServers: string[];
   enableWeakerNetworkIsolation: boolean;
 }): Record<string, unknown> {
-  const protectedPaths = [
-    path.dirname(params.executable),
-    path.join(params.workspace, '.env'),
-    path.join(params.home, '.claude'),
-    path.join(params.home, '.aws'),
-    path.join(params.home, '.azure'),
-    path.join(params.home, '.claude.json'),
-    path.join(params.home, '.config', 'gh'),
-    path.join(params.home, '.config', 'gcloud'),
-    path.join(params.home, '.config', 'containers'),
-    path.join(params.home, '.config', 'pip'),
-    path.join(params.home, '.config', 'pypoetry'),
-    path.join(params.home, '.cargo'),
-    path.join(params.home, '.composer'),
-    path.join(params.home, '.docker'),
-    path.join(params.home, '.kube'),
-    path.join(params.home, '.git-credentials'),
-    path.join(params.home, '.netrc'),
-    path.join(params.home, '.authinfo'),
-    path.join(params.home, '.npmrc'),
-    path.join(params.home, '.pnpmrc'),
-    path.join(params.home, '.pypirc'),
-    path.join(params.home, '.ssh'),
-    path.join(params.home, '.terraform.d'),
-    path.join(params.home, '.yarnrc'),
-    path.join(params.home, '.yarnrc.yml'),
-    ...params.projectSensitivePaths,
-    path.join(path.dirname(params.projectRoot), '.symphony-quarantine')
-  ];
+  const protectedPaths = params.protectedPathSnapshot.protectedPaths;
   const absoluteReadRules = protectedPaths.flatMap((protectedPath) => {
     const absolute = protectedPath.replace(/^\/+/, '');
     return [`Read(//${absolute})`, `Read(//${absolute}/**)`];
@@ -1082,6 +1122,41 @@ function boundedTelemetryName(value: string): string {
   return trimUtf8(value.trim(), MAX_TELEMETRY_NAME_BYTES);
 }
 
+function boundedToolResultText(content: unknown): string {
+  if (typeof content === 'string') return trimUtf8(content, MAX_TOOL_FAILURE_INSPECTION_BYTES);
+  if (!Array.isArray(content)) return '';
+  let output = '';
+  for (const rawBlock of content) {
+    const block = asRecord(rawBlock);
+    if (!block || readString(block, 'type') !== 'text') continue;
+    const text = readString(block, 'text');
+    if (!text) continue;
+    output = trimUtf8(`${output}${output ? '\n' : ''}${text}`, MAX_TOOL_FAILURE_INSPECTION_BYTES);
+    if (Buffer.byteLength(output, 'utf8') >= MAX_TOOL_FAILURE_INSPECTION_BYTES) break;
+  }
+  return output;
+}
+
+function sandboxRuntimeFailureCategory(content: unknown): string | null {
+  const normalized = boundedToolResultText(content).toLowerCase();
+  if (!normalized) return null;
+  if (normalized.includes('sandboxing requires wsl2')) return 'wsl_sandbox_unsupported';
+  if (/sandbox(?:ing)? (?:initialization|startup) (?:failed|failure)/.test(normalized)) {
+    return 'sandbox_initialization_failed';
+  }
+  if (/sandbox (?:dependency|dependencies).*(?:missing|unavailable|not found)/.test(normalized)) {
+    return 'sandbox_dependency_unavailable';
+  }
+  if (
+    normalized.includes('bwrap:') &&
+    /(?:mount|namespace|unshare|sandbox)/.test(normalized) &&
+    /(?:can(?:not|'t)|failed|failure|operation not permitted|no such file or directory)/.test(normalized)
+  ) {
+    return 'bubblewrap_containment_failed';
+  }
+  return null;
+}
+
 function retryCategory(value: unknown): string {
   const normalized = boundedFailureSignal(value) ?? 'unknown';
   if (/429|rate.?limit/.test(normalized)) return 'rate_limit';
@@ -1212,6 +1287,33 @@ function descendantProcessRows(rootPid: number | undefined, rows = readProcessRo
   return rows.filter((row) => row.pid !== rootPid && descendants.has(row.pid));
 }
 
+// Claude CLI 2.1.x runs each sandboxed Bash tool command by re-exec'ing its own
+// binary as the in-sandbox shell supervisor, with argv rewritten to
+// "/proc/self/fd/N /bin/bash -c <command>". Its /proc/<pid>/exe therefore
+// resolves to the claude executable even though no nested session exists. Only
+// this exact launcher shape is exempt: a real nested claude invocation carries
+// claude-style argv, and any nested claude spawned inside the sandboxed shell
+// still appears as its own descendant row and fails closed.
+export function isClaudeSandboxShellLauncher(argv: readonly string[]): boolean {
+  return (
+    /^\/proc\/self\/fd\/\d+$/.test(argv[0] ?? '') &&
+    ['/bin/bash', '/usr/bin/bash', '/bin/sh', '/usr/bin/sh'].includes(argv[1] ?? '') &&
+    argv[2] === '-c'
+  );
+}
+
+function readLinuxProcessArgv(pid: number): string[] | null {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    if (!raw) return null;
+    const argv = raw.split('\0');
+    if (argv.at(-1) === '') argv.pop();
+    return argv.length > 0 ? argv : null;
+  } catch {
+    return null;
+  }
+}
+
 function findNestedClaudeDescendant(rootPid: number | undefined, executable: string, rows = readProcessRows()): number | null {
   if (!rootPid) return null;
   const resolvesToExecutable = (candidate: string): boolean => {
@@ -1225,7 +1327,11 @@ function findNestedClaudeDescendant(rootPid: number | undefined, executable: str
   for (const row of descendantProcessRows(rootPid, rows)) {
     if (process.platform === 'linux') {
       try {
-        if (fs.realpathSync(`/proc/${row.pid}/exe`) === executable) return row.pid;
+        if (fs.realpathSync(`/proc/${row.pid}/exe`) === executable) {
+          const argv = readLinuxProcessArgv(row.pid);
+          if (row.ppid === rootPid && argv && isClaudeSandboxShellLauncher(argv)) continue;
+          return row.pid;
+        }
       } catch {
         // The process may have exited between ps and /proc inspection.
       }
@@ -1519,14 +1625,41 @@ export class ClaudeCliRunner implements AgentRunner {
       assertApprovedAuth(executable, workspace, childEnv, home, this.options.allowNonSubscriptionAuth);
       if (input.cancellationSignal?.aborted) return cancelledBeforeSpawn();
 
+      const protectedPathSnapshot = createClaudeSandboxPathSnapshot(claudeSandboxProtectedPathCandidates({
+        executable,
+        workspace,
+        projectRoot,
+        projectSensitivePaths,
+        home
+      }));
+      let sandboxRuntimeFingerprint = `platform:${this.platform}`;
+      if (this.platform === 'linux') {
+        let bwrapExecutable: string | null = null;
+        let socatExecutable: string | null = null;
+        try {
+          bwrapExecutable = resolveTrustedExecutable('bwrap', childEnv, [workspace, projectRoot]);
+          socatExecutable = resolveTrustedExecutable('socat', childEnv, [workspace, projectRoot]);
+        } catch {
+          // The shared probe returns the canonical missing-dependency failure.
+        }
+        const sandboxProbe = probeClaudeSandboxRuntime({
+          platform: this.platform,
+          bwrapExecutable,
+          socatExecutable,
+          env: childEnv
+        });
+        if (!sandboxProbe.ready) {
+          throw new Error(`claude_sandbox_runtime_failed:${sandboxProbe.reason}`);
+        }
+        sandboxRuntimeFingerprint = sandboxProbe.fingerprint;
+      }
+
       const settingsFile = createSandboxSettingsFile(
         (sessionTemp) => buildSandboxSettings({
           executable,
           workspace,
-          projectRoot,
-          projectSensitivePaths,
-          home,
           sessionTemp,
+          protectedPathSnapshot,
           networkAllowedDomains,
           sshAuthSock: sshAgent?.socketPath ?? null,
           allowedMcpServers: [...allowedMcpServers].sort(),
@@ -1547,10 +1680,8 @@ export class ClaudeCliRunner implements AgentRunner {
       const stableSandboxPolicy = buildSandboxSettings({
         executable,
         workspace,
-        projectRoot,
-        projectSensitivePaths,
-        home,
         sessionTemp: '<session-temp>',
+        protectedPathSnapshot,
         networkAllowedDomains,
         sshAuthSock: sshAgent?.socketPath ?? null,
         allowedMcpServers: [...allowedMcpServers].sort(),
@@ -1572,6 +1703,8 @@ export class ClaudeCliRunner implements AgentRunner {
           managedPolicy.hash,
           userMcpConfiguration.hash,
           stableSandboxPolicy,
+          protectedPathSnapshot.fingerprint,
+          sandboxRuntimeFingerprint,
           [...allowedMcpServers].sort(),
           [...requiredMcpServers].sort(),
           executable,
@@ -1642,15 +1775,51 @@ export class ClaudeCliRunner implements AgentRunner {
         });
       });
       let committed: 'cancelled' | 'timed_out' | null = null;
+      let terminationCause: 'cancelled' | 'timed_out' | 'protocol' | 'runtime' | 'provider' | null = null;
       let forcedKillSent = false;
       let resolveCloseDeadline: ((value: { code: null; signal: NodeJS.Signals; spawnError: string }) => void) | null = null;
       const closeDeadlinePromise = new Promise<{ code: null; signal: NodeJS.Signals; spawnError: string }>((resolve) => {
         resolveCloseDeadline = resolve;
       });
-      let state: ParsedProtocolState;
-      const requestTermination = (cause: string, outcome: 'cancelled' | 'timed_out' | null = null) => {
-        if (outcome && !committed) committed = outcome;
-        if (!outcome && state && !state.protocolError) state.protocolError = cause;
+      const state: ParsedProtocolState = {
+        sessionId: null,
+        initSessionId: null,
+        effectiveModel: null,
+        capabilityFingerprint: null,
+        instructionFingerprint: null,
+        skillFingerprint: null,
+        terminalResult: null,
+        primaryResults: [],
+        terminalFailure: null,
+        terminalResultCount: 0,
+        auxiliaryResultCount: 0,
+        continuationCount: 0,
+        initCount: 0,
+        apiRetryCount: 0,
+        permissionDenialCount: 0,
+        unknownEventCount: 0,
+        lastEvent: CANONICAL_EVENT.agentRunner.processStarted,
+        protocolError: null,
+        runtimeFailure: null
+      };
+      const requestTermination = (
+        cause: string,
+        kind: 'cancelled' | 'timed_out' | 'protocol' | 'runtime' | 'provider'
+      ) => {
+        if (terminationCause) {
+          if (
+            kind === 'protocol' &&
+            (cause === 'claude_process_group_cleanup_failed' || cause === 'claude_escaped_descendant_cleanup_failed')
+          ) {
+            state.protocolError = cause;
+          }
+          return;
+        }
+        terminationCause = kind;
+        if (kind === 'cancelled' || kind === 'timed_out') committed = kind;
+        else if (kind === 'runtime') state.runtimeFailure = cause;
+        else if (kind === 'provider') state.terminalFailure = cause;
+        else state.protocolError = cause;
         if (terminationLifecycle === 'closed' || forceKillTimer || closeDeadlineTimer) return;
         terminationLifecycle = 'terminating';
         killProcessGroup(child?.pid, 'SIGTERM');
@@ -1664,7 +1833,7 @@ export class ClaudeCliRunner implements AgentRunner {
           resolveCloseDeadline?.({ code: null, signal: 'SIGKILL', spawnError: 'claude_process_close_timeout' });
         }, TERMINATION_GRACE_MS + PROCESS_CLOSE_GRACE_MS);
       };
-      deliveryFailureHandler = () => requestTermination(eventDeliveryError ?? 'claude_event_delivery_failed');
+      deliveryFailureHandler = () => requestTermination(eventDeliveryError ?? 'claude_event_delivery_failed', 'protocol');
       emit({
         event: CANONICAL_EVENT.agentRunner.processStarted,
         session_id: expectedSessionId ?? undefined,
@@ -1672,23 +1841,6 @@ export class ClaudeCliRunner implements AgentRunner {
         turn_id: turnId
       });
 
-      state = {
-        sessionId: null,
-        initSessionId: null,
-        effectiveModel: null,
-        capabilityFingerprint: null,
-        instructionFingerprint: null,
-        skillFingerprint: null,
-        terminalResult: null,
-        terminalResultCount: 0,
-        auxiliaryResultCount: 0,
-        initCount: 0,
-        apiRetryCount: 0,
-        permissionDenialCount: 0,
-        unknownEventCount: 0,
-        lastEvent: CANONICAL_EVENT.agentRunner.processStarted,
-        protocolError: null
-      };
       let stderrBytes = 0;
       const stderrHash = crypto.createHash('sha256');
       child.stderr.on('data', (chunk: Buffer) => {
@@ -1702,6 +1854,7 @@ export class ClaudeCliRunner implements AgentRunner {
       const observedModels = new Set<string>();
       const emittedReroutes = new Set<string>();
       const observedToolIds = new Set<string>();
+      const toolNamesById = new Map<string, string>();
       const observedPermissionDenialIds = new Set<string>();
       const toolCounts: Record<string, number> = {};
       const mcpCounts: Record<string, number> = {};
@@ -1709,7 +1862,11 @@ export class ClaudeCliRunner implements AgentRunner {
       let firstAssistantAtMs: number | null = null;
       const failProtocol = (code: string) => {
         if (state.protocolError) return;
-        requestTermination(code);
+        requestTermination(code, 'protocol');
+      };
+      const failRuntime = (code: string) => {
+        if (state.runtimeFailure) return;
+        requestTermination(code, 'runtime');
       };
       const parseLine = (line: string) => {
         if (!line.trim() || state.protocolError) return;
@@ -1741,9 +1898,15 @@ export class ClaudeCliRunner implements AgentRunner {
 
         if (type === 'system' && subtype === 'init') {
           state.initCount += 1;
-          if (state.initCount > 1) {
+          const isContinuationInit = state.initCount > 1;
+          const previousRoundFingerprint = state.capabilityFingerprint;
+          if (isContinuationInit && state.terminalResultCount !== state.initCount - 1) {
             failProtocol(`claude_init_count:${state.initCount}`);
             return;
+          }
+          if (isContinuationInit) {
+            state.continuationCount += 1;
+            state.terminalResult = null;
           }
           if (!sessionId) {
             failProtocol('claude_init_session_missing');
@@ -1770,6 +1933,10 @@ export class ClaudeCliRunner implements AgentRunner {
             state.instructionFingerprint,
             state.skillFingerprint
           ]);
+          if (isContinuationInit && previousRoundFingerprint && previousRoundFingerprint !== state.capabilityFingerprint) {
+            failProtocol('claude_capability_fingerprint_drift');
+            return;
+          }
           if (expectedSessionId) {
             const previousFingerprint = this.capabilityFingerprintBySession.get(expectedSessionId);
             if (previousFingerprint && previousFingerprint !== state.capabilityFingerprint) {
@@ -1793,6 +1960,16 @@ export class ClaudeCliRunner implements AgentRunner {
             failProtocol(`claude_required_mcp_missing:${missingServers.sort().join(',')}`);
             return;
           }
+          if (isContinuationInit) {
+            emit({
+              event: CANONICAL_EVENT.agentRunner.activity,
+              session_id: state.sessionId ?? undefined,
+              thread_id: state.sessionId ? `claude:${state.sessionId}` : undefined,
+              turn_id: turnId,
+              detail: `claude_continuation_turn:${state.continuationCount}`
+            });
+            return;
+          }
           emit({
             event: CANONICAL_EVENT.agentRunner.sessionStarted,
             session_id: state.sessionId ?? undefined,
@@ -1808,16 +1985,35 @@ export class ClaudeCliRunner implements AgentRunner {
             state.auxiliaryResultCount += 1;
             return;
           }
-          if (state.initCount !== 1 || !state.initSessionId) {
+          if (state.initCount < 1 || !state.initSessionId) {
             failProtocol('claude_result_before_init');
             return;
           }
-          state.terminalResultCount += 1;
-          if (state.terminalResultCount > 1) {
-            failProtocol(`claude_terminal_result_count:${state.terminalResultCount}`);
+          if (state.terminalResultCount >= state.initCount) {
+            failProtocol(`claude_terminal_result_count:${state.terminalResultCount + 1}`);
             return;
           }
+          state.terminalResultCount += 1;
           state.terminalResult = payload;
+          state.primaryResults.push(payload);
+          const resultSessionId = readString(payload, 'session_id');
+          if (!resultSessionId) {
+            failProtocol('claude_terminal_session_missing');
+            return;
+          }
+          const permissionDenials = Array.isArray(payload.permission_denials) ? payload.permission_denials.length : 0;
+          if (permissionDenials > 0) {
+            state.permissionDenialCount += permissionDenials;
+            failRuntime('claude_permission_denied_under_sandbox');
+            return;
+          }
+          const resultSubtype = readString(payload, 'subtype');
+          const apiErrorStatus = boundedFailureSignal(payload.api_error_status);
+          const terminalReason = boundedFailureSignal(payload.terminal_reason ?? payload.stop_reason);
+          const resultFailure = resultSubtype !== 'success'
+            ? `claude_terminal_${resultSubtype ?? 'unknown'}${apiErrorStatus ? `:api_status=${apiErrorStatus}` : ''}${terminalReason ? `:reason=${terminalReason}` : ''}`
+            : payload.is_error !== false ? 'claude_terminal_is_error' : null;
+          if (resultFailure) requestTermination(resultFailure, 'provider');
           return;
         }
         if (type === 'system' && subtype === 'api_retry') {
@@ -1847,6 +2043,7 @@ export class ClaudeCliRunner implements AgentRunner {
             detail: `claude_permission_denied:${deniedTool}`,
             reason_code: REASON_CODES.claudePermissionDenied
           });
+          failRuntime('claude_permission_denied_under_sandbox');
           return;
         }
         if (type === 'assistant') {
@@ -1943,6 +2140,7 @@ export class ClaudeCliRunner implements AgentRunner {
               }
               observedToolIds.add(toolId);
               const boundedToolName = boundedTelemetryName(toolName);
+              toolNamesById.set(toolId, boundedToolName);
               toolCounts[boundedToolName] = (toolCounts[boundedToolName] ?? 0) + 1;
               const mcpServer = mcpServerFromToolName(boundedToolName);
               if (mcpServer) mcpCounts[mcpServer] = (mcpCounts[mcpServer] ?? 0) + 1;
@@ -1979,14 +2177,29 @@ export class ClaudeCliRunner implements AgentRunner {
             const rawToolId = readString(block, 'tool_use_id') ?? readString(block, 'toolUseId');
             if (!rawToolId) continue;
             const toolId = crypto.createHash('sha256').update(rawToolId).digest('hex');
+            const toolName = toolNamesById.get(toolId);
             emit({
               event: block.is_error === true ? CANONICAL_EVENT.codex.toolCallFailed : CANONICAL_EVENT.codex.toolCallCompleted,
               session_id: state.sessionId ?? undefined,
               turn_id: turnId,
               detail: block.is_error === true ? 'claude_tool_failed' : 'claude_tool_completed',
               tool_call_id: toolId,
+              tool_name: toolName,
               tool_call_evidence_source: 'worker_event'
             });
+            if (block.is_error === true && toolName === 'Bash') {
+              const category = sandboxRuntimeFailureCategory(block.content);
+              if (category) {
+                emit({
+                  event: CANONICAL_EVENT.agentRunner.activity,
+                  session_id: state.sessionId ?? undefined,
+                  turn_id: turnId,
+                  detail: category,
+                  reason_code: REASON_CODES.claudeSandboxRuntimeFailed
+                });
+                failRuntime(REASON_CODES.claudeSandboxRuntimeFailed);
+              }
+            }
           }
           return;
         }
@@ -2044,7 +2257,7 @@ export class ClaudeCliRunner implements AgentRunner {
       }, NESTED_PROCESS_SCAN_MS);
 
       const terminate = (outcome: 'cancelled' | 'timed_out') => {
-        if (committed) return;
+        if (terminationCause) return;
         requestTermination(outcome, outcome);
       };
       const abortListener = () => terminate('cancelled');
@@ -2099,11 +2312,9 @@ export class ClaudeCliRunner implements AgentRunner {
         }
       }
       const stderrDigest = stderrBytes > 0 ? stderrHash.digest('hex') : null;
-      const terminal = state.terminalResult;
-      const terminalPermissionDenials = terminal && Array.isArray(terminal.permission_denials)
-        ? terminal.permission_denials.length
-        : 0;
-      const permissionDenials = Math.max(state.permissionDenialCount, terminalPermissionDenials);
+      const terminal = state.primaryResults.at(-1) ?? null;
+      const aggregateTerminal = aggregateTerminalResults(state.primaryResults);
+      const permissionDenials = state.permissionDenialCount;
       const usageObservedAt = this.now().toISOString();
       const refreshedPartialUsage = partialUsageSnapshot(
         assistantSteps,
@@ -2119,9 +2330,9 @@ export class ClaudeCliRunner implements AgentRunner {
           auxiliaryResultCount: state.auxiliaryResultCount
         }
       );
-      let finalUsage = terminal
+      let finalUsage = aggregateTerminal
         ? usageFromResult(
-            terminal,
+            aggregateTerminal,
             state.effectiveModel,
             refreshedPartialUsage,
             state.apiRetryCount,
@@ -2145,7 +2356,7 @@ export class ClaudeCliRunner implements AgentRunner {
             toolCounts,
             mcpCounts,
             updatedAt: usageObservedAt,
-            missingReason: state.protocolError ?? 'claude_terminal_missing'
+            missingReason: state.runtimeFailure ?? state.protocolError ?? 'claude_terminal_missing'
           });
       if (finalUsage) {
         finalUsage = {
@@ -2192,6 +2403,7 @@ export class ClaudeCliRunner implements AgentRunner {
           last_event: event,
           error_code: state.protocolError ?? (committed === 'timed_out' ? REASON_CODES.turnTimeout : REASON_CODES.workerCancelRequested),
           error_detail: [
+            state.runtimeFailure ? `runtime_failure=${state.runtimeFailure}` : null,
             state.protocolError ? `containment_failure=${state.protocolError}` : null,
             stderrDigest ? `stderr_bytes=${stderrBytes};stderr_sha256=${stderrDigest}` : null
           ].filter(Boolean).join(';') || undefined,
@@ -2205,13 +2417,6 @@ export class ClaudeCliRunner implements AgentRunner {
         };
       }
 
-      const terminalSubtype = terminal ? readString(terminal, 'subtype') : null;
-      const apiErrorStatus = terminal ? boundedFailureSignal(terminal.api_error_status) : null;
-      const terminalReason = terminal ? boundedFailureSignal(terminal.terminal_reason ?? terminal.stop_reason) : null;
-      const terminalFailure = terminalSubtype !== 'success'
-        ? `claude_terminal_${terminalSubtype ?? 'unknown'}${apiErrorStatus ? `:api_status=${apiErrorStatus}` : ''}${terminalReason ? `:reason=${terminalReason}` : ''}`
-        : null;
-      const isError = terminal?.is_error !== false;
       const terminalSession = terminal ? readString(terminal, 'session_id') : null;
       const processCrash = close.spawnError || close.code !== 0
         ? `claude_process_exit:${close.code ?? close.signal ?? 'unknown'}`
@@ -2219,17 +2424,17 @@ export class ClaudeCliRunner implements AgentRunner {
       const failure =
         close.spawnError ||
         eventDeliveryError ||
+        state.runtimeFailure ||
         state.protocolError ||
-        (state.terminalResultCount !== 1 ? `claude_terminal_result_count:${state.terminalResultCount}` : null) ||
-        (state.initCount !== 1 ? `claude_init_count:${state.initCount}` : null) ||
+        state.terminalFailure ||
+        (state.terminalResultCount !== state.initCount ? `claude_terminal_result_count:${state.terminalResultCount}` : null) ||
+        (state.initCount < 1 ? `claude_init_count:${state.initCount}` : null) ||
         (!state.capabilityFingerprint ? 'claude_init_missing' : null) ||
         (!state.sessionId ? 'claude_session_id_missing' : null) ||
         (!state.initSessionId ? 'claude_init_session_missing' : null) ||
         (state.initSessionId !== state.sessionId ? 'claude_init_session_mismatch' : null) ||
         (!terminalSession ? 'claude_terminal_session_missing' : null) ||
         (terminalSession !== state.sessionId ? 'claude_terminal_session_mismatch' : null) ||
-        terminalFailure ||
-        (isError ? 'claude_terminal_is_error' : null) ||
         (permissionDenials > 0 ? 'claude_permission_denied_under_sandbox' : null) ||
         processCrash;
 
@@ -2253,7 +2458,9 @@ export class ClaudeCliRunner implements AgentRunner {
           requested_model: this.options.model,
           effective_model: state.effectiveModel,
           provider_usage: finalUsage ?? undefined,
-          retryable: Boolean(processCrash) && !state.protocolError
+          retryable: state.terminalFailure
+            ? isRetryableClaudeFailure(state.terminalFailure)
+            : Boolean(processCrash) && !state.protocolError && !state.runtimeFailure
             ? true
             : isRetryableClaudeFailure(failure ?? 'claude_terminal_missing')
         };
@@ -2264,7 +2471,7 @@ export class ClaudeCliRunner implements AgentRunner {
       this.retainSessionBinding(sessionId, binding, fingerprint);
 
       const providerUsage = finalUsage!;
-      for (const observedModel of effectiveModelsFromResult(terminal, state.effectiveModel)) {
+      for (const observedModel of effectiveModelsFromResult(aggregateTerminal ?? terminal, state.effectiveModel)) {
         if (observedModel === this.options.model) continue;
         if (emittedReroutes.has(observedModel)) continue;
         emit({
