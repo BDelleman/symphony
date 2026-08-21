@@ -10,6 +10,47 @@ export type ExecutionGraphEntityStatus =
   | 'timed_out'
   | 'stalled';
 
+export type ReviewApprovalActionStatus =
+  | 'pending_validation'
+  | 'approval_pending'
+  | 'approved'
+  | 'routing_pending'
+  | 'routed'
+  | 'failed'
+  | 'superseded';
+
+export interface ReviewApprovalActionRecord {
+  action_key: string;
+  project_key: string | null;
+  issue_id: string;
+  issue_identifier: string;
+  issue_run_id: string | null;
+  attempt_id: string | null;
+  thread_id: string | null;
+  turn_id: string | null;
+  symphony_attempt_id: string;
+  repository: string;
+  pr_number: number;
+  base_sha: string;
+  head_sha: string;
+  receipt_sha256: string;
+  review_artifact_sha256: string;
+  github_context_sha256: string;
+  requested_route: string;
+  effective_route: string | null;
+  app_slug: string | null;
+  app_login: string | null;
+  github_review_id: number | null;
+  github_review_state: string | null;
+  status: ReviewApprovalActionStatus;
+  reason_code: string | null;
+  created_at: string;
+  validated_at: string | null;
+  approved_at: string | null;
+  routed_at: string | null;
+  updated_at: string;
+}
+
 export type IdentityEvidence<T extends string = string> =
   | { status: 'present'; value: T }
   | { status: 'missing'; reason: string };

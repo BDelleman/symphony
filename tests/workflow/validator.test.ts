@@ -89,6 +89,19 @@ describe('ConfigValidator', () => {
     expect(validator.validate(baseConfig())).toEqual({ ok: true, at: expect.any(String) });
   });
 
+  it('requires durable fresh Agent Review dispatch for the GitHub App gate', () => {
+    const validator = new ConfigValidator();
+    const config = baseConfig();
+    config.review_approval = { provider: 'github_app', required: true };
+    config.tracker.active_states.push('Agent Review');
+    config.tracker.handoff_states = ['Agent Review'];
+    config.tracker.fresh_dispatch_states = ['Agent Review'];
+    expect(validator.validate(config).ok).toBe(true);
+
+    config.persistence.enabled = false;
+    expect(validator.validate(config)).toMatchObject({ ok: false, error_code: 'invalid_review_approval' });
+  });
+
   it('enforces supported tracker kind', () => {
     const validator = new ConfigValidator();
     const config = baseConfig();

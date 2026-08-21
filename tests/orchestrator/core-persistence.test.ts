@@ -331,7 +331,7 @@ describe('OrchestratorCore persistence', () => {
         expect.objectContaining({ turn_id: 'claude-turn-sqlite-1', input_tokens: 10, output_tokens: 2 }),
         expect.objectContaining({ turn_id: 'claude-turn-sqlite-2', input_tokens: 20, output_tokens: 4 })
       ]));
-      expect(store.historySchemaHealth()).toMatchObject({ status: 'healthy', applied_version: 14 });
+      expect(store.historySchemaHealth()).toMatchObject({ status: 'healthy', applied_version: 15 });
     } finally {
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });

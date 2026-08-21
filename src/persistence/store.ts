@@ -51,6 +51,7 @@ import type {
   PersistenceHealth,
   PersistenceHealthOptions,
   ProjectHistoryTicketSummaryPage,
+  ReviewApprovalActionRecord,
   RunTerminalStatus,
   StateTransitionRecord,
   TicketBlockerRecord,
@@ -183,6 +184,62 @@ export class SqlitePersistenceStore {
 
   historySchemaHealth(): HistorySchemaHealth {
     return this.readHistorySchemaHealth();
+  }
+
+  private appendRecoveredTerminalOutcomeIfMissing(params: {
+    issue_run_id: string;
+    outcome: RunTerminalStatus;
+    recorded_at: string;
+    reason_detail: string;
+  }): void {
+    const existing = this.db
+      .prepare('SELECT 1 FROM history_ticket_terminal_outcome WHERE issue_run_id = ? LIMIT 1')
+      .get(params.issue_run_id);
+    if (existing) return;
+    const latestAttempt = this.db
+      .prepare('SELECT attempt_id FROM attempt WHERE issue_run_id = ? ORDER BY attempt_number DESC LIMIT 1')
+      .get(params.issue_run_id) as { attempt_id: string } | undefined;
+    this.executionGraphWriter.appendTicketTerminalOutcome({
+      terminal_outcome_id: `terminal_outcome:recovered:${params.issue_run_id}`,
+      issue_run_id: params.issue_run_id,
+      attempt_id: latestAttempt?.attempt_id ?? null,
+      outcome: params.outcome,
+      reason_code: REASON_CODES.recoveredAfterRestart,
+      reason_detail: params.reason_detail,
+      recorded_at: params.recorded_at
+    });
+  }
+
+  private closeOpenLegacyRunProjections(params: {
+    issue_run_id: string;
+    ended_at: string;
+    terminal_status: RunTerminalStatus;
+    process_status: string;
+    workflow_outcome: string;
+    reason_detail: string;
+  }): number {
+    this.db
+      .prepare(
+        `UPDATE runs SET
+          ended_at = ?, completed_at = ?, terminal_status = ?, process_status = ?, workflow_outcome = ?,
+          terminal_reason_code = ?, terminal_reason_detail = ?
+         WHERE ended_at IS NULL AND run_id IN (
+           SELECT source_id
+           FROM history_identity_projection
+           WHERE source_table = 'runs' AND issue_run_id = ?
+         )`
+      )
+      .run(
+        params.ended_at,
+        params.ended_at,
+        params.terminal_status,
+        params.process_status,
+        params.workflow_outcome,
+        REASON_CODES.recoveredAfterRestart,
+        params.reason_detail,
+        params.issue_run_id
+      );
+    return Number((this.db.prepare('SELECT changes() AS changes').get() as { changes: number }).changes);
   }
 
   reconcileExecutionGraphAfterRestart(): { recovered: number; ambiguous: number } {
@@ -329,8 +386,62 @@ export class SqlitePersistenceStore {
           reason_code: REASON_CODES.recoveredAfterRestart,
           reason_detail: recoveryDetail
         });
+        this.appendRecoveredTerminalOutcomeIfMissing({
+          issue_run_id: row.issue_run_id,
+          outcome: recoveryStatus,
+          recorded_at: endedAt,
+          reason_detail: recoveryDetail
+        });
+        this.closeOpenLegacyRunProjections({
+          issue_run_id: row.issue_run_id,
+          ended_at: endedAt,
+          terminal_status: recoveryStatus,
+          process_status: recoveryStatus,
+          workflow_outcome: recoveryStatus,
+          reason_detail: recoveryDetail
+        });
       });
       recovered += 1;
+    }
+    const staleRunProjections = this.db
+      .prepare(
+        `SELECT DISTINCT issue_run.issue_run_id, issue_run.ended_at, issue_run.status,
+          issue_run.process_status, issue_run.workflow_outcome
+         FROM issue_run
+         JOIN history_identity_projection ON history_identity_projection.issue_run_id = issue_run.issue_run_id
+           AND history_identity_projection.source_table = 'runs'
+         JOIN runs ON runs.run_id = history_identity_projection.source_id
+         WHERE issue_run.ended_at IS NOT NULL
+           AND issue_run.status <> 'running'
+           AND runs.ended_at IS NULL`
+      )
+      .all() as Array<{
+      issue_run_id: string;
+      ended_at: string;
+      status: RunTerminalStatus;
+      process_status: string | null;
+      workflow_outcome: string | null;
+    }>;
+    for (const row of staleRunProjections) {
+      const recoveryDetail = 'Closed from the provably terminal execution graph during startup reconciliation.';
+      let repaired = 0;
+      this.transaction(() => {
+        this.appendRecoveredTerminalOutcomeIfMissing({
+          issue_run_id: row.issue_run_id,
+          outcome: row.status,
+          recorded_at: row.ended_at,
+          reason_detail: recoveryDetail
+        });
+        repaired = this.closeOpenLegacyRunProjections({
+          issue_run_id: row.issue_run_id,
+          ended_at: row.ended_at,
+          terminal_status: row.status,
+          process_status: row.process_status ?? row.status,
+          workflow_outcome: row.workflow_outcome ?? row.status,
+          reason_detail: recoveryDetail
+        });
+      });
+      recovered += repaired;
     }
     if (ambiguous > 0) {
       this.recordHistorySchemaState({
@@ -524,6 +635,88 @@ export class SqlitePersistenceStore {
 
   appendProviderUsageStepFact(params: AppendProviderUsageStepFactParams): string {
     return this.executionGraphWriter.appendProviderUsageStepFact(params);
+  }
+
+  upsertReviewApprovalAction(record: ReviewApprovalActionRecord): void {
+    const lineage = this.db.prepare(
+      `SELECT thread.thread_id, attempt.attempt_id, attempt.issue_run_id, issue_run.project_key
+       FROM thread
+       JOIN attempt ON attempt.attempt_id = thread.attempt_id
+       JOIN issue_run ON issue_run.issue_run_id = attempt.issue_run_id
+       WHERE thread.worker_instance_id = ?
+       ORDER BY thread.started_at DESC
+       LIMIT 1`
+    ).get(record.symphony_attempt_id) as {
+      thread_id: string;
+      attempt_id: string;
+      issue_run_id: string;
+      project_key: string | null;
+    } | undefined;
+    const turn = lineage
+      ? this.db.prepare('SELECT turn_id FROM turn WHERE thread_id = ? ORDER BY turn_index DESC LIMIT 1')
+          .get(lineage.thread_id) as { turn_id: string } | undefined
+      : undefined;
+    const boundRecord: ReviewApprovalActionRecord = {
+      ...record,
+      project_key: record.project_key ?? lineage?.project_key ?? null,
+      issue_run_id: record.issue_run_id ?? lineage?.issue_run_id ?? null,
+      attempt_id: record.attempt_id ?? lineage?.attempt_id ?? null,
+      thread_id: record.thread_id ?? lineage?.thread_id ?? null,
+      turn_id: record.turn_id ?? turn?.turn_id ?? null
+    };
+    this.db.prepare(
+      `INSERT INTO review_approval_action (
+        action_key, project_key, issue_id, issue_identifier, issue_run_id, attempt_id, thread_id, turn_id,
+        symphony_attempt_id, repository, pr_number, base_sha, head_sha, receipt_sha256,
+        review_artifact_sha256, github_context_sha256, requested_route, effective_route, app_slug, app_login,
+        github_review_id, github_review_state, status, reason_code, created_at, validated_at, approved_at, routed_at, updated_at
+      ) VALUES (
+        @action_key, @project_key, @issue_id, @issue_identifier, @issue_run_id, @attempt_id, @thread_id, @turn_id,
+        @symphony_attempt_id, @repository, @pr_number, @base_sha, @head_sha, @receipt_sha256,
+        @review_artifact_sha256, @github_context_sha256, @requested_route, @effective_route, @app_slug, @app_login,
+        @github_review_id, @github_review_state, @status, @reason_code, @created_at, @validated_at, @approved_at, @routed_at, @updated_at
+      ) ON CONFLICT(action_key) DO UPDATE SET
+        issue_run_id = excluded.issue_run_id,
+        attempt_id = excluded.attempt_id,
+        thread_id = excluded.thread_id,
+        turn_id = excluded.turn_id,
+        effective_route = excluded.effective_route,
+        app_slug = excluded.app_slug,
+        app_login = excluded.app_login,
+        github_review_id = excluded.github_review_id,
+        github_review_state = excluded.github_review_state,
+        status = excluded.status,
+        reason_code = excluded.reason_code,
+        validated_at = COALESCE(excluded.validated_at, review_approval_action.validated_at),
+        approved_at = COALESCE(excluded.approved_at, review_approval_action.approved_at),
+        routed_at = COALESCE(excluded.routed_at, review_approval_action.routed_at),
+        updated_at = excluded.updated_at`
+    ).run(boundRecord);
+  }
+
+  readReviewApprovalAction(actionKey: string): ReviewApprovalActionRecord | null {
+    const record = this.db.prepare('SELECT * FROM review_approval_action WHERE action_key = ?').get(actionKey) as
+      | ReviewApprovalActionRecord
+      | undefined;
+    return record ?? null;
+  }
+
+  listNonterminalReviewApprovalActions(): ReviewApprovalActionRecord[] {
+    return this.db.prepare(
+      "SELECT * FROM review_approval_action WHERE status IN ('pending_validation','approval_pending','approved','routing_pending') ORDER BY updated_at ASC"
+    ).all() as ReviewApprovalActionRecord[];
+  }
+
+  listReviewApprovalActions(issueIdentifier?: string, limit = 50): ReviewApprovalActionRecord[] {
+    const boundedLimit = Math.max(1, Math.min(limit, 200));
+    if (issueIdentifier) {
+      return this.db.prepare(
+        'SELECT * FROM review_approval_action WHERE issue_identifier = ? ORDER BY updated_at DESC LIMIT ?'
+      ).all(issueIdentifier, boundedLimit) as ReviewApprovalActionRecord[];
+    }
+    return this.db.prepare(
+      'SELECT * FROM review_approval_action ORDER BY updated_at DESC LIMIT ?'
+    ).all(boundedLimit) as ReviewApprovalActionRecord[];
   }
 
   reconstructThreadLineage(threadId: string): ExecutionGraphThreadLineage | null {

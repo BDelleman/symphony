@@ -27,6 +27,9 @@ tracker:
     - Canceled
     - Duplicate
     - Done
+review_approval:
+  provider: github_app
+  required: true
 polling:
   interval_ms: 5000
 workspace:
@@ -155,8 +158,8 @@ This is a fresh, independent review. Do not implement or land the change.
    - for cross-cutting work, `### Scope Comments Reviewed`, `### Scenario-To-Surface Trace`, `### Path Census`, and `### Invalid Evidence Check`, separating API/state/diagnostics, Dashboard/operator UI, and Persistence/history/audit evidence;
    - `### Findings`.
 9. Immediately before finalization, refresh Linear once and require state still `Agent Review`; capture the issue version and labels. Choose exactly one route: fixable P1/P2 to `In Progress` (`in_progress`); reset-level P1/P2 to `Rework` (`rework`); pass with UI/human judgment or a `Human Review` label to `Human Review` (`human_review`); otherwise pass to `Merging` (`merging`).
-10. Run `npm run review:governed -- finalize --body-file "<draft-file>" --route "<route>" [--issue-version "<integer>"]`. The command performs the adjacent explicit GitHub refresh, rejects capsule/PR/head/feedback drift, appends the canonical Verdict and v1 Review Receipt, and validates the final artifact. It never changes GitHub or Linear.
-11. Post the generated `final.md` as one normal Linear comment. Immediately refresh Linear again and require state still `Agent Review` and the chosen route still matches the current labels; then make the chosen state transition and stop. Do not repeat evidence in a second comment.
+10. Run `symphony review finalize --issue "{{ issue.identifier }}" --pr "<linked-pr-number>" --route "<route>" --body-file "<draft-file>"`. The installed command performs an adjacent GitHub refresh, rejects dirty/stale PR evidence, writes the v2 Review Receipt and final artifact under private Git metadata, and prints the terminal review envelope. It holds no reviewer App credentials and never changes GitHub or Linear.
+11. Post the generated `final.md` as one normal Linear comment. Return exactly the generated `SYMPHONY_REVIEW_OUTCOME_V1 ...` envelope as the final response, with no other text. Leave Linear in `Agent Review`; Symphony validates the receipt, owns the App approval, and performs the selected transition. Gate failure blocks in Agent Review and never falls back to Human Review.
 
 A Linear label named `Human Review` is an explicit human-review routing requirement. Match this label case-insensitively; labels are normalized to lowercase by the tracker model. The implementation workpad should contain `Review routing: Human Review label present` when observed. A pass without evidence-backed lens verdicts is invalid.
 
@@ -167,10 +170,10 @@ This is a fresh landing run. Do not redo implementation or formal review.
 
 1. Open and follow `.codex/skills/land/SKILL.md`.
 2. Refresh Linear by explicit ID and require state exactly `Merging`. Entering `Merging` is authoritative human approval; a remaining `Human Review` label is audit evidence, not a veto.
-3. Locate the latest `### Review Receipt` overall. It must be passing and match the issue ID, PR number, base SHA, and exact current head SHA. Missing, malformed, failed, or stale evidence blocks landing; route a changed base or head back to `Agent Review`.
+3. Locate the latest `### Review Receipt` overall. For gated runs it must be v2, passing, and match the issue ID, PR number, base SHA, and exact current head SHA. Require an exact-head `symphony-reviewer[bot]` approval. Missing, malformed, failed, stale, or v1-only evidence from a new gated run blocks landing; route a changed base or head back to `Agent Review`.
 4. Run:
 
-   `.codex/skills/land/scripts/land_watch.py --mode landing-readiness --expected-head "<head-sha>" --expected-base "<base-sha>" --json`
+   `.codex/skills/land/scripts/land_watch.py --mode landing-readiness --expected-head "<head-sha>" --expected-base "<base-sha>" --require-reviewer-app-approval --json`
 
 5. Immediately before merge, refresh Linear and require state still `Merging`; refresh the explicit GitHub PR number and require the same base and head; reread the latest Review Receipt overall and require it is still the same passing issue/PR/base/head receipt.
 6. Merge with `gh pr merge "<pr-number>" --merge --match-head-commit "<head-sha>"`. Never use admin override, force, or auto-merge.

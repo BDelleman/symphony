@@ -63,13 +63,13 @@ describe('workflow command examples', () => {
     expect(workflow).toContain('normalized to lowercase by the tracker model');
     expect(workflow).toContain('Review routing: Human Review label present');
     expect(workflow).toContain('otherwise pass to `Merging`');
-    expect(workflow).toContain('make the chosen state transition');
+    expect(workflow).toContain('Symphony validates the receipt, owns the App approval, and performs the selected transition');
     expect(workflow).toContain('npm run review:governed -- prepare --issue');
     expect(workflow).toContain('--pr "<linked-pr-number>"');
-    expect(workflow).toContain('npm run review:governed -- finalize --body-file');
+    expect(workflow).toContain('symphony review finalize --issue');
     expect(workflow.match(/review:governed -- prepare/g)).toHaveLength(1);
     expect(workflow).toContain('Do not query GitHub separately; the prepare command owns that snapshot');
-    expect(workflow).toContain('Immediately refresh Linear again');
+    expect(workflow).toContain('Leave Linear in `Agent Review`');
     expect(workflow).not.toContain('review_round');
   });
 

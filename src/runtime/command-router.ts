@@ -42,6 +42,7 @@ import {
   type WorkflowFilePlanEntry
 } from '../workflow/materializer';
 import { getPortableSkill, listPortableSkills } from '../workflow/portable-skill-catalog';
+import { runReviewCommand } from '../review';
 
 export interface DashboardLaunchContext {
   cwd: string;
@@ -99,7 +100,7 @@ export interface DashboardSupervisorSignalBinding {
   forwardedSignal: () => DashboardSupervisorSignal | null;
 }
 
-const SUPPORTED_COMMANDS = ['dashboard', 'doctor', 'setup', 'profile', 'init', 'link-local'] as const;
+const SUPPORTED_COMMANDS = ['dashboard', 'doctor', 'setup', 'profile', 'init', 'link-local', 'review'] as const;
 
 function defaultRepoRoot(): string {
   let current = __dirname;
@@ -1346,6 +1347,15 @@ export async function runCommandRouter(options: RunCommandRouterOptions): Promis
       deps.stdout(doctor.human);
     }
     return doctor.result.exitCode;
+  }
+
+  if (command === 'review') {
+    return runReviewCommand(rest, {
+      cwd: deps.cwd,
+      env: deps.env,
+      stdout: deps.stdout,
+      stderr: deps.stderr
+    });
   }
 
   return failUnsupported(

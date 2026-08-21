@@ -110,6 +110,21 @@ export const CANONICAL_EVENT = {
     turnCancelled: 'agent_runner.turn.cancelled',
     turnTimedOut: 'agent_runner.turn.timed_out'
   },
+  reviewApproval: {
+    requested: 'review_approval.requested',
+    validated: 'review_approval.validated',
+    reused: 'review_approval.reused',
+    submitted: 'review_approval.submitted',
+    confirmed: 'review_approval.confirmed',
+    routingPending: 'review_approval.routing_pending',
+    routeCompleted: 'review_approval.route_completed',
+    contextMismatch: 'review_approval.context_mismatch',
+    headChanged: 'review_approval.head_changed',
+    credentialsInvalid: 'review_approval.credentials_invalid',
+    githubFailed: 'review_approval.github_failed',
+    readbackFailed: 'review_approval.readback_failed',
+    superseded: 'review_approval.superseded'
+  },
   workspace: {
     provisionStart: 'workspace.provision.start',
     provisionSuccess: 'workspace.provision.success',

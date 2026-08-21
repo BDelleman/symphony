@@ -977,7 +977,12 @@ describe('LocalRunnerBridge integration', () => {
           'model_reasoning_effort=high',
           'app-server'
         ],
-        commandEnv: { BAZ: 'qux', CODEX_HOME: '/tmp/codex-home', FOO: 'bar' }
+        commandEnv: expect.objectContaining({
+          BAZ: 'qux',
+          CODEX_HOME: '/tmp/codex-home',
+          FOO: 'bar',
+          SYMPHONY_ATTEMPT_ID: expect.any(String)
+        })
       })
     );
     expect(events.some((event) => event.detail === 'codex_command_legacy_path_used')).toBe(false);
@@ -1024,7 +1029,7 @@ describe('LocalRunnerBridge integration', () => {
       expect.objectContaining({
         command: 'codex app-server',
         commandArgs: undefined,
-        commandEnv: undefined
+        commandEnv: expect.objectContaining({ SYMPHONY_ATTEMPT_ID: expect.any(String) })
       })
     );
     expect(events).toEqual([

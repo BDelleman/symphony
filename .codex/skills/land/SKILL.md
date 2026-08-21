@@ -12,7 +12,7 @@ Use this skill only for the landing phase. Do not redo implementation, formal Ag
 - `gh` is authenticated and the working tree is clean.
 - Linear MCP is connected; never fall back to raw HTTP or `LINEAR_API_KEY`.
 - The Linear issue is exactly `Merging`.
-- A passing Agent Review receipt identifies the current PR and exact head SHA.
+- A passing v2 Agent Review receipt identifies the current PR and exact head SHA, and the reviewer App approved that exact head.
 
 Entering `Merging` is authoritative human approval. A remaining `Human Review` label is audit evidence, not a veto after the state transition.
 
@@ -20,7 +20,7 @@ Entering `Merging` is authoritative human approval. A remaining `Human Review` l
 
 1. Locate the PR for the current branch and capture its number and head SHA.
 2. Refresh the Linear issue. Require state `Merging` and capture its issue version and labels.
-3. Locate the latest Agent Review receipt overall. It must be passing and identify the same issue ID, PR number, base SHA, and head SHA. Missing, failed, malformed, or stale evidence blocks landing. Route a changed base or head back to `Agent Review`.
+3. Locate the latest Agent Review receipt overall. New gated runs require v2. It must be passing and identify the same issue ID, PR number, base SHA, and head SHA. Require the exact current head to have an `APPROVED` review from `symphony-reviewer[bot]`; aggregate review decision or another reviewer does not satisfy this gate. Missing, failed, malformed, stale, or v1-only gated evidence blocks landing. Route a changed base or head back to `Agent Review`.
 4. Require a clean worktree. Reuse exact-head CI and the review receipt; do not rerun implementation validation.
 5. Run the bounded readiness watcher:
 
@@ -29,6 +29,7 @@ Entering `Merging` is authoritative human approval. A remaining `Human Review` l
      --mode landing-readiness \
      --expected-head "$head_sha" \
      --expected-base "$base_sha" \
+     --require-reviewer-app-approval \
      --json
    ```
 

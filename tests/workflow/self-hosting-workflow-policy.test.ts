@@ -20,7 +20,8 @@ describe('Symphony self-hosting workflow policy', () => {
     expect(workflow).toContain('The PR body must include Summary, Spec Alignment with relevant `SPEC.md`');
     expect(workflow).toContain('Review routing: Human Review label present');
     expect(workflow).toContain('npm run review:governed -- prepare --issue');
-    expect(workflow).toContain('npm run review:governed -- finalize --body-file');
+    expect(workflow).toContain('symphony review finalize --issue');
+    expect(workflow).toContain('Return exactly the generated `SYMPHONY_REVIEW_OUTCOME_V1');
     expect(workflow).toContain('`Done` is only allowed after the exact reviewed PR head is confirmed merged');
   });
 

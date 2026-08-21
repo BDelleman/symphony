@@ -21,6 +21,7 @@ import type {
   PersistenceHealth,
   PersistenceHealthOptions,
   ProjectHistoryTicketSummaryPage,
+  ReviewApprovalActionRecord,
   TicketTimelineRecord,
   UiContinuityState
 } from '../persistence';
@@ -109,6 +110,7 @@ export interface DiagnosticsSource {
   getPersistenceHealth(options?: PersistenceHealthOptions): PersistenceHealth;
   listRunHistory(limit?: number): DurableRunHistoryRecord[];
   listCompletedProviderUsageTotals?: (excludeIssueRunIds?: string[]) => CompletedProviderUsageTotal[];
+  listReviewApprovalActions?: (issueIdentifier?: string, limit?: number) => ReviewApprovalActionRecord[];
   reconstructThreadLineage?: (threadId: string) => ExecutionGraphThreadLineage | null;
   reconstructLatestThreadLineageByIssueIdentifier?: (issueIdentifier: string) => ExecutionGraphThreadLineage | null;
   listProjectTicketIdentities?: (
@@ -1276,6 +1278,7 @@ export type ApiStateSnapshotResponse = ApiStateResponse | ApiStateErrorResponse;
 export interface ApiIssueResponse extends SnapshotFreshnessFields, ApiDegradedFields {
   issue_identifier: string;
   issue_id: string;
+  review_approval_actions?: ReviewApprovalActionRecord[];
   status: 'running' | 'retrying' | 'blocked';
   operator_actions: OperatorActionProjection[];
   operator_explainer: OperatorExplainer;

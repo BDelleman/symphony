@@ -4,7 +4,7 @@ import type { PersistenceDatabase } from './store-context';
 import type { HistorySchemaHealth } from './types';
 
 export const HISTORY_SCHEMA_NAME = 'project_execution_history';
-export const HISTORY_SCHEMA_VERSION = 14;
+export const HISTORY_SCHEMA_VERSION = 15;
 
 export interface HistorySchemaStateParams {
   appliedVersion: number;

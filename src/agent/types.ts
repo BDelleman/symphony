@@ -5,6 +5,7 @@ import type {
   CodexRunnerStartInput,
   CodexTurnErrorCode
 } from '../codex/types';
+import type { AgentReviewOutcome } from '../review';
 
 export type AgentRuntime = 'codex-app-server' | 'claude-cli';
 
@@ -86,6 +87,7 @@ export interface AgentRunnerStartInput extends Omit<CodexRunnerStartInput, 'onEv
     issue_id: string;
     issue_identifier: string;
     attempt: number | null;
+    symphony_attempt_id?: string;
   };
 }
 
@@ -109,6 +111,7 @@ export interface AgentRunResult {
   requested_model?: string | null;
   effective_model?: string | null;
   retryable?: boolean;
+  review_outcome?: AgentReviewOutcome | null;
 }
 
 export interface AgentRunner {

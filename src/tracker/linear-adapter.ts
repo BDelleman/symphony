@@ -1,5 +1,5 @@
 import { TrackerAdapterError } from './errors';
-import type { Issue, IssueBlockerRef, IssuePullRequestLink, TrackerAdapter } from './types';
+import type { Issue, IssueBlockerRef, IssuePullRequestLink, TrackerAdapter, TrackerComment } from './types';
 
 interface LinearAdapterOptions {
   endpoint: string;
@@ -222,7 +222,8 @@ function normalizeIssue(rawIssue: Record<string, unknown>): Issue {
     },
     has_github_issue_link: hasGithubIssueLink,
     created_at: parseIsoDate(rawIssue.createdAt),
-    updated_at: parseIsoDate(rawIssue.updatedAt)
+    updated_at: parseIsoDate(rawIssue.updatedAt),
+    version: typeof rawIssue.version === 'number' && Number.isInteger(rawIssue.version) ? rawIssue.version : null
   };
 }
 
@@ -302,7 +303,7 @@ query Issues($projectSlug: String!, $stateNames: [String!], $after: String, $fir
 
 export function buildIssuesByAssigneeQuery(): string {
   return `
-query IssuesByAssignee($projectSlug: String!, $stateNames: [String!], $assigneeId: String!, $after: String, $first: Int!) {
+query IssuesByAssignee($projectSlug: String!, $stateNames: [String!], $assigneeId: ID!, $after: String, $first: Int!) {
   issues(
     filter: {
       project: { slugId: { eq: $projectSlug } }
@@ -439,6 +440,23 @@ mutation CreateComment($issueId: String!, $body: String!) {
 }`;
 }
 
+export function buildIssueCommentsQuery(): string {
+  return `
+query IssueComments($issueId: String!, $after: String) {
+  issue(id: $issueId) {
+    comments(first: 100, after: $after) {
+      nodes {
+        id
+        body
+        createdAt
+        updatedAt
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}`;
+}
+
 export function buildIssueStateOptionsQuery(): string {
   return `
 query IssueStateOptions($issueId: String!) {
@@ -528,6 +546,29 @@ export class LinearTrackerAdapter implements TrackerAdapter {
     if (!commentCreate || !readBoolean(commentCreate.success)) {
       throw new TrackerAdapterError('linear_unknown_payload', 'Linear payload missing data.commentCreate.success');
     }
+  }
+
+  async fetch_issue_comments(issue_id: string): Promise<TrackerComment[]> {
+    const output: TrackerComment[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < 100; page += 1) {
+      const payload = await this.graphqlRequest(buildIssueCommentsQuery(), { issueId: issue_id, after });
+      const data = readObject(payload.data);
+      const issue = data ? readObject(data.issue) : null;
+      const connection = issue ? readObject(issue.comments) : null;
+      const comments = connection ? readNodes(connection) : [];
+      output.push(...comments.map((comment) => ({
+        id: readString(comment.id),
+        body: readString(comment.body),
+        created_at: parseIsoDate(comment.createdAt),
+        updated_at: parseIsoDate(comment.updatedAt)
+      })));
+      const pageInfo = connection ? readObject(connection.pageInfo) : null;
+      if (pageInfo?.hasNextPage !== true) return output;
+      after = readString(pageInfo.endCursor) || null;
+      if (!after) throw new TrackerAdapterError('linear_missing_end_cursor', 'Linear comments pagination cursor is missing');
+    }
+    throw new TrackerAdapterError('linear_unknown_payload', 'Linear comments pagination exceeded the supported limit');
   }
 
   async update_issue_state(issue_id: string, state_name: string): Promise<void> {

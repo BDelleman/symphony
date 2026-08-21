@@ -367,7 +367,7 @@ describe('SqlitePersistenceStore identity', () => {
 
     const storeB = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
     stores.push(storeB);
-    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
+    expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 15, status: 'healthy' });
     expect(storeB.listProjectTicketIdentities(newEvidence.project.key).total).toBe(1);
     expect(storeB.reconstructTicketTimeline(newEvidence).issue_runs).toHaveLength(1);
     storeB.close();
@@ -375,7 +375,7 @@ describe('SqlitePersistenceStore identity', () => {
 
     const storeC = new SqlitePersistenceStore({ dbPath, retentionDays: 14 });
     stores.push(storeC);
-    expect(storeC.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
+    expect(storeC.historySchemaHealth()).toMatchObject({ applied_version: 15, status: 'healthy' });
     expect(storeC.reconstructTicketTimeline(newEvidence).issue_runs).toHaveLength(1);
 
     const dbC = openDatabase(dbPath);
@@ -642,7 +642,7 @@ describe('SqlitePersistenceStore identity', () => {
     stores.push(storeB);
     const backfillDbB = openDatabase(dbPath);
     try {
-      expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 14, status: 'healthy' });
+      expect(storeB.historySchemaHealth()).toMatchObject({ applied_version: 15, status: 'healthy' });
       expect(backfillDbB.prepare('SELECT COUNT(*) AS count FROM history_identity_projection').get()).toEqual({ count: 3 });
     } finally {
       backfillDbB.close();
