@@ -374,6 +374,7 @@ export class WorkspaceManager {
   async prepareAttempt(workspacePath: string, options: WorkspacePrepareAttemptOptions = {}): Promise<void> {
     const resolved = path.resolve(workspacePath);
     this.assertLaunchSafety({ workspacePath: resolved, cwd: resolved });
+    await this.removeEscapedVirtualenvs(resolved);
     this.assertNoSensitiveFiles(resolved);
 
     for (const artifact of TEMP_ARTIFACTS) {
@@ -383,6 +384,58 @@ export class WorkspaceManager {
 
     await this.runHookOrThrow('before_run', resolved);
     this.assertNoSensitiveFiles(resolved);
+  }
+
+  // Remove only untracked .venv directories that the complete sensitive-file
+  // audit has already identified as carrying escaped interpreter links. Any
+  // tracked, ambiguous, differently named, or incompletely audited directory
+  // remains untouched and is rejected by the normal fail-closed audit.
+  private async removeEscapedVirtualenvs(workspacePath: string): Promise<void> {
+    const audit = auditSensitiveWorkspaceFiles(workspacePath);
+    if (!audit.complete) return;
+
+    const candidates = new Set<string>();
+    for (const violation of audit.violations) {
+      if (violation.category !== 'symlink_escape') continue;
+      const segments = violation.path.replace(/\\/g, '/').split('/').filter(Boolean);
+      const venvIndex = segments.lastIndexOf('.venv');
+      if (venvIndex < 0) continue;
+      const binDirectory = segments[venvIndex + 1]?.toLowerCase();
+      if (binDirectory !== 'bin' && binDirectory !== 'scripts') continue;
+      const relativeVenv = segments.slice(0, venvIndex + 1).join('/');
+      try {
+        const marker = await fs.lstat(path.join(workspacePath, relativeVenv, 'pyvenv.cfg'));
+        if (!marker.isFile()) continue;
+      } catch {
+        continue;
+      }
+      const tracked = await this.runGit({ cwd: workspacePath, args: ['ls-files', '--', relativeVenv] });
+      if (tracked === null || tracked.trim().length > 0) continue;
+      candidates.add(relativeVenv);
+    }
+
+    const removed: Array<{ path: string; action: 'remove' }> = [];
+    for (const relativeVenv of candidates) {
+      try {
+        await fs.rm(path.join(workspacePath, relativeVenv), { recursive: true, force: true });
+      } catch {
+        throw new WorkspaceError(
+          'workspace_sensitive_file_detected',
+          JSON.stringify({ detail: 'virtualenv_cleanup_failed', path: relativeVenv })
+        );
+      }
+      removed.push({ path: relativeVenv, action: 'remove' });
+    }
+    if (removed.length > 0) {
+      this.onPreflightResult?.({
+        identifier: path.basename(workspacePath),
+        workspace_path: workspacePath,
+        status: 'cleaned',
+        cleaned_files: removed,
+        conflict_files: [],
+        resolution_hints: []
+      });
+    }
   }
 
   private assertNoSensitiveFiles(workspacePath: string): void {
