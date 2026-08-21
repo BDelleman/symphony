@@ -1339,7 +1339,7 @@ export function findNestedClaudeDescendant(
   executable: string,
   rows = readProcessRows(),
   inspector: ProcessInspector = hostProcessInspector
-): number | null {
+): ProcessRow | null {
   if (!rootPid) return null;
   const resolvesToExecutable = (candidate: string): boolean => {
     if (!path.isAbsolute(candidate)) return false;
@@ -1355,7 +1355,7 @@ export function findNestedClaudeDescendant(
         if (inspector.realpath(`/proc/${row.pid}/exe`) === executable) {
           const argv = inspector.readArgv(row.pid);
           if (argv && isClaudeSandboxShellLauncher(argv)) continue;
-          return row.pid;
+          return row;
         }
       } catch {
         // The process may have exited between ps and /proc inspection.
@@ -1363,7 +1363,7 @@ export function findNestedClaudeDescendant(
     }
     const argv = row.args.trim().split(/\s+/).slice(0, 2);
     if (resolvesToExecutable(row.command) || argv.some(resolvesToExecutable)) {
-      return row.pid;
+      return row;
     }
   }
   return null;
@@ -2295,6 +2295,7 @@ export class ClaudeCliRunner implements AgentRunner {
         });
       }, HEARTBEAT_MS);
       const observedDescendantPids = new Map<number, string>();
+      let suspectedNestedRow: ProcessRow | null = null;
       const nestedProcessMonitor = setInterval(() => {
         const processRows = readProcessRows();
         for (const descendant of descendantProcessRows(child?.pid, processRows)) {
@@ -2302,10 +2303,33 @@ export class ClaudeCliRunner implements AgentRunner {
             observedDescendantPids.set(descendant.pid, processRowIdentity(descendant));
           }
         }
-        const nestedPid = findNestedClaudeDescendant(child?.pid, executable, processRows);
-        if (nestedPid && !state.protocolError) {
-          failProtocol('claude_nested_runtime_detected');
+        const nestedRow = findNestedClaudeDescendant(child?.pid, executable, processRows);
+        if (!nestedRow) {
+          suspectedNestedRow = null;
+          return;
         }
+        if (state.protocolError) return;
+        // Children forked by the sandbox shell supervisor inherit the claude
+        // executable until their execve of the actual tool command completes,
+        // and /proc/<pid>/cmdline can be unreadable inside that window, so a
+        // single sighting is not proof of a nested runtime. Fail only when the
+        // same pid is still a nested claude on the next scan: a transient
+        // pipeline stage has exec'd its target by then, while a real nested
+        // session persists.
+        if (suspectedNestedRow?.pid !== nestedRow.pid) {
+          suspectedNestedRow = nestedRow;
+          return;
+        }
+        emit({
+          event: CANONICAL_EVENT.agentRunner.activity,
+          session_id: state.sessionId ?? undefined,
+          turn_id: turnId,
+          detail: `claude_nested_runtime_detected: pid=${nestedRow.pid} comm=${nestedRow.command} args=${trimUtf8(
+            nestedRow.args,
+            512
+          )}`
+        });
+        failProtocol('claude_nested_runtime_detected');
       }, NESTED_PROCESS_SCAN_MS);
 
       const terminate = (outcome: 'cancelled' | 'timed_out') => {

@@ -123,6 +123,19 @@ process.stdin.on('end', () => {
     skills: ['linear']
   };
   const result = { type: 'result', subtype: 'success', is_error: false, session_id: '${SESSION_ID}', result: 'done', num_turns: 3, total_cost_usd: 0.0123, usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 } };
+  if (process.env.MOCK_MODE === 'nested-process-transient') {
+    const { spawn } = require('node:child_process');
+    const nested = spawn(process.env.MOCK_NESTED_CLAUDE, [], {
+      stdio: 'ignore',
+      env: { ...process.env, MOCK_MODE: 'hang' }
+    });
+    setTimeout(() => { try { nested.kill('SIGKILL'); } catch {} }, 1500);
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify(init) + '\\n' + JSON.stringify(result) + '\\n');
+      process.exit(0);
+    }, 3200);
+    return;
+  }
   if (process.env.MOCK_MODE === 'oversized-line') { process.stdout.write('x'.repeat(8 * 1024 * 1024 + 1)); setInterval(() => {}, 1000); return; }
   if (process.env.MOCK_MODE === 'split-utf8') {
     result.result = 'café';
@@ -1392,6 +1405,23 @@ describe('ClaudeCliRunner', () => {
     });
   });
 
+  it('tolerates a transient claude-exe descendant that exits before the confirmation scan', async () => {
+    const fixture = createFixture();
+    const result = await new ClaudeCliRunner({
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture, { MOCK_MODE: 'nested-process-transient' }),
+      homedir: () => fixture.root
+    }).startSessionAndRunTurn({ ...startInput(fixture.root), turnTimeoutMs: 15_000 });
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      last_agent_message: 'done'
+    });
+  });
+
   it('kills an escaped descendant without failing an otherwise successful invocation', async () => {
     const fixture = createFixture();
     const pidFile = path.join(fixture.root, 'escaped.pid');
@@ -1666,6 +1696,6 @@ describe('isClaudeSandboxShellLauncher', () => {
     rows.push({ pid: 140, ppid: 130, started: 'start-140', command: 'claude', args: 'claude --print' });
     executableByPid.set(140, executable);
     argvByPid.set(140, [executable, '--print', '--model', 'claude-sonnet-4-6']);
-    expect(findNestedClaudeDescendant(rootPid, executable, rows, inspector)).toBe(140);
+    expect(findNestedClaudeDescendant(rootPid, executable, rows, inspector)?.pid).toBe(140);
   });
 });
