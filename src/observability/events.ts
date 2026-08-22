@@ -116,6 +116,7 @@ export const CANONICAL_EVENT = {
     reused: 'review_approval.reused',
     submitted: 'review_approval.submitted',
     confirmed: 'review_approval.confirmed',
+    artifactPublished: 'review_approval.artifact_published',
     routingPending: 'review_approval.routing_pending',
     routeCompleted: 'review_approval.route_completed',
     contextMismatch: 'review_approval.context_mismatch',

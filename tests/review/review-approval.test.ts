@@ -217,4 +217,89 @@ describe('ReviewApprovalCoordinator', () => {
     expect(events).toContain('approved');
     expect(tracker.update_issue_state).toHaveBeenCalledWith('linear-id', 'Merging');
   });
+
+  it('publishes the capsule artifact itself when the worker comment is missing or drifted', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'symphony-review-coordinator-'));
+    dirs.push(root);
+    execFileSync('git', ['init', '-b', 'feature/NIE-574'], { cwd: root });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: root });
+    await fs.writeFile(path.join(root, 'README.md'), 'review\n');
+    execFileSync('git', ['add', 'README.md'], { cwd: root });
+    execFileSync('git', ['commit', '-m', 'docs: review'], { cwd: root });
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/nielsgl/symphony.git'], { cwd: root });
+    const actualHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    const artifact = reviewBody();
+    const receipt: ReviewReceiptV2 = {
+      version: 2, issue_id: 'NIE-574', issue_version: null, repository: 'nielsgl/symphony', pr_number: 574,
+      base_ref: 'main', base_sha: baseSha, head_sha: actualHead, verdict: 'pass', route: 'merging',
+      symphony_attempt_id: 'attempt-1', review_artifact_sha256: reviewSha256(artifact),
+      github_context_sha256: 'e'.repeat(64), created_at: '2026-08-21T10:00:00.000Z'
+    };
+    const finalMarkdown = `${artifact}\n### Review Receipt\n${JSON.stringify(receipt)}\n`;
+    const capsule = path.join(root, '.git', 'symphony-review', actualHead);
+    await fs.mkdir(capsule, { recursive: true });
+    await fs.writeFile(path.join(capsule, 'final.md'), finalMarkdown);
+    const terminal = outcome({
+      head_sha: actualHead,
+      review_receipt_sha256: receiptSha256(receipt),
+      review_artifact_sha256: receipt.review_artifact_sha256
+    });
+    let state = 'Agent Review';
+    const issue: Issue = {
+      id: 'linear-id', identifier: 'NIE-574', title: 'Review', description: null, priority: null, state,
+      branch_name: 'feature/NIE-574', url: null, labels: [], blocked_by: [], created_at: null, updated_at: null,
+      tracker_meta: { tracker_kind: 'linear', repository: 'nielsgl/symphony', pr_links: [
+        { number: 574, url: 'https://github.com/nielsgl/symphony/pull/574', state: 'open', merged: false }
+      ] }
+    };
+    // The worker paraphrased the review into the tracker: the receipt JSON
+    // survived but the artifact text drifted, so its hash no longer matches.
+    const drifted = `${artifact.replace('Approval identity', 'The approval identity')}\n### Review Receipt\n${JSON.stringify(receipt)}\n`;
+    const published: string[] = [];
+    const tracker: TrackerAdapter = {
+      fetch_candidate_issues: vi.fn(async () => []),
+      fetch_issues_by_states: vi.fn(async () => []),
+      fetch_issue_states_by_ids: vi.fn(async () => [{ ...issue, state }]),
+      fetch_issue_comments: vi.fn(async () => [
+        { id: 'comment-1', body: drifted, created_at: null, updated_at: null },
+        ...published.map((body, index) => ({ id: `posted-${index}`, body, created_at: null, updated_at: null }))
+      ]),
+      create_comment: vi.fn(async (_id, body) => { published.push(body); }),
+      update_issue_state: vi.fn(async (_id, nextState) => { state = nextState; })
+    };
+    const snapshot: GitHubPullRequestSnapshot = {
+      repository: 'nielsgl/symphony', number: 574, base_ref: 'main', base_sha: baseSha, head_sha: actualHead,
+      title: 'Review', body: '', draft: false, state: 'open', checks_green: true, review_decision: 'APPROVED',
+      semantic_context: {}, context_sha256: receipt.github_context_sha256
+    };
+    const coordinator = new ReviewApprovalCoordinator({
+      tracker, projectRoot: root, workspaceRoot: path.join(root, 'workspaces'),
+      managedWorkspaceRoot: path.join(root, 'workspaces'), baseRef: 'origin/main',
+      env: { SYMPHONY_REVIEWER_APP_ID: '1', SYMPHONY_REVIEWER_INSTALLATION_ID: '2' },
+      githubClient: { fetchSnapshot: vi.fn(async () => snapshot) } as any,
+      brokerFactory: () => ({
+        separatedIdentity: vi.fn(async () => ({ slug: 'symphony-reviewer', login: 'symphony-reviewer[bot]', app_id: '1', installation_id: '2' })),
+        approve: vi.fn(async () => ({ identity: {} as any, review_id: 99, reused: false }))
+      }),
+      actionLedger: { upsertReviewApprovalAction: vi.fn() }
+    });
+    const result = await coordinator.process({
+      issue, outcome: terminal, workspace: { path: root, workspace_key: 'NIE-574', created_now: false },
+      symphonyAttemptId: 'attempt-1'
+    });
+    expect(result).toMatchObject({ ok: true, state: 'Merging' });
+    expect(published).toEqual([finalMarkdown]);
+
+    // Without a hash-matching capsule the gate still fails closed.
+    await fs.rm(path.join(capsule, 'final.md'));
+    published.splice(0);
+    state = 'Agent Review';
+    const second = await coordinator.process({
+      issue, outcome: terminal, workspace: { path: root, workspace_key: 'NIE-574', created_now: false },
+      symphonyAttemptId: 'attempt-1'
+    });
+    expect(second).toMatchObject({ ok: false, reason_code: 'review_approval_context_mismatch' });
+    expect(published).toEqual([]);
+  });
 });
