@@ -1,5 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 import type { StructuredLogger } from '../observability';
 import { CANONICAL_EVENT } from '../observability/events';
@@ -7,6 +9,7 @@ import { REASON_CODES } from '../observability/reason-codes';
 import type { Issue, TrackerAdapter } from '../tracker';
 import type { WorkspaceInfo } from '../workspace';
 import type { ReviewApprovalActionRecord, ReviewApprovalActionStatus } from '../persistence';
+import { resolveWorkspaceGitDirectory } from './capsule';
 import { extractReviewArtifact, extractReviewReceipt, receiptSha256, reviewSha256 } from './contract';
 import { GitHubAppApprovalBroker } from './github-app-broker';
 import { GitHubReviewClient, parseGitHubRemote } from './github-context';
@@ -274,8 +277,7 @@ export class ReviewApprovalCoordinator {
       if (links.length !== 1 || links[0]!.number !== params.outcome.pr_number) {
         return fail('review_approval_pr_binding_ambiguous');
       }
-      const comments = await this.options.tracker.fetch_issue_comments(params.issue.id);
-      const artifacts = comments.flatMap((comment) => {
+      const matchPublishedArtifacts = (comments: { body: string }[]) => comments.flatMap((comment) => {
         const receipt = extractReviewReceipt(comment.body);
         const artifact = extractReviewArtifact(comment.body);
         return receipt && artifact ? [{ receipt, artifact }] : [];
@@ -283,6 +285,45 @@ export class ReviewApprovalCoordinator {
         receiptSha256(receipt) === params.outcome.review_receipt_sha256
         && reviewSha256(artifact) === params.outcome.review_artifact_sha256
       );
+      let artifacts = matchPublishedArtifacts(await this.options.tracker.fetch_issue_comments(params.issue.id));
+      if (artifacts.length === 0) {
+        // The workflow asks the worker to publish final.md as a tracker
+        // comment, but an agent copying kilobytes of markdown by hand drifts
+        // often enough that a receipt-verified review was discarded as
+        // unpublished. The capsule written by `review finalize` holds the
+        // canonical bytes; when they hash-match the outcome, the supervisor
+        // publishes them itself and re-reads. A capsule that does not match
+        // the outcome, or anything other than exactly one published match
+        // afterwards, still fails closed.
+        const gitDirectory = resolveWorkspaceGitDirectory(params.workspace.path);
+        let finalMarkdown: string | null = null;
+        try {
+          finalMarkdown = gitDirectory
+            ? fs.readFileSync(path.join(gitDirectory, 'symphony-review', params.outcome.head_sha, 'final.md'), 'utf8')
+            : null;
+        } catch {
+          finalMarkdown = null;
+        }
+        const capsuleReceipt = finalMarkdown ? extractReviewReceipt(finalMarkdown) : null;
+        const capsuleArtifact = finalMarkdown ? extractReviewArtifact(finalMarkdown) : null;
+        if (
+          !finalMarkdown
+          || !capsuleReceipt
+          || !capsuleArtifact
+          || receiptSha256(capsuleReceipt) !== params.outcome.review_receipt_sha256
+          || reviewSha256(capsuleArtifact) !== params.outcome.review_artifact_sha256
+        ) {
+          return fail('review_approval_receipt_missing_or_duplicate');
+        }
+        await this.options.tracker.create_comment(params.issue.id, finalMarkdown);
+        this.options.logger?.log({
+          level: 'info',
+          event: CANONICAL_EVENT.reviewApproval.artifactPublished,
+          message: 'supervisor published the capsule review artifact as the tracker comment',
+          context: { issue_id: params.issue.id, pr_number: params.outcome.pr_number, head_sha: params.outcome.head_sha }
+        });
+        artifacts = matchPublishedArtifacts(await this.options.tracker.fetch_issue_comments(params.issue.id));
+      }
       if (artifacts.length !== 1) return fail('review_approval_receipt_missing_or_duplicate');
       const { receipt, artifact } = artifacts[0]!;
       if (
