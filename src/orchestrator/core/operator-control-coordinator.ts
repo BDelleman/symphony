@@ -53,6 +53,7 @@ export interface OperatorControlCoordinatorHooks {
   terminateRunningIssue: (issueId: string, cleanupWorkspace: boolean, reason: string) => Promise<void>;
   scheduleRetry: (params: OperatorControlScheduleRetryParams) => Promise<void>;
   recordHistoryWriteFailure: (operation: string, reasonCode: string, error: unknown) => Promise<void>;
+  clearCircuitBreaker: (issueId: string) => Promise<void>;
 }
 
 export interface OperatorControlCoordinatorContext {
@@ -221,6 +222,10 @@ export async function coordinateRequeueIssue(
       issue_snapshot: running.issue,
       progress_signals: running.progress_signals
     });
+    // An explicit operator requeue supersedes any no-progress circuit breaker,
+    // matching the resume path; otherwise the breaker outlives the requeued
+    // attempt and silently suppresses every later dispatch of the issue.
+    await context.hooks.clearCircuitBreaker(running.issue.id);
     recordOperatorAction(context, running.issue.id, {
       action: 'requeue',
       requested_at_ms: context.nowMs(),
@@ -268,6 +273,7 @@ export async function coordinateRequeueIssue(
       issue_snapshot: null
     });
     await context.persistence?.deleteBlockedInput?.(blocked.issue_id);
+    await context.hooks.clearCircuitBreaker(blocked.issue_id);
     recordOperatorAction(context, blocked.issue_id, {
       action: 'requeue',
       requested_at_ms: context.nowMs(),
@@ -313,6 +319,7 @@ export async function coordinateRequeueIssue(
       previous_session_id: retry.previous_session_id,
       issue_snapshot: null
     });
+    await context.hooks.clearCircuitBreaker(retry.issue_id);
     recordOperatorAction(context, retry.issue_id, {
       action: 'requeue',
       requested_at_ms: context.nowMs(),

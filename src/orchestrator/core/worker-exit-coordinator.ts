@@ -171,6 +171,7 @@ export interface WorkerExitCoordinatorHooks {
   ) => Promise<void>;
   scheduleRetry: (params: WorkerExitScheduleRetryParams) => Promise<void>;
   scheduleBlockedInput: (params: WorkerExitBlockedInputParams) => Promise<{ created: boolean }>;
+  clearCircuitBreaker: (issueId: string) => Promise<void>;
   scheduleRecoveryStartFailedBlock: (issueId: string, running: RunningEntry, error: string) => Promise<void>;
   persistExecutionGraphStateTransition: (
     runningEntry: RunningEntry,
@@ -446,6 +447,11 @@ export async function coordinateWorkerExit(
         );
         context.state.completed.add(issue_id);
         context.state.claimed.delete(issue_id);
+        // A normal completion is definitive progress: a no-progress circuit
+        // breaker left over from an earlier failed attempt must not outlive
+        // it, or the issue becomes undispatchable at its next active state
+        // with no blocked-input record for resume or requeue to act on.
+        await context.hooks.clearCircuitBreaker(issue_id);
         context.logger?.log({
           level: 'info',
           event: CANONICAL_EVENT.orchestration.workerExitHandled,

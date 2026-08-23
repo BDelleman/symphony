@@ -1677,6 +1677,7 @@ export class OrchestratorCore {
           this.completeRunRecord(runningEntry, terminalStatus, errorCode, recoveryOverride ?? null, terminalReasonDetail ?? null),
         scheduleRetry: (params) => this.scheduleRetry(params),
         scheduleBlockedInput: (params) => this.scheduleBlockedInput(params),
+        clearCircuitBreaker: (issueId) => this.clearCircuitBreaker(issueId),
         scheduleRecoveryStartFailedBlock: (issueId, running, recoveryError) =>
           this.scheduleRecoveryStartFailedBlock(issueId, running, recoveryError),
         persistExecutionGraphStateTransition: (runningEntry, toStatus, status, reasonCode, reasonDetail) =>
@@ -2127,7 +2128,8 @@ export class OrchestratorCore {
           this.terminateRunningIssue(issueId, cleanupWorkspace, reason),
         scheduleRetry: (params) => this.scheduleRetry(params),
         recordHistoryWriteFailure: (operation, reasonCode, error) =>
-          this.recordHistoryWriteFailure(operation, reasonCode, error)
+          this.recordHistoryWriteFailure(operation, reasonCode, error),
+        clearCircuitBreaker: (issueId) => this.clearCircuitBreaker(issueId)
       }
     };
   }
