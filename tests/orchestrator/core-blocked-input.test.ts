@@ -1278,7 +1278,7 @@ describe('OrchestratorCore blocked input', () => {
     });
   });
 
-  it('does not expose no-progress automation faults through the blocked-input resume path', async () => {
+  it('refuses to resume a no-progress automation fault and names the endpoint that clears it', async () => {
     const harness = createHarness({
       configOverrides: { respawn_max_attempts_without_progress: 1 },
       resolveProgressSignals: async () => ({
@@ -1301,8 +1301,8 @@ describe('OrchestratorCore blocked input', () => {
     });
     expect(withoutOverride).toEqual({
       ok: false,
-      code: 'issue_not_blocked',
-      message: 'Issue ABC-OVERRIDE is not blocked'
+      code: 'automation_fault_active',
+      message: 'Issue ABC-OVERRIDE is held by a no-progress automation fault; clear it with POST /api/v1/issues/ABC-OVERRIDE/clear-automation-fault'
     });
 
     const withOverride = await harness.orchestrator.resumeBlockedIssue(
@@ -1316,8 +1316,8 @@ describe('OrchestratorCore blocked input', () => {
     );
     expect(withOverride).toEqual({
       ok: false,
-      code: 'issue_not_blocked',
-      message: 'Issue ABC-OVERRIDE is not blocked'
+      code: 'automation_fault_active',
+      message: 'Issue ABC-OVERRIDE is held by a no-progress automation fault; clear it with POST /api/v1/issues/ABC-OVERRIDE/clear-automation-fault'
     });
     expect(harness.orchestrator.getStateSnapshot().circuit_breakers.get('i-resume-override')).toMatchObject({
       breaker_active: true
