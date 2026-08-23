@@ -123,6 +123,12 @@ process.stdin.on('end', () => {
     skills: ['linear']
   };
   const result = { type: 'result', subtype: 'success', is_error: false, session_id: '${SESSION_ID}', result: 'done', num_turns: 3, total_cost_usd: 0.0123, usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 } };
+  if (process.env.MOCK_MODE === 'auth-expired-result') {
+    const failed = { ...result, is_error: true, result: 'Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.' };
+    process.stdout.write(JSON.stringify(init) + '\\n' + JSON.stringify(failed) + '\\n');
+    process.exit(0);
+    return;
+  }
   if (process.env.MOCK_MODE === 'nested-process-transient') {
     const { spawn } = require('node:child_process');
     const nested = spawn(process.env.MOCK_NESTED_CLAUDE, [], {
@@ -1420,6 +1426,34 @@ describe('ClaudeCliRunner', () => {
       status: 'completed',
       last_agent_message: 'done'
     });
+  });
+
+  it('refuses dispatch on an expired subscription token and classifies a terminal 401', async () => {
+    const fixture = createFixture();
+    const credentialsPath = path.join(fixture.root, '.claude', '.credentials.json');
+    fs.mkdirSync(path.dirname(credentialsPath), { recursive: true });
+    const runnerOptions = {
+      command: fixture.command,
+      projectRoot: fixture.root,
+      model: 'claude-sonnet-4-6',
+      allowNonSubscriptionAuth: false,
+      env: fixtureEnv(fixture),
+      homedir: () => fixture.root
+    };
+
+    fs.writeFileSync(credentialsPath, JSON.stringify({ claudeAiOauth: { expiresAt: Date.now() - 1_000 } }));
+    const expired = await new ClaudeCliRunner(runnerOptions).startSessionAndRunTurn(startInput(fixture.root));
+    expect(expired).toMatchObject({ status: 'failed', error_code: 'claude_auth_expired', retryable: false });
+
+    fs.writeFileSync(credentialsPath, JSON.stringify({ claudeAiOauth: { expiresAt: Date.now() + 3_600_000 } }));
+    const fresh = await new ClaudeCliRunner(runnerOptions).startSessionAndRunTurn(startInput(fixture.root));
+    expect(fresh.status).toBe('completed');
+
+    const terminal = await new ClaudeCliRunner({
+      ...runnerOptions,
+      env: fixtureEnv(fixture, { MOCK_MODE: 'auth-expired-result' })
+    }).startSessionAndRunTurn(startInput(fixture.root));
+    expect(terminal).toMatchObject({ status: 'failed', error_code: 'claude_auth_expired', retryable: false });
   });
 
   it('kills an escaped descendant without failing an otherwise successful invocation', async () => {

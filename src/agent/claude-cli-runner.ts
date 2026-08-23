@@ -573,6 +573,27 @@ function assertApprovedAuth(
   }
 }
 
+const SUBSCRIPTION_TOKEN_EXPIRY_MARGIN_MS = 60_000;
+
+// Subscription OAuth tokens expire roughly daily, and the sandboxed CLI does
+// not run the interactive refresh flow: a worker dispatched with a stale token
+// burns its turn on an immediate 401 and blocks the issue behind a generic
+// terminal error. Reading the expiry lets the runner refuse such a dispatch
+// upfront with an actionable code. Returns null when the credentials file is
+// absent, unreadable, or carries no numeric expiry (keychain-backed or
+// non-subscription auth) — the preflight only acts on positive evidence.
+function readSubscriptionTokenExpiry(home: string): number | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(home, '.claude', '.credentials.json'), 'utf8')) as {
+      claudeAiOauth?: { expiresAt?: unknown };
+    };
+    const expiresAt = parsed.claudeAiOauth?.expiresAt;
+    return typeof expiresAt === 'number' && Number.isFinite(expiresAt) ? expiresAt : null;
+  } catch {
+    return null;
+  }
+}
+
 function isRetryableClaudeFailure(code: string): boolean {
   return (
     code.startsWith('claude_process_exit:') ||
@@ -1574,6 +1595,10 @@ export class ClaudeCliRunner implements AgentRunner {
         const inheritedSelectors = NON_SUBSCRIPTION_ENV_NAMES.filter((name) => Boolean(this.env[name]?.trim()));
         const selectors = [...new Set([...inheritedSelectors, ...userSettings.selectors])];
         if (selectors.length > 0) throw new Error(`claude_non_subscription_auth_forbidden:${selectors.join(',')}`);
+        const tokenExpiresAt = readSubscriptionTokenExpiry(home);
+        if (tokenExpiresAt !== null && tokenExpiresAt <= Date.now() + SUBSCRIPTION_TOKEN_EXPIRY_MARGIN_MS) {
+          throw new Error('claude_auth_expired');
+        }
       }
       const networkAllowedDomains = [
         ...new Set((this.options.networkAllowedDomains ?? []).map((value) => value.toLowerCase()))
@@ -2067,7 +2092,11 @@ export class ClaudeCliRunner implements AgentRunner {
           const terminalReason = boundedFailureSignal(payload.terminal_reason ?? payload.stop_reason);
           const resultFailure = resultSubtype !== 'success'
             ? `claude_terminal_${resultSubtype ?? 'unknown'}${apiErrorStatus ? `:api_status=${apiErrorStatus}` : ''}${terminalReason ? `:reason=${terminalReason}` : ''}`
-            : payload.is_error !== false ? 'claude_terminal_is_error' : null;
+            : payload.is_error !== false
+              ? /oauth access token has expired/i.test(readString(payload, 'result') ?? '')
+                ? 'claude_auth_expired'
+                : 'claude_terminal_is_error'
+              : null;
           if (resultFailure) requestTermination(resultFailure, 'provider');
           return;
         }
