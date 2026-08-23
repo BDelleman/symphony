@@ -62,7 +62,12 @@ export function statusForOperatorActionFailure(code: string): number {
   if (code === 'issue_not_found' || code === 'issue_not_blocked' || code === 'issue_not_automation_fault') {
     return 404;
   }
-  if (code === 'confirmation_required' || code === 'issue_not_active' || code === 'unsupported_transition') {
+  if (
+    code === 'confirmation_required' ||
+    code === 'issue_not_active' ||
+    code === 'unsupported_transition' ||
+    code === 'automation_fault_active'
+  ) {
     return 409;
   }
   if (code.endsWith('_unavailable')) {

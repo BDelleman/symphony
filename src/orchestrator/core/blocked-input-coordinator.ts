@@ -494,6 +494,20 @@ export async function resumeBlockedIssue(
   }
   const blocked = Array.from(context.state.blocked_inputs.values()).find((entry) => entry.issue_identifier === issue_identifier);
   if (!blocked) {
+    // A no-progress circuit breaker can hold an issue with no blocked-input
+    // record at all; a bare "not blocked" here sends the operator in circles
+    // while the dashboard still shows the issue as blocked. Name the actual
+    // holder and the endpoint that releases it.
+    const breaker = Array.from(context.state.circuit_breakers.values()).find(
+      (entry) => entry.issue_identifier === issue_identifier && entry.breaker_active
+    );
+    if (breaker) {
+      return {
+        ok: false,
+        code: 'automation_fault_active',
+        message: `Issue ${issue_identifier} is held by a no-progress automation fault; clear it with POST /api/v1/issues/${issue_identifier}/clear-automation-fault`
+      };
+    }
     return {
       ok: false,
       code: 'issue_not_blocked',
