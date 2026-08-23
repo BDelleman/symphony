@@ -88,6 +88,7 @@ export interface AgentRunnerStartInput extends Omit<CodexRunnerStartInput, 'onEv
     issue_identifier: string;
     attempt: number | null;
     symphony_attempt_id?: string;
+    base_ref?: string;
   };
 }
 

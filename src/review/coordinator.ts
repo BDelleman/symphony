@@ -343,18 +343,24 @@ export class ReviewApprovalCoordinator {
       const broker = this.broker();
       const identity = await broker.separatedIdentity();
       const snapshot = await this.client.fetchSnapshot(repository, params.outcome.pr_number, identity.login);
-      if (
-        snapshot.state !== 'open'
-        || snapshot.draft
-        || snapshot.base_ref !== this.options.baseRef.replace(/^origin\//, '')
-        || receipt.base_ref !== snapshot.base_ref
-        || snapshot.base_sha !== receipt.base_sha
-        || snapshot.head_sha !== receipt.head_sha
-        || !snapshot.checks_green
-        || snapshot.context_sha256 !== receipt.github_context_sha256
-      ) {
+      // Named clauses instead of one opaque OR: the operator-facing detail must
+      // say which invariant failed (a PR opened against the wrong base branch
+      // reads very differently from post-review context drift).
+      const workflowBaseRef = this.options.baseRef.replace(/^origin\//, '');
+      const contextMismatches: string[] = [];
+      if (snapshot.state !== 'open') contextMismatches.push('pr_not_open');
+      if (snapshot.draft) contextMismatches.push('pr_draft');
+      if (snapshot.base_ref !== workflowBaseRef) {
+        contextMismatches.push(`pr_base_mismatch(pr=${snapshot.base_ref},workflow=${workflowBaseRef})`);
+      }
+      if (receipt.base_ref !== snapshot.base_ref) contextMismatches.push('receipt_base_ref_drift');
+      if (snapshot.base_sha !== receipt.base_sha) contextMismatches.push('base_sha_drift');
+      if (snapshot.head_sha !== receipt.head_sha) contextMismatches.push('head_sha_drift');
+      if (!snapshot.checks_green) contextMismatches.push('checks_not_green');
+      if (snapshot.context_sha256 !== receipt.github_context_sha256) contextMismatches.push('github_context_drift');
+      if (contextMismatches.length > 0) {
         updateAction('superseded', { reason_code: REASON_CODES.reviewApprovalContextMismatch });
-        return fail(REASON_CODES.reviewApprovalContextMismatch);
+        return fail(`${REASON_CODES.reviewApprovalContextMismatch}:${contextMismatches.join('+')}`);
       }
       this.options.logger?.log({
         level: 'info',

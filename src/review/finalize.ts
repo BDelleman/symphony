@@ -81,6 +81,14 @@ export async function finalizeAgentReview(options: FinalizeOptions): Promise<Fin
   const reviewerLogin = options.env.SYMPHONY_REVIEWER_APP_LOGIN ?? 'symphony-reviewer[bot]';
   const snapshot = await client.fetchSnapshot(repository, options.pr, reviewerLogin);
   if (snapshot.state !== 'open' || snapshot.draft) throw new Error('review_finalize_pr_not_ready');
+  // A PR opened against the wrong base branch fails the approval gate at the
+  // very end of the pipeline; when the orchestrator exports the workflow's
+  // base ref, refuse to finalize against it so the review turn surfaces the
+  // misconfigured PR immediately with an actionable error.
+  const expectedBaseRef = options.env.SYMPHONY_BASE_REF?.trim().replace(/^origin\//, '');
+  if (expectedBaseRef && snapshot.base_ref !== expectedBaseRef) {
+    throw new Error(`review_finalize_pr_base_mismatch:pr=${snapshot.base_ref},workflow=${expectedBaseRef}`);
+  }
   if (snapshot.head_sha !== headSha) throw new Error('review_finalize_head_mismatch');
   if (!snapshot.checks_green) throw new Error('review_finalize_checks_not_green');
 

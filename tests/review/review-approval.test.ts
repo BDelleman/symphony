@@ -147,6 +147,19 @@ describe('review approval contract', () => {
     const final = await fs.readFile(result.finalPath, 'utf8');
     expect(extractReviewReceipt(final)).toEqual(result.receipt);
     expect(extractReviewArtifact(final)).toBe(reviewBody());
+
+    await expect(finalizeAgentReview({
+      issue: 'NIE-574', pr: 574, route: 'merging', bodyFile, cwd: root,
+      env: { SYMPHONY_ATTEMPT_ID: 'attempt-1', GH_TOKEN: 'worker-token', SYMPHONY_BASE_REF: 'origin/develop' },
+      now: () => new Date('2026-08-21T10:00:00.000Z'),
+      client: { fetchSnapshot: vi.fn(async () => snapshot) } as any
+    })).rejects.toThrow('review_finalize_pr_base_mismatch:pr=main,workflow=develop');
+    await expect(finalizeAgentReview({
+      issue: 'NIE-574', pr: 574, route: 'merging', bodyFile, cwd: root,
+      env: { SYMPHONY_ATTEMPT_ID: 'attempt-1', GH_TOKEN: 'worker-token', SYMPHONY_BASE_REF: 'main' },
+      now: () => new Date('2026-08-21T10:00:00.000Z'),
+      client: { fetchSnapshot: vi.fn(async () => snapshot) } as any
+    })).resolves.toMatchObject({ receipt: { base_ref: 'main' } });
   });
 });
 
