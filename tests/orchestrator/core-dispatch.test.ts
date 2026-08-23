@@ -1189,4 +1189,44 @@ describe('OrchestratorCore dispatch and backpressure', () => {
     expect(snapshot.completed.has('i-handoff')).toBe(true);
     expect(harness.terminated).toEqual([]);
   });
+
+  it('clears a no-progress circuit breaker on operator requeue and on normal completion', async () => {
+    const harness = createHarness();
+    const issue = makeIssue({ id: 'i-breaker', identifier: 'ABC-BREAKER' });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([issue]);
+    await harness.orchestrator.tick('interval');
+    await harness.orchestrator.onWorkerExit('i-breaker', 'abnormal', 'review_approval_outcome_invalid', {
+      retryable: false
+    });
+    expect(harness.orchestrator.getStateSnapshot().circuit_breakers.get('i-breaker')?.breaker_active).toBe(true);
+
+    await expect(harness.orchestrator.requeueIssue('ABC-BREAKER', {
+      actor: 'operator@example.test',
+      reason_note: 'progress made since the breaker tripped'
+    })).resolves.toMatchObject({ ok: true, issue_id: 'i-breaker' });
+    expect(harness.orchestrator.getStateSnapshot().circuit_breakers.has('i-breaker')).toBe(false);
+
+    // A breaker that slipped past operator clearing must still not outlive a
+    // normally completed attempt: completion is definitive progress.
+    const second = makeIssue({ id: 'i-breaker-2', identifier: 'ABC-BREAKER-2' });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([second]);
+    await harness.orchestrator.tick('interval');
+    const liveBreakers = (harness.orchestrator as unknown as {
+      state: { circuit_breakers: Map<string, unknown> };
+    }).state.circuit_breakers;
+    liveBreakers.set('i-breaker-2', {
+      issue_id: 'i-breaker-2',
+      issue_identifier: 'ABC-BREAKER-2',
+      breaker_active: true,
+      breaker_hit_count: 1,
+      breaker_window_minutes: 30,
+      breaker_first_hit_at_ms: 1,
+      breaker_last_hit_at_ms: 1
+    });
+    await harness.orchestrator.onWorkerExit('i-breaker-2', 'normal', undefined, {
+      completion_reason: 'handoff_state_reached',
+      refreshed_state: 'Agent Review'
+    });
+    expect(liveBreakers.has('i-breaker-2')).toBe(false);
+  });
 });
