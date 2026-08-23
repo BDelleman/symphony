@@ -1229,4 +1229,29 @@ describe('OrchestratorCore dispatch and backpressure', () => {
     });
     expect(liveBreakers.has('i-breaker-2')).toBe(false);
   });
+
+  it('names the automation fault when resume or requeue target a breaker-held idle issue', async () => {
+    const harness = createHarness();
+    const liveBreakers = (harness.orchestrator as unknown as {
+      state: { circuit_breakers: Map<string, unknown> };
+    }).state.circuit_breakers;
+    liveBreakers.set('i-held', {
+      issue_id: 'i-held',
+      issue_identifier: 'ABC-HELD',
+      breaker_active: true,
+      breaker_hit_count: 1,
+      breaker_window_minutes: 30,
+      breaker_first_hit_at_ms: 1,
+      breaker_last_hit_at_ms: 1
+    });
+
+    await expect(harness.orchestrator.resumeBlockedIssue('ABC-HELD', null, null, {
+      actor: 'operator@example.test',
+      reason_note: 'trying to unstick the issue'
+    })).resolves.toMatchObject({ ok: false, code: 'automation_fault_active' });
+    await expect(harness.orchestrator.requeueIssue('ABC-HELD', {
+      actor: 'operator@example.test',
+      reason_note: 'trying to unstick the issue'
+    })).resolves.toMatchObject({ ok: false, code: 'automation_fault_active' });
+  });
 });
