@@ -1303,6 +1303,7 @@ function descendantProcessRows(rootPid: number | undefined, rows = readProcessRo
 // as its own descendant row and fails closed.
 export function isClaudeSandboxShellLauncher(argv: readonly string[]): boolean {
   return (
+    argv.length === 4 &&
     /^\/proc\/self\/fd\/\d+$/.test(argv[0] ?? '') &&
     ['/bin/bash', '/usr/bin/bash', '/bin/sh', '/usr/bin/sh'].includes(argv[1] ?? '') &&
     argv[2] === '-c'
@@ -1321,21 +1322,38 @@ function readLinuxProcessArgv(pid: number): string[] | null {
   }
 }
 
-function findNestedClaudeDescendant(rootPid: number | undefined, executable: string, rows = readProcessRows()): ProcessRow | null {
+interface ProcessInspector {
+  platform: NodeJS.Platform;
+  realpath(candidate: string): string;
+  readArgv(pid: number): string[] | null;
+}
+
+const hostProcessInspector: ProcessInspector = {
+  platform: process.platform,
+  realpath: (candidate) => fs.realpathSync(candidate),
+  readArgv: readLinuxProcessArgv
+};
+
+export function findNestedClaudeDescendant(
+  rootPid: number | undefined,
+  executable: string,
+  rows = readProcessRows(),
+  inspector: ProcessInspector = hostProcessInspector
+): ProcessRow | null {
   if (!rootPid) return null;
   const resolvesToExecutable = (candidate: string): boolean => {
     if (!path.isAbsolute(candidate)) return false;
     try {
-      return fs.realpathSync(candidate) === executable;
+      return inspector.realpath(candidate) === executable;
     } catch {
       return false;
     }
   };
   for (const row of descendantProcessRows(rootPid, rows)) {
-    if (process.platform === 'linux') {
+    if (inspector.platform === 'linux') {
       try {
-        if (fs.realpathSync(`/proc/${row.pid}/exe`) === executable) {
-          const argv = readLinuxProcessArgv(row.pid);
+        if (inspector.realpath(`/proc/${row.pid}/exe`) === executable) {
+          const argv = inspector.readArgv(row.pid);
           if (argv && isClaudeSandboxShellLauncher(argv)) continue;
           return row;
         }

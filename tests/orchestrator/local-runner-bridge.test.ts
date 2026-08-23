@@ -1799,6 +1799,44 @@ describe('LocalRunnerBridge integration', () => {
     expect(snapshot.retry_attempts.has('i-1')).toBe(false);
   });
 
+  it('does not retry a sensitive workspace preflight failure', async () => {
+    const exits: Array<{ reason: string; error?: string; retryable?: boolean }> = [];
+    const workspaceManager = {
+      ensureWorkspace: vi.fn(async () => ({ path: '/tmp/symphony/ABC-1', workspace_key: 'ABC-1', created_now: true })),
+      prepareAttempt: vi.fn(async () => {
+        const error = new Error('{"violations":[{"path":".venv/bin/python","category":"symlink_escape"}]}') as Error & {
+          code?: string;
+        };
+        error.code = 'workspace_sensitive_file_detected';
+        throw error;
+      }),
+      finalizeAttempt: vi.fn(async () => {}),
+      cleanupWorkspace: vi.fn(async () => true)
+    } as unknown as WorkspaceManager;
+    const bridge = new LocalRunnerBridge({
+      workspaceManager,
+      codexRunner: {} as CodexRunner,
+      config: makeConfig(),
+      promptTemplate: 'Issue {{ issue.identifier }} attempt {{ attempt }}',
+      onWorkerExit: ({ reason, error, retryable }) => {
+        exits.push({ reason, error, retryable });
+      }
+    });
+
+    const spawned = await bridge.spawnWorker({ issue: makeIssue(), attempt: null });
+    expect(spawned.ok).toBe(true);
+    if (!spawned.ok) throw new Error('expected spawn success');
+    await (spawned.worker_handle as { promise: Promise<void> }).promise;
+
+    expect(exits).toEqual([
+      {
+        reason: 'abnormal',
+        error: 'workspace_sensitive_file_detected:{"violations":[{"path":".venv/bin/python","category":"symlink_escape"}]}',
+        retryable: false
+      }
+    ]);
+  });
+
   it('fails fast with codex.startup.failed event when workspace resolves to unsafe root', async () => {
     const workspaceManager = {
       ensureWorkspace: vi.fn(async () => ({

@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 
 import { ClaudeCliRunner, type AgentRunnerEvent } from '../../src/agent';
-import { isClaudeSandboxShellLauncher } from '../../src/agent/claude-cli-runner';
+import { findNestedClaudeDescendant, isClaudeSandboxShellLauncher } from '../../src/agent/claude-cli-runner';
 
 const SESSION_ID = '123e4567-e89b-42d3-a456-426614174000';
 const NON_SUBSCRIPTION_SELECTORS = [
@@ -1663,7 +1663,39 @@ describe('isClaudeSandboxShellLauncher', () => {
     expect(isClaudeSandboxShellLauncher(['/bin/bash', '-c', 'ls'])).toBe(false);
     expect(isClaudeSandboxShellLauncher(['/proc/self/fd/x', '/bin/bash', '-c', 'ls'])).toBe(false);
     expect(isClaudeSandboxShellLauncher(['/proc/self/fd/3', '/bin/bash', 'ls'])).toBe(false);
+    expect(isClaudeSandboxShellLauncher(['/proc/self/fd/3', '/bin/bash', '-c'])).toBe(false);
+    expect(isClaudeSandboxShellLauncher(['/proc/self/fd/3', '/bin/bash', '-c', 'ls', 'extra'])).toBe(false);
     expect(isClaudeSandboxShellLauncher(['/proc/self/fd/3 /bin/bash -c', '--print', 'prompt'])).toBe(false);
     expect(isClaudeSandboxShellLauncher([])).toBe(false);
+  });
+
+  it('allows the observed supervisor helper chain but detects nested Claude beneath it', () => {
+    const executable = '/opt/claude/2.1.224';
+    const rootPid = 100;
+    const rows = [
+      { pid: 110, ppid: rootPid, started: 'start-110', command: 'bash', args: '/bin/bash proxy-wrapper' },
+      { pid: 120, ppid: 110, started: 'start-120', command: 'claude', args: 'sandbox-supervisor' },
+      { pid: 130, ppid: 120, started: 'start-130', command: 'claude', args: 'sandbox-helper' }
+    ];
+    const executableByPid = new Map([[120, executable], [130, executable]]);
+    const argvByPid = new Map<number, string[]>([
+      [120, ['/proc/self/fd/3', '/bin/bash', '-c', 'gh pr view 503']],
+      [130, ['/proc/self/fd/3', '/bin/bash', '-c', 'gh pr view 503']]
+    ]);
+    const inspector = {
+      platform: 'linux' as const,
+      realpath: (candidate: string) => {
+        const match = /^\/proc\/(\d+)\/exe$/.exec(candidate);
+        return match ? executableByPid.get(Number(match[1])) ?? '/bin/bash' : candidate;
+      },
+      readArgv: (pid: number) => argvByPid.get(pid) ?? null
+    };
+
+    expect(findNestedClaudeDescendant(rootPid, executable, rows, inspector)).toBeNull();
+
+    rows.push({ pid: 140, ppid: 130, started: 'start-140', command: 'claude', args: 'claude --print' });
+    executableByPid.set(140, executable);
+    argvByPid.set(140, [executable, '--print', '--model', 'claude-sonnet-4-6']);
+    expect(findNestedClaudeDescendant(rootPid, executable, rows, inspector)?.pid).toBe(140);
   });
 });
