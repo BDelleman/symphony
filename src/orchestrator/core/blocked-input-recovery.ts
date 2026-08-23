@@ -3,6 +3,7 @@ import { REASON_CODES } from '../../observability/reason-codes';
 import {
   type BlockedEntry,
   type MissingToolOutputRecoveryState,
+  type OrchestratorState,
   type OutstandingToolCall,
   type RunningEntry,
   type WorkerObservabilityEvent,
@@ -74,6 +75,30 @@ export function normalizeOperatorReasonNote(reason_note: string | null | undefin
 
 export function reasonNoteRequiredFailure(): { ok: false; code: string; message: string } {
   return { ok: false, code: 'reason_note_required', message: 'reason_note is required' };
+}
+
+/**
+ * A no-progress circuit breaker can hold an issue that has no blocked-input
+ * record and no running attempt. Resume and requeue both fall through to a
+ * generic "nothing to do here" error in that case, which sends the operator in
+ * circles while the dashboard still shows the issue as held. Name the actual
+ * holder and the only endpoint that releases it.
+ */
+export function activeAutomationFaultFailure(
+  state: OrchestratorState,
+  issue_identifier: string
+): { ok: false; code: string; message: string } | null {
+  const held = Array.from(state.circuit_breakers.values()).some(
+    (entry) => entry.issue_identifier === issue_identifier && entry.breaker_active
+  );
+  if (!held) {
+    return null;
+  }
+  return {
+    ok: false,
+    code: 'automation_fault_active',
+    message: `Issue ${issue_identifier} is held by a no-progress automation fault; clear it with POST /api/v1/issues/${encodeURIComponent(issue_identifier)}/clear-automation-fault`
+  };
 }
 
 export function applyBlockedWorkerEventQuarantine(
