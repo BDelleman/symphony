@@ -269,7 +269,7 @@ describe('LocalRunnerBridge integration', () => {
         }
       },
       issueStateFetcher,
-      promptTemplate: 'Issue {{ issue.identifier }} attempt {{ attempt }}'
+      promptTemplate: 'Issue {{ issue.identifier }} attempt {{ attempt }} base {{ base_ref }}'
     });
 
     const spawned = await bridge.spawnWorker({ issue: makeIssue(), attempt: null });
@@ -285,6 +285,9 @@ describe('LocalRunnerBridge integration', () => {
       prompt: expect.stringContaining('Issue ABC-1 attempt'),
       maxTurns: 1
     });
+    expect(startSessionAndRunTurn.mock.calls[0][0].prompt).toContain('base main');
+    expect(startSessionAndRunTurn.mock.calls[0][0].runBinding).toMatchObject({ base_ref: 'main' });
+    expect(startSessionAndRunTurn.mock.calls[0][0].commandEnv).toMatchObject({ SYMPHONY_BASE_REF: 'main' });
     expect(startSessionAndRunTurn.mock.calls[1][0]).toMatchObject({
       prompt: expect.stringContaining('Continue on the same thread'),
       maxTurns: 1

@@ -138,7 +138,11 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
         commandEnv:
           agentRunner.runtime === 'claude-cli'
             ? undefined
-            : { ...codexSpawnCommand.env, SYMPHONY_ATTEMPT_ID: input.symphonyAttemptId },
+            : {
+                ...codexSpawnCommand.env,
+                SYMPHONY_ATTEMPT_ID: input.symphonyAttemptId,
+                SYMPHONY_BASE_REF: input.config.workspace.provisioner.base_ref.replace(/^origin\//, '')
+              },
         workspaceCwd: workspace.path,
         workerHost: input.worker_host,
         prompt,
@@ -159,7 +163,8 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
           issue_id: currentIssue.id,
           issue_identifier: currentIssue.identifier,
           attempt: input.attempt,
-          symphony_attempt_id: input.symphonyAttemptId
+          symphony_attempt_id: input.symphonyAttemptId,
+          base_ref: input.config.workspace.provisioner.base_ref.replace(/^origin\//, '')
         }
       };
       const turnResult: AgentRunResult | undefined =
