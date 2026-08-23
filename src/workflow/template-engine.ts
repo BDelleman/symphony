@@ -5,6 +5,11 @@ import { WorkflowConfigError } from './errors';
 export interface TemplateContext {
   issue: Record<string, unknown>;
   attempt: number | null;
+  // The workflow's integration branch (workspace.provisioner.base_ref with any
+  // remote prefix stripped), so prompt instructions can reference the
+  // configured PR base — e.g. `gh pr create --base {{ base_ref }}` — instead
+  // of leaving the agent to guess it.
+  base_ref?: string;
 }
 
 export class TemplateEngine {

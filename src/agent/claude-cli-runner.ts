@@ -1213,7 +1213,8 @@ function buildChildEnvironment(
   home: string,
   model: string,
   allowNonSubscriptionAuth: boolean,
-  symphonyAttemptId: string | undefined
+  symphonyAttemptId: string | undefined,
+  baseRef: string | undefined
 ): NodeJS.ProcessEnv {
   const output: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(base)) {
@@ -1240,6 +1241,7 @@ function buildChildEnvironment(
   output.DISABLE_AUTOUPDATER = '1';
   output.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
   if (symphonyAttemptId) output.SYMPHONY_ATTEMPT_ID = symphonyAttemptId;
+  if (baseRef) output.SYMPHONY_BASE_REF = baseRef;
   return stripReviewerCredentials(output);
 }
 
@@ -1624,7 +1626,8 @@ export class ClaudeCliRunner implements AgentRunner {
         home,
         this.options.model,
         this.options.allowNonSubscriptionAuth,
-        input.runBinding?.symphony_attempt_id
+        input.runBinding?.symphony_attempt_id,
+        input.runBinding?.base_ref
       );
       if (!sshAgent) delete childEnv.SSH_AUTH_SOCK;
       else childEnv.SSH_AUTH_SOCK = sshAgent.socketPath;

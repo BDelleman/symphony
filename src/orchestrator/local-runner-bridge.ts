@@ -78,7 +78,11 @@ export class LocalRunnerBridge {
     } else {
       const compiledTemplate: Template = new TemplateEngine().compile(options.promptTemplate);
       this.renderPrompt = async ({ issue, attempt }) => {
-        return compiledTemplate.render({ issue: issue as unknown as Record<string, unknown>, attempt });
+        return compiledTemplate.render({
+          issue: issue as unknown as Record<string, unknown>,
+          attempt,
+          base_ref: this.config.workspace.provisioner.base_ref.replace(/^origin\//, '')
+        });
       };
     }
     this.logger = options.logger;
@@ -92,7 +96,11 @@ export class LocalRunnerBridge {
     this.config = config;
     const compiledTemplate: Template = new TemplateEngine().compile(promptTemplate);
     this.renderPrompt = async ({ issue, attempt }) => {
-      return compiledTemplate.render({ issue: issue as unknown as Record<string, unknown>, attempt });
+      return compiledTemplate.render({
+        issue: issue as unknown as Record<string, unknown>,
+        attempt,
+        base_ref: this.config.workspace.provisioner.base_ref.replace(/^origin\//, '')
+      });
     };
   }
 
