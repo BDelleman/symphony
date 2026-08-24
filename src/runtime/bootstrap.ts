@@ -1307,7 +1307,9 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
             },
       spawnWorker: ({ issue, attempt, worker_host, resume_context, recover_workspace_attempt_residue }) =>
         bridge.spawnWorker({ issue, attempt, worker_host, resume_context, recover_workspace_attempt_residue }),
-      recoverMissingToolOutput: (params) => bridge.recoverMissingToolOutput(params),
+      recoverMissingToolOutput: bridge.missingToolOutputRecoverySupported()
+        ? (params) => bridge.recoverMissingToolOutput(params)
+        : undefined,
       terminateWorker: createRuntimeTerminateWorkerPort(bridge),
       scheduleRetryTimer: ({ issue_id, due_at_ms, callback }) => {
         const delayMs = Math.max(0, due_at_ms - nowMs());

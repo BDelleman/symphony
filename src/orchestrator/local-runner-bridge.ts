@@ -179,6 +179,10 @@ export class LocalRunnerBridge {
     };
   }
 
+  missingToolOutputRecoverySupported(): boolean {
+    return this.agentRunner.capabilities.missing_tool_output_recovery === true;
+  }
+
   async recoverMissingToolOutput(params: {
     issue: Issue;
     attempt: number | null;

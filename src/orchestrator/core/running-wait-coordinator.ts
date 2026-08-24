@@ -243,6 +243,22 @@ export async function coordinateMaybeClassifyRunningWaitStall(
 
   const missingToolOutput = context.hooks.findMissingToolOutputCandidate(runningEntry, observedAtMs, waitThresholdMs);
   if (missingToolOutput) {
+    // A long-running tool call (e.g. an Agent subagent streaming its own tool events) is only
+    // "missing output" once the whole worker has gone quiet — never while it demonstrably advances.
+    const activity = classifyWorkerActivity({ runningEntry, observedAtMs, waitThresholdMs });
+    if (activity.activity_state === 'advancing' || activity.activity_state === 'active_but_opaque') {
+      if (missingToolOutput.recovery_deferred_at_ms == null) {
+        context.hooks.recordRuntimeEvent({
+          event: CANONICAL_EVENT.orchestration.missingToolOutputRecoveryDeferred,
+          severity: 'info',
+          issue_identifier: runningEntry.identifier,
+          session_id: runningEntry.session_id ?? undefined,
+          detail: `tool_name=${missingToolOutput.tool_name} call_id=${missingToolOutput.call_id} activity_state=${activity.activity_state} outstanding_ms=${Math.max(0, observedAtMs - missingToolOutput.started_at_ms)} latest_meaningful_progress_at_ms=${activity.latest_meaningful_progress_at_ms ?? 'unknown'}`
+        });
+      }
+      missingToolOutput.recovery_deferred_at_ms = observedAtMs;
+      return false;
+    }
     runningEntry.stalled_waiting_reason = REASON_CODES.turnWaitingThresholdExceeded;
     await context.hooks.recoverOrBlockMissingToolOutput(issueId, runningEntry, missingToolOutput, observedAtMs);
     return true;

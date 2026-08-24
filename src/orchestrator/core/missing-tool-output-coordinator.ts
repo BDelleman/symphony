@@ -931,6 +931,21 @@ export async function coordinateRecoverOrBlockMissingToolOutput(
     return;
   }
 
+  // Mark the termination before interrupting so the generic worker-exit handler defers to this
+  // coordinator instead of racing the cancelled worker's exit into a worker_exit_abnormal block.
+  runningEntry.termination = {
+    state: 'requested',
+    reason: REASON_CODES.missingToolOutputRecoveryInterrupted,
+    cleanup_workspace: false,
+    requested_at_ms: context.nowMs(),
+    worker_handle: runningEntry.worker_handle,
+    worker_instance_id: runningEntry.worker_instance_id ?? null,
+    codex_app_server_pid: runningEntry.codex_app_server_pid ?? null,
+    worker_process_pid: runningEntry.worker_process_pid ?? null,
+    thread_id: runningEntry.thread_id ?? null,
+    turn_id: runningEntry.turn_id ?? null,
+    session_id: runningEntry.session_id ?? null
+  };
   const terminationResult = await context.terminateWorker({
     issue_id: issueId,
     worker_handle: runningEntry.worker_handle,
@@ -1074,6 +1089,7 @@ export async function coordinateRecoverOrBlockMissingToolOutput(
     outstanding_tool_calls: {},
     codex_session_transcript_scan_offsets: {},
     ownership_conflict: null,
+    termination: null,
     recovery: { ...interruptedRecovery, last_result: 'started' }
   });
 
@@ -1112,6 +1128,21 @@ async function blockMissingToolOutput(
 
   let terminationResult: WorkerTerminationResult | null = null;
   if (options.terminate_worker ?? true) {
+    // Mark the termination before killing so the generic worker-exit handler defers to this
+    // block instead of racing in a worker_exit_abnormal block with a misleading reason.
+    runningEntry.termination ??= {
+      state: 'requested',
+      reason: stopReasonCode,
+      cleanup_workspace: false,
+      requested_at_ms: context.nowMs(),
+      worker_handle: runningEntry.worker_handle,
+      worker_instance_id: runningEntry.worker_instance_id ?? null,
+      codex_app_server_pid: runningEntry.codex_app_server_pid ?? null,
+      worker_process_pid: runningEntry.worker_process_pid ?? null,
+      thread_id: runningEntry.thread_id ?? null,
+      turn_id: runningEntry.turn_id ?? null,
+      session_id: runningEntry.session_id ?? null
+    };
     terminationResult = await context.terminateWorker({
       issue_id: issueId,
       worker_handle: runningEntry.worker_handle,
