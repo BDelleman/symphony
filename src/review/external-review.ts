@@ -17,13 +17,14 @@ export interface ExternalReviewPolicy {
 
 export interface ExternalReviewEvidence {
   requested_at: string | null;
-  answered_for_head: boolean;
+  answered_at: string | null;
   unavailable_at: string | null;
 }
 
 export interface ExternalReviewReviewInput {
   login: string;
   commit_id: string;
+  submitted_at: string;
 }
 
 export interface ExternalReviewCommentInput {
@@ -34,7 +35,7 @@ export interface ExternalReviewCommentInput {
 
 export const EXTERNAL_REVIEW_ABSENT: ExternalReviewEvidence = {
   requested_at: null,
-  answered_for_head: false,
+  answered_at: null,
   unavailable_at: null
 };
 
@@ -114,34 +115,37 @@ export function collectExternalReviewEvidence(input: {
     .sort();
   const requestedAt = requests.length > 0 ? requests[requests.length - 1] : null;
 
-  const answeredForHead = input.reviews.some(
-    (review) => isBot(review.login) && review.commit_id === input.headSha
-  );
-
   // ISO-8601 UTC from the GitHub API sorts lexicographically, so no Date
-  // parsing is needed to order a notice against the request that provoked it.
-  const unavailable = input.comments
+  // parsing is needed to order an answer against the request that provoked it.
+  const latest = (values: readonly string[]): string | null => {
+    const sorted = [...values].filter((value) => value.length > 0).sort();
+    return sorted.length > 0 ? sorted[sorted.length - 1] : null;
+  };
+
+  const answeredAt = latest(input.reviews
+    .filter((review) => isBot(review.login) && review.commit_id === input.headSha)
+    .map((review) => review.submitted_at));
+
+  const unavailableAt = latest(input.comments
     .filter((comment) =>
       isBot(comment.login)
-      && policy.unavailable_patterns.some((pattern) => comment.body.toLowerCase().includes(pattern))
-      && (requestedAt === null || comment.created_at >= requestedAt))
-    .map((comment) => comment.created_at)
-    .filter((createdAt) => createdAt.length > 0)
-    .sort();
+      && policy.unavailable_patterns.some((pattern) => comment.body.toLowerCase().includes(pattern)))
+    .map((comment) => comment.created_at));
 
-  return {
-    requested_at: requestedAt,
-    answered_for_head: answeredForHead,
-    unavailable_at: unavailable.length > 0 ? unavailable[unavailable.length - 1] : null
-  };
+  return { requested_at: requestedAt, answered_at: answeredAt, unavailable_at: unavailableAt };
 }
 
 // Silence is not availability. Only a review bound to this head, or the
-// reviewer saying it will not produce one, ends the wait.
+// reviewer saying it will not produce one, ends the wait — and the answer has
+// to be newer than the request it answers. A request posted after the last
+// answer is still outstanding, so a second review may still land; treating the
+// earlier answer as final there would reopen the very race this gate closes.
 export function externalReviewSettled(
   evidence: ExternalReviewEvidence,
   policy: ExternalReviewPolicy
 ): boolean {
   if (!externalReviewRequired(policy)) return true;
-  return evidence.answered_for_head || evidence.unavailable_at !== null;
+  const answersRequest = (answeredAt: string | null): boolean =>
+    answeredAt !== null && (evidence.requested_at === null || answeredAt >= evidence.requested_at);
+  return answersRequest(evidence.answered_at) || answersRequest(evidence.unavailable_at);
 }

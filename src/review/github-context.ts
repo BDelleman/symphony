@@ -304,7 +304,8 @@ export class GitHubReviewClient {
         policy: this.externalReviewPolicy,
         reviews: reviews.map((review) => ({
           login: userLogin(review.user),
-          commit_id: stringValue(review.commit_id)
+          commit_id: stringValue(review.commit_id),
+          submitted_at: stringValue(review.submitted_at)
         })),
         comments: comments.map((comment) => ({
           login: userLogin(comment.user),
