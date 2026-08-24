@@ -126,9 +126,19 @@ export interface AgentRuntimeConfig {
   claude_supported_version: '2.1.224';
 }
 
+export interface ExternalReviewConfig {
+  bot_login: string;
+  request_marker: string;
+  unavailable_pattern: string;
+}
+
 export interface ReviewApprovalConfig {
   provider: 'github_app';
   required: boolean;
+  // Absent means the project has no external reviewer, and the approval gate
+  // keeps its previous behaviour rather than waiting on evidence that will
+  // never arrive.
+  external_review?: ExternalReviewConfig;
 }
 
 export type BudgetHardLimitPolicy = 'block_requires_resume' | 'terminate_attempt';

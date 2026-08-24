@@ -24,6 +24,7 @@ import type {
 } from './types';
 import { tryParseReviewOutcome } from '../review';
 import { stripReviewerCredentials } from '../review/credential-boundary';
+import { externalReviewEnvironment, type ExternalReviewPolicy } from '../review/external-review';
 
 export const CLAUDE_SUPPORTED_VERSION = '2.1.224';
 const MAX_PROMPT_BYTES = 8 * 1024 * 1024;
@@ -1214,7 +1215,8 @@ function buildChildEnvironment(
   model: string,
   allowNonSubscriptionAuth: boolean,
   symphonyAttemptId: string | undefined,
-  baseRef: string | undefined
+  baseRef: string | undefined,
+  externalReview: ExternalReviewPolicy | undefined
 ): NodeJS.ProcessEnv {
   const output: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(base)) {
@@ -1242,6 +1244,7 @@ function buildChildEnvironment(
   output.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
   if (symphonyAttemptId) output.SYMPHONY_ATTEMPT_ID = symphonyAttemptId;
   if (baseRef) output.SYMPHONY_BASE_REF = baseRef;
+  Object.assign(output, externalReviewEnvironment(externalReview));
   return stripReviewerCredentials(output);
 }
 
@@ -1627,7 +1630,8 @@ export class ClaudeCliRunner implements AgentRunner {
         this.options.model,
         this.options.allowNonSubscriptionAuth,
         input.runBinding?.symphony_attempt_id,
-        input.runBinding?.base_ref
+        input.runBinding?.base_ref,
+        input.runBinding?.external_review
       );
       if (!sshAgent) delete childEnv.SSH_AUTH_SOCK;
       else childEnv.SSH_AUTH_SOCK = sshAgent.socketPath;

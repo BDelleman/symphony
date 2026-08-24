@@ -166,6 +166,21 @@ export class ConfigValidator {
           at
         };
       }
+      const externalReview = effectiveConfig.review_approval.external_review;
+      if (
+        externalReview
+        && (!externalReview.bot_login.trim()
+          || !externalReview.request_marker.trim()
+          || !externalReview.unavailable_pattern.trim())
+      ) {
+        return {
+          ok: false,
+          error_code: 'invalid_review_approval',
+          message:
+            'review_approval.external_review requires non-empty bot_login, request_marker, and unavailable_pattern',
+          at
+        };
+      }
     }
 
     const githubLinkingMode = effectiveConfig.tracker.github_linking?.mode ?? 'off';
