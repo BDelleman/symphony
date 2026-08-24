@@ -498,11 +498,15 @@ export class ExecutionGraphWriter {
           redactUnknown(params.reason_detail ?? null)
         );
       if (params.status === 'running' && !params.ended_at) {
+        // A fresh attempt reopens the issue_run: clear the previous attempt's outcome
+        // columns so history never shows an active run carrying a settled failed outcome.
         this.db
           .prepare(
             `UPDATE issue_run SET
               ended_at = NULL,
               status = 'running',
+              process_status = NULL,
+              workflow_outcome = NULL,
               reason_code = ?,
               reason_detail = ?
             WHERE issue_run_id = ?`
