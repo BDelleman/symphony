@@ -4,13 +4,20 @@ import {
   collectExternalReviewEvidence,
   externalReviewEnvironment,
   externalReviewSettled,
+  parseExternalReviewPatterns,
   resolveExternalReviewPolicy,
   GitHubReviewClient
 } from '../../src/review';
 
 const HEAD = '01a4e58a103fda46ddca86a31ce3baefbaf304f4';
 const PREVIOUS_HEAD = '4d0e32a24f6dee937ee8b566b8c8fc00e134ce98';
-const POLICY = resolveExternalReviewPolicy({ SYMPHONY_EXTERNAL_REVIEW_BOT: 'chatgpt-codex-connector' });
+const POLICY = resolveExternalReviewPolicy({
+  SYMPHONY_EXTERNAL_REVIEW_BOT: 'chatgpt-codex-connector',
+  SYMPHONY_EXTERNAL_REVIEW_UNAVAILABLE_PATTERNS: JSON.stringify([
+    'usage limit',
+    'create an environment for this repo'
+  ])
+});
 
 // Reconstructed from conclusion-ai/ai-platform#577, where the App approval was
 // submitted at 07:19:47 and the review that contradicted it arrived at 07:19:58.
@@ -72,6 +79,28 @@ describe('external review evidence', () => {
     expect(externalReviewSettled(evidence, POLICY)).toBe(true);
   });
 
+  it('recognises every configured notice form, not just the first', () => {
+    // A reviewer declines in more than one voice. conclusion-ai/ai-platform#579
+    // drew "To use Codex here, create an environment for this repo", which
+    // shares no phrase with the usage-limit notice; a single pattern would
+    // leave the workflow declaring a settled state the gate could not confirm.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      policy: POLICY,
+      reviews: [],
+      comments: [
+        { login: 'bdelleman', body: '@codex review', created_at: '2026-08-24T08:42:05Z' },
+        {
+          login: 'chatgpt-codex-connector[bot]',
+          body: 'To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).',
+          created_at: '2026-08-24T08:42:14Z'
+        }
+      ]
+    });
+    expect(evidence.unavailable_at).toBe('2026-08-24T08:42:14Z');
+    expect(externalReviewSettled(evidence, POLICY)).toBe(true);
+  });
+
   it('ignores an unavailability notice that predates the current request', () => {
     const evidence = collectExternalReviewEvidence({
       headSha: HEAD,
@@ -109,6 +138,40 @@ describe('external review evidence', () => {
     const evidence = collectExternalReviewEvidence({ headSha: HEAD, policy, reviews: [], comments: [REQUEST] });
     expect(evidence).toEqual({ requested_at: null, answered_for_head: false, unavailable_at: null });
     expect(externalReviewSettled(evidence, policy)).toBe(true);
+  });
+});
+
+describe('external review worker handoff', () => {
+  it('carries the policy across the worker environment allowlist', () => {
+    // The worker environment is an allowlist, not an inherited copy, so a
+    // policy that is not handed over explicitly leaves `symphony review
+    // finalize` ungated inside the worker.
+    expect(externalReviewEnvironment(POLICY)).toEqual({
+      SYMPHONY_EXTERNAL_REVIEW_BOT: 'chatgpt-codex-connector',
+      SYMPHONY_EXTERNAL_REVIEW_REQUEST_MARKER: '@codex review',
+      SYMPHONY_EXTERNAL_REVIEW_UNAVAILABLE_PATTERNS:
+        '["usage limit","create an environment for this repo"]'
+    });
+    expect(resolveExternalReviewPolicy(externalReviewEnvironment(POLICY))).toEqual(POLICY);
+    expect(externalReviewEnvironment(resolveExternalReviewPolicy({}))).toEqual({});
+  });
+
+  it('carries a pattern containing a comma without splitting it', () => {
+    // JSON rather than a delimited string: a notice phrase is prose, and prose
+    // contains commas.
+    const policy = resolveExternalReviewPolicy({
+      SYMPHONY_EXTERNAL_REVIEW_BOT: 'reviewer',
+      SYMPHONY_EXTERNAL_REVIEW_UNAVAILABLE_PATTERNS: JSON.stringify(['sorry, no capacity'])
+    });
+    expect(policy.unavailable_patterns).toEqual(['sorry, no capacity']);
+    expect(resolveExternalReviewPolicy(externalReviewEnvironment(policy))).toEqual(policy);
+  });
+
+  it('yields no patterns for malformed input rather than a bogus one', () => {
+    expect(parseExternalReviewPatterns(undefined)).toEqual(['usage limit']);
+    expect(parseExternalReviewPatterns('not json')).toEqual([]);
+    expect(parseExternalReviewPatterns('"a string"')).toEqual([]);
+    expect(parseExternalReviewPatterns(JSON.stringify(['  Usage Limit  ', '', 7]))).toEqual(['usage limit']);
   });
 });
 
@@ -163,7 +226,10 @@ describe('snapshot feedback derivation', () => {
       token: 'test-token',
       externalReviewPolicy: POLICY,
       fetchFn: githubFixture({
-        reviews: [{ id: 1, user: { login: 'chatgpt-codex-connector[bot]' }, state: 'COMMENTED', body: '', commit_id: PREVIOUS_HEAD }],
+        reviews: [{
+          id: 1, user: { login: 'chatgpt-codex-connector[bot]' }, state: 'COMMENTED', body: '',
+          commit_id: PREVIOUS_HEAD
+        }],
         issueComments: [{ id: 10, user: { login: 'BDelleman' }, body: '@codex review', created_at: '2026-08-24T07:11:27Z' }],
         threads: [
           { id: 'thread-1', isResolved: true },
@@ -185,7 +251,10 @@ describe('snapshot feedback derivation', () => {
       token: 'test-token',
       externalReviewPolicy: POLICY,
       fetchFn: githubFixture({
-        reviews: [{ id: 2, user: { login: 'chatgpt-codex-connector[bot]' }, state: 'COMMENTED', body: '', commit_id: HEAD }],
+        reviews: [{
+          id: 2, user: { login: 'chatgpt-codex-connector[bot]' }, state: 'COMMENTED', body: '',
+          commit_id: HEAD
+        }],
         issueComments: [{ id: 10, user: { login: 'BDelleman' }, body: '@codex review', created_at: '2026-08-24T07:11:27Z' }],
         threads: [
           { id: 'thread-1', isResolved: true },
@@ -198,20 +267,5 @@ describe('snapshot feedback derivation', () => {
     const snapshot = await client.fetchSnapshot('acme/repo', 1, 'symphony-reviewer[bot]');
     expect(snapshot.unresolved_review_threads).toBe(3);
     expect(externalReviewSettled(snapshot.external_review, POLICY)).toBe(true);
-  });
-});
-
-describe('external review worker handoff', () => {
-  it('carries the policy across the worker environment allowlist', () => {
-    // The worker environment is an allowlist, not an inherited copy, so a
-    // policy that is not handed over explicitly leaves `symphony review
-    // finalize` ungated inside the worker.
-    expect(externalReviewEnvironment(POLICY)).toEqual({
-      SYMPHONY_EXTERNAL_REVIEW_BOT: 'chatgpt-codex-connector',
-      SYMPHONY_EXTERNAL_REVIEW_REQUEST_MARKER: '@codex review',
-      SYMPHONY_EXTERNAL_REVIEW_UNAVAILABLE_PATTERN: 'usage limits'
-    });
-    expect(resolveExternalReviewPolicy(externalReviewEnvironment(POLICY))).toEqual(POLICY);
-    expect(externalReviewEnvironment(resolveExternalReviewPolicy({}))).toEqual({});
   });
 });

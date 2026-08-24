@@ -77,7 +77,10 @@ describe('ConfigResolver', () => {
         review_approval: {
           provider: 'github_app',
           required: true,
-          external_review: { bot_login: 'chatgpt-codex-connector[bot]', unavailable_pattern: 'Usage Limits' }
+          external_review: {
+            bot_login: 'chatgpt-codex-connector[bot]',
+            unavailable_patterns: ['Usage Limit', '  Create an environment for this repo  ']
+          }
         }
       },
       prompt_template: 'prompt'
@@ -85,7 +88,7 @@ describe('ConfigResolver', () => {
     expect(config.review_approval?.external_review).toEqual({
       bot_login: 'chatgpt-codex-connector',
       request_marker: '@codex review',
-      unavailable_pattern: 'usage limits'
+      unavailable_patterns: ['usage limit', 'create an environment for this repo']
     });
 
     const withoutBot = resolver.resolve({

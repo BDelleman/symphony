@@ -9,7 +9,10 @@
 export interface ExternalReviewPolicy {
   bot_login: string;
   request_marker: string;
-  unavailable_pattern: string;
+  // A list because a reviewer declines in more than one voice: a usage ceiling
+  // and a credit ceiling do not share a phrase. One pattern per accepted form,
+  // and the configured list is the definition of "declined" — nothing else is.
+  unavailable_patterns: string[];
 }
 
 export interface ExternalReviewEvidence {
@@ -38,7 +41,7 @@ export const EXTERNAL_REVIEW_ABSENT: ExternalReviewEvidence = {
 export const EXTERNAL_REVIEW_ENV = {
   botLogin: 'SYMPHONY_EXTERNAL_REVIEW_BOT',
   requestMarker: 'SYMPHONY_EXTERNAL_REVIEW_REQUEST_MARKER',
-  unavailablePattern: 'SYMPHONY_EXTERNAL_REVIEW_UNAVAILABLE_PATTERN'
+  unavailablePatterns: 'SYMPHONY_EXTERNAL_REVIEW_UNAVAILABLE_PATTERNS'
 } as const;
 
 export function normaliseBotLogin(value: string): string {
@@ -47,11 +50,28 @@ export function normaliseBotLogin(value: string): string {
 
 // The requirement is opt-in: a project without a configured reviewer bot keeps
 // the previous behaviour instead of blocking on evidence it can never produce.
+// Patterns cross the worker boundary as JSON so a phrase containing a comma or
+// a quote cannot be split into two patterns that match nothing.
+export function parseExternalReviewPatterns(raw: string | undefined): string[] {
+  if (raw === undefined) return ['usage limit'];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return normaliseExternalReviewPatterns(parsed.filter((entry): entry is string => typeof entry === 'string'));
+  } catch {
+    return [];
+  }
+}
+
+export function normaliseExternalReviewPatterns(patterns: readonly string[]): string[] {
+  return patterns.map((pattern) => pattern.trim().toLowerCase()).filter((pattern) => pattern.length > 0);
+}
+
 export function resolveExternalReviewPolicy(env: NodeJS.ProcessEnv): ExternalReviewPolicy {
   return {
     bot_login: normaliseBotLogin(env[EXTERNAL_REVIEW_ENV.botLogin] ?? ''),
     request_marker: (env[EXTERNAL_REVIEW_ENV.requestMarker] ?? '@codex review').trim().toLowerCase(),
-    unavailable_pattern: (env[EXTERNAL_REVIEW_ENV.unavailablePattern] ?? 'usage limits').trim().toLowerCase()
+    unavailable_patterns: parseExternalReviewPatterns(env[EXTERNAL_REVIEW_ENV.unavailablePatterns])
   };
 }
 
@@ -69,7 +89,7 @@ export function externalReviewEnvironment(
   return {
     [EXTERNAL_REVIEW_ENV.botLogin]: policy.bot_login,
     [EXTERNAL_REVIEW_ENV.requestMarker]: policy.request_marker,
-    [EXTERNAL_REVIEW_ENV.unavailablePattern]: policy.unavailable_pattern
+    [EXTERNAL_REVIEW_ENV.unavailablePatterns]: JSON.stringify(policy.unavailable_patterns)
   };
 }
 
@@ -103,8 +123,7 @@ export function collectExternalReviewEvidence(input: {
   const unavailable = input.comments
     .filter((comment) =>
       isBot(comment.login)
-      && policy.unavailable_pattern.length > 0
-      && comment.body.toLowerCase().includes(policy.unavailable_pattern)
+      && policy.unavailable_patterns.some((pattern) => comment.body.toLowerCase().includes(pattern))
       && (requestedAt === null || comment.created_at >= requestedAt))
     .map((comment) => comment.created_at)
     .filter((createdAt) => createdAt.length > 0)

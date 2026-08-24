@@ -89,7 +89,7 @@ export interface AgentRunnerStartInput extends Omit<CodexRunnerStartInput, 'onEv
     attempt: number | null;
     symphony_attempt_id?: string;
     base_ref?: string;
-    external_review?: { bot_login: string; request_marker: string; unavailable_pattern: string };
+    external_review?: { bot_login: string; request_marker: string; unavailable_patterns: string[] };
   };
 }
 

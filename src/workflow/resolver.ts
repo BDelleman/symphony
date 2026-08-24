@@ -2,6 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { DEFAULT_LOG_ROTATION_MAX_BYTES, DEFAULT_LOG_ROTATION_MAX_FILES } from '../observability';
+import { normaliseExternalReviewPatterns } from '../review/external-review';
 import { WorkflowConfigError } from './errors';
 import type { EffectiveConfig, WorkflowDefinition } from './types';
 
@@ -719,7 +720,9 @@ export class ConfigResolver {
                     external_review: {
                       bot_login: externalReviewBotLogin,
                       request_marker: readString(externalReview.request_marker, '@codex review').trim().toLowerCase(),
-                      unavailable_pattern: readString(externalReview.unavailable_pattern, 'usage limits').trim().toLowerCase()
+                      unavailable_patterns: normaliseExternalReviewPatterns(
+                        readStringList(externalReview.unavailable_patterns, ['usage limit'])
+                      )
                     }
                   }
                 : {})
