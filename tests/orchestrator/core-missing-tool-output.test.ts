@@ -91,6 +91,86 @@ describe('OrchestratorCore missing tool output', () => {
     ]);
   });
 
+  it('defers missing-tool-output recovery while other tool activity shows the worker advancing', async () => {
+    const harness = createHarness({
+      configOverrides: { running_wait_stall_threshold_ms: 1_000, stall_timeout_ms: 60_000 }
+    });
+    harness.tracker.fetch_candidate_issues.mockResolvedValue([makeIssue({ id: 'i-live-subagent', identifier: 'ABC-LIVE-SUB' })]);
+    await harness.orchestrator.tick('interval');
+
+    harness.orchestrator.onWorkerEvent('i-live-subagent', {
+      timestamp_ms: harness.now.value,
+      event: CANONICAL_EVENT.codex.turnStarted,
+      thread_id: 'thread-live',
+      turn_id: 'turn-1',
+      session_id: 'session-live'
+    });
+    harness.orchestrator.onWorkerEvent('i-live-subagent', {
+      timestamp_ms: harness.now.value + 10,
+      event: CANONICAL_EVENT.codex.toolCallStarted,
+      detail: 'claude_tool_started',
+      thread_id: 'thread-live',
+      turn_id: 'turn-1',
+      session_id: 'session-live',
+      tool_name: 'Agent',
+      tool_call_id: 'call_agent_1'
+    });
+
+    // The Agent call stays outstanding past the threshold, but the subagent keeps
+    // streaming its own tool events: the worker is demonstrably advancing.
+    for (let step = 1; step <= 4; step += 1) {
+      harness.now.value += 600;
+      harness.orchestrator.onWorkerEvent('i-live-subagent', {
+        timestamp_ms: harness.now.value,
+        event: CANONICAL_EVENT.codex.toolCallStarted,
+        detail: 'claude_tool_started',
+        thread_id: 'thread-live',
+        turn_id: 'turn-1',
+        session_id: 'session-live',
+        tool_name: 'Edit',
+        tool_call_id: `call_edit_${step}`
+      });
+      harness.orchestrator.onWorkerEvent('i-live-subagent', {
+        timestamp_ms: harness.now.value + 5,
+        event: CANONICAL_EVENT.codex.toolCallCompleted,
+        detail: 'claude_tool_completed',
+        thread_id: 'thread-live',
+        turn_id: 'turn-1',
+        session_id: 'session-live',
+        tool_name: 'Edit',
+        tool_call_id: `call_edit_${step}`
+      });
+      await harness.orchestrator.tick('interval');
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    expect(harness.orchestrator.getStateSnapshot().running.has('i-live-subagent')).toBe(true);
+    expect(harness.orchestrator.getStateSnapshot().blocked_inputs.has('i-live-subagent')).toBe(false);
+    expect(harness.terminated).toEqual([]);
+    expect(
+      harness.orchestrator
+        .getStateSnapshot()
+        .recent_runtime_events.some(
+          (event) => event.event === CANONICAL_EVENT.orchestration.missingToolOutputRecoveryDeferred
+        )
+    ).toBe(true);
+
+    // Once every signal goes quiet for a full threshold window, the watchdog proceeds.
+    harness.now.value += 2_000;
+    await harness.orchestrator.tick('interval');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const blocked = harness.orchestrator.getStateSnapshot().blocked_inputs.get('i-live-subagent');
+    expect(blocked).toMatchObject({
+      stop_reason_code: REASON_CODES.missingToolOutput,
+      tool_output_wait: {
+        tool_name: 'Agent',
+        call_id: 'call_agent_1'
+      }
+    });
+    expect(harness.orchestrator.getStateSnapshot().running.has('i-live-subagent')).toBe(false);
+  });
+
   it('blocks a linear_graphql MCP-style tool call that never records matching tool output by call id', async () => {
     const harness = createHarness({
       configOverrides: { running_wait_stall_threshold_ms: 1_000, stall_timeout_ms: 60_000 }

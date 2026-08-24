@@ -76,6 +76,7 @@ export const CANONICAL_EVENT = {
     blockedInputCleared: 'orchestration.blocked_input.cleared',
     automationFaultCleared: 'orchestration.automation_fault.cleared',
     blockedWorkerEventQuarantined: 'orchestration.blocked_worker_event.quarantined',
+    missingToolOutputRecoveryDeferred: 'orchestration.missing_tool_output_recovery.deferred',
     missingToolOutputRecoveryStarted: 'orchestration.missing_tool_output_recovery.started',
     missingToolOutputRecoveryInterruptCompleted: 'orchestration.missing_tool_output_recovery.interrupt_completed',
     missingToolOutputRecoveryStartFailed: 'orchestration.missing_tool_output_recovery.start_failed',

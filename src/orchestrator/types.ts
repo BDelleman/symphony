@@ -249,6 +249,7 @@ export interface OutstandingToolCall {
   last_waiting_at_ms: number | null;
   last_agent_message: string | null;
   evidence_source: ToolCallEvidenceSource;
+  recovery_deferred_at_ms?: number | null;
 }
 
 export type ToolCallCompletionStatus = 'pending' | 'completed';
