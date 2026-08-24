@@ -14,6 +14,7 @@ export interface GitHubPullRequestSnapshot {
   draft: boolean;
   state: string;
   checks_green: boolean;
+  checks_settled: boolean;
   review_decision: string | null;
   semantic_context: Record<string, unknown>;
   context_sha256: string;
@@ -260,8 +261,9 @@ export class GitHubReviewClient {
       || left.status.localeCompare(right.status)
       || left.conclusion.localeCompare(right.conclusion)
     );
-    const checksGreen = semanticChecks.length > 0 && semanticChecks.every((check) =>
-      check.status === 'completed' && ['success', 'neutral', 'skipped'].includes(check.conclusion)
+    const checksSettled = semanticChecks.length > 0 && semanticChecks.every((check) => check.status === 'completed');
+    const checksGreen = checksSettled && semanticChecks.every((check) =>
+      ['success', 'neutral', 'skipped'].includes(check.conclusion)
     );
 
     const reviewer = normaliseReviewerLogin(reviewerLogin);
@@ -320,6 +322,7 @@ export class GitHubReviewClient {
       draft: pr.draft === true,
       state: stringValue(pr.state),
       checks_green: checksGreen,
+      checks_settled: checksSettled,
       review_decision: reviewDecision,
       semantic_context: semanticContext,
       context_sha256: crypto.createHash('sha256').update(canonicalJson(semanticContext)).digest('hex')
