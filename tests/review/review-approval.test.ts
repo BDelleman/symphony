@@ -29,7 +29,7 @@ const dirs: string[] = [];
 // No reviewer bot is configured in these fixtures, so the external-review
 // requirement is inert and every snapshot reads as a finished conversation.
 function settledExternalReview(): ExternalReviewEvidence {
-  return { requested_at: null, answered_for_head: false, unavailable_at: null };
+  return { requested_at: null, answered_at: null, unavailable_at: null };
 }
 const baseSha = 'a'.repeat(40);
 const headSha = 'b'.repeat(40);
@@ -517,7 +517,7 @@ describe('review finalize feedback gate', () => {
   };
   const pending = {
     unresolved_review_threads: 0,
-    external_review: { requested_at: '2026-08-24T07:11:27Z', answered_for_head: false, unavailable_at: null }
+    external_review: { requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null }
   };
 
   it('refuses an approval route while the external reviewer has not answered for this head', async () => {
@@ -539,7 +539,7 @@ describe('review finalize feedback gate', () => {
     const bodyFile = await draftFor(root, head);
     const client = { fetchSnapshot: vi.fn(async () => snapshotFor(head, {
       unresolved_review_threads: 3,
-      external_review: { requested_at: '2026-08-24T07:11:27Z', answered_for_head: true, unavailable_at: null }
+      external_review: { requested_at: '2026-08-24T07:11:27Z', answered_at: '2026-08-24T07:19:58Z', unavailable_at: null }
     })) } as any;
     await expect(finalizeAgentReview({
       issue: 'NIE-574', pr: 574, route: 'merging', bodyFile, cwd: root, env, client
@@ -553,7 +553,7 @@ describe('review finalize feedback gate', () => {
     const bodyFile = await draftFor(root, head);
     const client = { fetchSnapshot: vi.fn(async () => snapshotFor(head, {
       unresolved_review_threads: 3,
-      external_review: { requested_at: '2026-08-24T07:11:27Z', answered_for_head: false, unavailable_at: null }
+      external_review: { requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null }
     })) } as any;
     for (const route of ['in_progress', 'rework'] as const) {
       await expect(finalizeAgentReview({
@@ -569,7 +569,7 @@ describe('review finalize feedback gate', () => {
       unresolved_review_threads: 0,
       external_review: {
         requested_at: '2026-08-23T10:14:44Z',
-        answered_for_head: false,
+        answered_at: null,
         unavailable_at: '2026-08-23T10:14:54Z'
       }
     })) } as any;
@@ -635,7 +635,7 @@ describe('supervisor feedback mirror', () => {
         fetchSnapshot: vi.fn(async () => snapshotFor(head, {
           context_sha256: receipt.github_context_sha256,
           unresolved_review_threads: 0,
-          external_review: { requested_at: '2026-08-24T07:11:27Z', answered_for_head: false, unavailable_at: null }
+          external_review: { requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null }
         }))
       } as any,
       brokerFactory: () => ({

@@ -34,12 +34,16 @@ describe('external review evidence', () => {
       policy: POLICY,
       // The previous round's review is answered and resolved; it says nothing
       // about the commit that replaced it.
-      reviews: [{ login: 'chatgpt-codex-connector[bot]', commit_id: PREVIOUS_HEAD }],
+      reviews: [{
+        login: 'chatgpt-codex-connector[bot]',
+        commit_id: PREVIOUS_HEAD,
+        submitted_at: '2026-08-23T13:58:24Z'
+      }],
       comments: [REQUEST]
     });
     expect(evidence).toEqual({
       requested_at: '2026-08-24T07:11:27Z',
-      answered_for_head: false,
+      answered_at: null,
       unavailable_at: null
     });
     expect(externalReviewSettled(evidence, POLICY)).toBe(false);
@@ -50,13 +54,34 @@ describe('external review evidence', () => {
       headSha: HEAD,
       policy: POLICY,
       reviews: [
-        { login: 'chatgpt-codex-connector[bot]', commit_id: PREVIOUS_HEAD },
-        { login: 'chatgpt-codex-connector[bot]', commit_id: HEAD }
+        { login: 'chatgpt-codex-connector[bot]', commit_id: PREVIOUS_HEAD, submitted_at: '2026-08-23T13:58:24Z' },
+        { login: 'chatgpt-codex-connector[bot]', commit_id: HEAD, submitted_at: '2026-08-24T07:19:58Z' }
       ],
       comments: [REQUEST]
     });
-    expect(evidence.answered_for_head).toBe(true);
+    expect(evidence.answered_at).toBe('2026-08-24T07:19:58Z');
     expect(externalReviewSettled(evidence, POLICY)).toBe(true);
+  });
+
+  it('reopens the wait when a newer request outlives the last answer', () => {
+    // A run that stops while Codex is still answering can be redispatched, and
+    // the fresh run may post a second request. The first answer does not answer
+    // the second request: a review may still be in flight, and treating the
+    // earlier one as final would approve just before the later one lands, which
+    // is the failure this gate exists to prevent.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      policy: POLICY,
+      reviews: [{
+        login: 'chatgpt-codex-connector[bot]',
+        commit_id: HEAD,
+        submitted_at: '2026-08-24T07:19:58Z'
+      }],
+      comments: [REQUEST, { login: 'bdelleman', body: '@codex review', created_at: '2026-08-24T08:30:00Z' }]
+    });
+    expect(evidence.answered_at).toBe('2026-08-24T07:19:58Z');
+    expect(evidence.requested_at).toBe('2026-08-24T08:30:00Z');
+    expect(externalReviewSettled(evidence, POLICY)).toBe(false);
   });
 
   it('settles on an explicit unavailability notice', () => {
@@ -115,7 +140,7 @@ describe('external review evidence', () => {
         REQUEST
       ]
     });
-    expect(evidence.unavailable_at).toBeNull();
+    expect(evidence.unavailable_at).toBe('2026-08-23T10:14:54Z');
     expect(externalReviewSettled(evidence, POLICY)).toBe(false);
   });
 
@@ -136,7 +161,7 @@ describe('external review evidence', () => {
   it('stays inert when no reviewer bot is configured', () => {
     const policy = resolveExternalReviewPolicy({});
     const evidence = collectExternalReviewEvidence({ headSha: HEAD, policy, reviews: [], comments: [REQUEST] });
-    expect(evidence).toEqual({ requested_at: null, answered_for_head: false, unavailable_at: null });
+    expect(evidence).toEqual({ requested_at: null, answered_at: null, unavailable_at: null });
     expect(externalReviewSettled(evidence, policy)).toBe(true);
   });
 });
@@ -228,7 +253,7 @@ describe('snapshot feedback derivation', () => {
       fetchFn: githubFixture({
         reviews: [{
           id: 1, user: { login: 'chatgpt-codex-connector[bot]' }, state: 'COMMENTED', body: '',
-          commit_id: PREVIOUS_HEAD
+          commit_id: PREVIOUS_HEAD, submitted_at: '2026-08-23T13:58:24Z'
         }],
         issueComments: [{ id: 10, user: { login: 'BDelleman' }, body: '@codex review', created_at: '2026-08-24T07:11:27Z' }],
         threads: [
@@ -242,7 +267,7 @@ describe('snapshot feedback derivation', () => {
     expect(snapshot.unresolved_review_threads).toBe(0);
     // Clean by every state reading, and still not approvable: the reviewer has
     // not spoken about this head yet. This is exactly the 07:19:24 moment.
-    expect(snapshot.external_review.answered_for_head).toBe(false);
+    expect(snapshot.external_review.answered_at).toBeNull();
     expect(externalReviewSettled(snapshot.external_review, POLICY)).toBe(false);
   });
 
@@ -253,7 +278,7 @@ describe('snapshot feedback derivation', () => {
       fetchFn: githubFixture({
         reviews: [{
           id: 2, user: { login: 'chatgpt-codex-connector[bot]' }, state: 'COMMENTED', body: '',
-          commit_id: HEAD
+          commit_id: HEAD, submitted_at: '2026-08-24T07:19:58Z'
         }],
         issueComments: [{ id: 10, user: { login: 'BDelleman' }, body: '@codex review', created_at: '2026-08-24T07:11:27Z' }],
         threads: [
