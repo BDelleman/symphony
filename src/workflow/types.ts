@@ -129,7 +129,7 @@ export interface AgentRuntimeConfig {
 export interface ExternalReviewConfig {
   bot_login: string;
   request_marker: string;
-  unavailable_pattern: string;
+  unavailable_patterns: string[];
 }
 
 export interface ReviewApprovalConfig {

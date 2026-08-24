@@ -167,17 +167,21 @@ export class ConfigValidator {
         };
       }
       const externalReview = effectiveConfig.review_approval.external_review;
+      // An empty pattern list is the dangerous shape: every declined review
+      // would stay unsettled forever, so the gate would block instead of
+      // recognising a reviewer that answered.
       if (
         externalReview
         && (!externalReview.bot_login.trim()
           || !externalReview.request_marker.trim()
-          || !externalReview.unavailable_pattern.trim())
+          || externalReview.unavailable_patterns.length === 0)
       ) {
         return {
           ok: false,
           error_code: 'invalid_review_approval',
           message:
-            'review_approval.external_review requires non-empty bot_login, request_marker, and unavailable_pattern',
+            'review_approval.external_review requires non-empty bot_login, request_marker, '
+            + 'and at least one unavailable_patterns entry',
           at
         };
       }
