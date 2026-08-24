@@ -11,6 +11,7 @@ import type { WorkspaceInfo } from '../workspace';
 import type { ReviewApprovalActionRecord, ReviewApprovalActionStatus } from '../persistence';
 import { resolveWorkspaceGitDirectory } from './capsule';
 import { extractReviewArtifact, extractReviewReceipt, receiptSha256, reviewSha256 } from './contract';
+import { checksRequirementForRoute } from './finalize';
 import { GitHubAppApprovalBroker } from './github-app-broker';
 import { GitHubReviewClient, parseGitHubRemote } from './github-context';
 import type { AgentReviewOutcome, ReviewApprovalResult, ReviewRoute } from './types';
@@ -41,6 +42,15 @@ function routeState(route: ReviewRoute): string {
 
 function sameState(left: string, right: string): boolean {
   return left.trim().toLowerCase() === right.trim().toLowerCase();
+}
+
+// Mirrors the finalize-side gate so the supervisor accepts exactly the routes finalize can mint:
+// green checks for the approval routes, a settled check set for the send-back routes.
+function checksSatisfyRoute(
+  route: ReviewRoute,
+  snapshot: { checks_green: boolean; checks_settled: boolean }
+): boolean {
+  return checksRequirementForRoute(route) === 'green' ? snapshot.checks_green : snapshot.checks_settled;
 }
 
 function git(workspace: string, args: string[]): string {
@@ -155,6 +165,7 @@ export class ReviewApprovalCoordinator {
         const broker = this.broker();
         const identity = await broker.separatedIdentity();
         const snapshot = await this.client.fetchSnapshot(action.repository, action.pr_number, identity.login);
+        const passRoute = route === 'merging' || route === 'human_review';
         if (
           snapshot.state !== 'open'
           || snapshot.draft
@@ -162,13 +173,12 @@ export class ReviewApprovalCoordinator {
           || snapshot.base_sha !== action.base_sha
           || snapshot.head_sha !== action.head_sha
           || snapshot.context_sha256 !== action.github_context_sha256
-          || !snapshot.checks_green
+          || !checksSatisfyRoute(route, snapshot)
         ) {
           persist('superseded', { reason_code: REASON_CODES.reviewApprovalContextMismatch });
           superseded += 1;
           continue;
         }
-        const passRoute = route === 'merging' || route === 'human_review';
         const effectiveRoute = passRoute && issue.labels.some((label) => label.toLowerCase() === 'human review')
           ? 'human_review'
           : route;
@@ -397,7 +407,11 @@ export class ReviewApprovalCoordinator {
       if (receipt.base_ref !== snapshot.base_ref) contextMismatches.push('receipt_base_ref_drift');
       if (snapshot.base_sha !== receipt.base_sha) contextMismatches.push('base_sha_drift');
       if (snapshot.head_sha !== receipt.head_sha) contextMismatches.push('head_sha_drift');
-      if (!snapshot.checks_green) contextMismatches.push('checks_not_green');
+      if (!checksSatisfyRoute(receipt.route, snapshot)) {
+        contextMismatches.push(
+          checksRequirementForRoute(receipt.route) === 'green' ? 'checks_not_green' : 'checks_unsettled'
+        );
+      }
       if (snapshot.context_sha256 !== receipt.github_context_sha256) contextMismatches.push('github_context_drift');
       if (contextMismatches.length > 0) {
         updateAction('superseded', { reason_code: REASON_CODES.reviewApprovalContextMismatch });

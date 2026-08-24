@@ -41,6 +41,24 @@ function verdictForRoute(route: ReviewRoute): ReviewVerdict {
   return 'reset';
 }
 
+// Green checks gate the App approval, which only passing routes ever submit. The send-back
+// routes exist precisely for red CI, so they require a settled check set instead: the review
+// must still describe a decided PR, but a failing one no longer traps the issue in the gate.
+export function checksRequirementForRoute(route: ReviewRoute): 'green' | 'settled' {
+  return verdictForRoute(route) === 'pass' ? 'green' : 'settled';
+}
+
+function assertChecksSatisfyRoute(
+  route: ReviewRoute,
+  snapshot: { checks_green: boolean; checks_settled: boolean }
+): void {
+  if (checksRequirementForRoute(route) === 'green') {
+    if (!snapshot.checks_green) throw new Error('review_finalize_checks_not_green');
+    return;
+  }
+  if (!snapshot.checks_settled) throw new Error('review_finalize_checks_unsettled');
+}
+
 function assertReviewBody(body: string): void {
   if (!body.trim()) throw new Error('review_finalize_body_empty');
   if (body.includes('### Review Receipt')) throw new Error('review_finalize_body_contains_receipt');
@@ -90,7 +108,7 @@ export async function finalizeAgentReview(options: FinalizeOptions): Promise<Fin
     throw new Error(`review_finalize_pr_base_mismatch:pr=${snapshot.base_ref},workflow=${expectedBaseRef}`);
   }
   if (snapshot.head_sha !== headSha) throw new Error('review_finalize_head_mismatch');
-  if (!snapshot.checks_green) throw new Error('review_finalize_checks_not_green');
+  assertChecksSatisfyRoute(options.route, snapshot);
 
   const artifactHash = reviewSha256(reviewBody);
   const receipt: ReviewReceiptV2 = {
