@@ -3,6 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { encodeReviewOutcome, normalizeReviewMarkdown, receiptSha256, reviewSha256 } from './contract';
+import {
+  externalReviewSettled,
+  resolveExternalReviewPolicy,
+  type ExternalReviewEvidence,
+  type ExternalReviewPolicy
+} from './external-review';
 import { createGhApiFetch, GitHubReviewClient, parseGitHubRemote } from './github-context';
 import type { AgentReviewOutcome, ReviewReceiptV2, ReviewRoute, ReviewVerdict } from './types';
 
@@ -48,6 +54,14 @@ export function checksRequirementForRoute(route: ReviewRoute): 'green' | 'settle
   return verdictForRoute(route) === 'pass' ? 'green' : 'settled';
 }
 
+// Same split as the checks gate: only the routes that end in an App approval
+// have to prove the review conversation is finished. The send-back routes exist
+// to report unfinished work, so requiring finished feedback of them would trap
+// exactly the issues that need to move.
+export function externalReviewRequirementForRoute(route: ReviewRoute): 'settled' | 'none' {
+  return verdictForRoute(route) === 'pass' ? 'settled' : 'none';
+}
+
 function assertChecksSatisfyRoute(
   route: ReviewRoute,
   snapshot: { checks_green: boolean; checks_settled: boolean }
@@ -57,6 +71,25 @@ function assertChecksSatisfyRoute(
     return;
   }
   if (!snapshot.checks_settled) throw new Error('review_finalize_checks_unsettled');
+}
+
+// Two conditions of different kinds, and an approval needs both. Unresolved
+// threads are state: someone raised something and nobody closed it. Settlement
+// is liveness: the reviewer has finished with this head. State alone approves
+// the findings that have not been posted yet, which is precisely how an
+// approval lands seconds before the review that contradicts it.
+function assertReviewFeedbackSatisfiesRoute(
+  route: ReviewRoute,
+  snapshot: { unresolved_review_threads: number; external_review: ExternalReviewEvidence },
+  policy: ExternalReviewPolicy
+): void {
+  if (externalReviewRequirementForRoute(route) === 'none') return;
+  if (!externalReviewSettled(snapshot.external_review, policy)) {
+    throw new Error('review_finalize_external_review_pending');
+  }
+  if (snapshot.unresolved_review_threads > 0) {
+    throw new Error(`review_finalize_unresolved_review_threads:${snapshot.unresolved_review_threads}`);
+  }
 }
 
 function assertReviewBody(body: string): void {
@@ -92,9 +125,11 @@ export async function finalizeAgentReview(options: FinalizeOptions): Promise<Fin
   const reviewBody = normalizeReviewMarkdown(fs.readFileSync(bodyPath, 'utf8'));
   assertReviewBody(reviewBody);
 
+  const externalReviewPolicy = resolveExternalReviewPolicy(options.env);
   const client = options.client ?? new GitHubReviewClient({
     token: options.env.GH_TOKEN ?? options.env.GITHUB_TOKEN,
-    fetchFn: createGhApiFetch({ cwd: root, env: options.env })
+    fetchFn: createGhApiFetch({ cwd: root, env: options.env }),
+    externalReviewPolicy
   });
   const reviewerLogin = options.env.SYMPHONY_REVIEWER_APP_LOGIN ?? 'symphony-reviewer[bot]';
   const snapshot = await client.fetchSnapshot(repository, options.pr, reviewerLogin);
@@ -109,6 +144,7 @@ export async function finalizeAgentReview(options: FinalizeOptions): Promise<Fin
   }
   if (snapshot.head_sha !== headSha) throw new Error('review_finalize_head_mismatch');
   assertChecksSatisfyRoute(options.route, snapshot);
+  assertReviewFeedbackSatisfiesRoute(options.route, snapshot, externalReviewPolicy);
 
   const artifactHash = reviewSha256(reviewBody);
   const receipt: ReviewReceiptV2 = {
