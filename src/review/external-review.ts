@@ -19,6 +19,11 @@ export interface ExternalReviewEvidence {
   requested_at: string | null;
   answered_at: string | null;
   unavailable_at: string | null;
+  // When the current head first became the PR head, from GitHub's own
+  // timeline. Reviews name the commit they reviewed; requests and
+  // unavailability notices do not, so this is the only anchor that can bind
+  // them to a head. Null means the arrival could not be established.
+  head_arrived_at: string | null;
 }
 
 export interface ExternalReviewReviewInput {
@@ -36,7 +41,8 @@ export interface ExternalReviewCommentInput {
 export const EXTERNAL_REVIEW_ABSENT: ExternalReviewEvidence = {
   requested_at: null,
   answered_at: null,
-  unavailable_at: null
+  unavailable_at: null,
+  head_arrived_at: null
 };
 
 export const EXTERNAL_REVIEW_ENV = {
@@ -96,6 +102,9 @@ export function externalReviewEnvironment(
 
 export function collectExternalReviewEvidence(input: {
   headSha: string;
+  // Recorded as a fact, applied as a rule in externalReviewSettled: the
+  // evidence stays a plain readback of GitHub, and one place decides.
+  headArrivedAt: string | null;
   policy: ExternalReviewPolicy;
   reviews: readonly ExternalReviewReviewInput[];
   comments: readonly ExternalReviewCommentInput[];
@@ -132,20 +141,51 @@ export function collectExternalReviewEvidence(input: {
       && policy.unavailable_patterns.some((pattern) => comment.body.toLowerCase().includes(pattern)))
     .map((comment) => comment.created_at));
 
-  return { requested_at: requestedAt, answered_at: answeredAt, unavailable_at: unavailableAt };
+  return {
+    requested_at: requestedAt,
+    answered_at: answeredAt,
+    unavailable_at: unavailableAt,
+    head_arrived_at: input.headArrivedAt
+  };
 }
+
+// The two ways the wait can still be open, named apart so the logs can tell a
+// reviewer that has not spoken from a notice that vouches for the wrong head.
+export type ExternalReviewHold = 'pending' | 'stale_request';
 
 // Silence is not availability. Only a review bound to this head, or the
 // reviewer saying it will not produce one, ends the wait — and the answer has
 // to be newer than the request it answers. A request posted after the last
 // answer is still outstanding, so a second review may still land; treating the
 // earlier answer as final there would reopen the very race this gate closes.
+//
+// A review names the commit it reviewed, so answered_at is head-bound by
+// construction. An unavailability notice names nothing, and the bare request
+// it answers names nothing either, so ordering alone lets a notice for an old
+// head settle a new one: request for commit A, commits land, the reviewer
+// declines — the decline postdates the request and vouches for a head nobody
+// asked about. Unavailability therefore settles only when the full chain
+// holds: unavailable_at >= newest requested_at >= head_arrived_at. A request
+// older than the current head is evidence for a previous head, and an
+// unknown arrival time proves nothing, so both hold — the gate fails closed.
+export function externalReviewHold(
+  evidence: ExternalReviewEvidence,
+  policy: ExternalReviewPolicy
+): ExternalReviewHold | null {
+  if (!externalReviewRequired(policy)) return null;
+  const answersRequest = (answeredAt: string | null): boolean =>
+    answeredAt !== null && (evidence.requested_at === null || answeredAt >= evidence.requested_at);
+  if (answersRequest(evidence.answered_at)) return null;
+  if (!answersRequest(evidence.unavailable_at)) return 'pending';
+  const requestBoundToHead = evidence.requested_at !== null
+    && evidence.head_arrived_at !== null
+    && evidence.requested_at >= evidence.head_arrived_at;
+  return requestBoundToHead ? null : 'stale_request';
+}
+
 export function externalReviewSettled(
   evidence: ExternalReviewEvidence,
   policy: ExternalReviewPolicy
 ): boolean {
-  if (!externalReviewRequired(policy)) return true;
-  const answersRequest = (answeredAt: string | null): boolean =>
-    answeredAt !== null && (evidence.requested_at === null || answeredAt >= evidence.requested_at);
-  return answersRequest(evidence.answered_at) || answersRequest(evidence.unavailable_at);
+  return externalReviewHold(evidence, policy) === null;
 }

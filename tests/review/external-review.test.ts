@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   collectExternalReviewEvidence,
   externalReviewEnvironment,
+  externalReviewHold,
   externalReviewSettled,
   parseExternalReviewPatterns,
   resolveExternalReviewPolicy,
@@ -11,6 +12,8 @@ import {
 
 const HEAD = '01a4e58a103fda46ddca86a31ce3baefbaf304f4';
 const PREVIOUS_HEAD = '4d0e32a24f6dee937ee8b566b8c8fc00e134ce98';
+// When HEAD became the PR head, just before the request below asked about it.
+const HEAD_ARRIVED = '2026-08-24T07:10:12Z';
 const POLICY = resolveExternalReviewPolicy({
   SYMPHONY_EXTERNAL_REVIEW_BOT: 'chatgpt-codex-connector',
   SYMPHONY_EXTERNAL_REVIEW_UNAVAILABLE_PATTERNS: JSON.stringify([
@@ -31,6 +34,7 @@ describe('external review evidence', () => {
   it('reports pending while the reviewer has not answered for this head', () => {
     const evidence = collectExternalReviewEvidence({
       headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
       policy: POLICY,
       // The previous round's review is answered and resolved; it says nothing
       // about the commit that replaced it.
@@ -44,14 +48,17 @@ describe('external review evidence', () => {
     expect(evidence).toEqual({
       requested_at: '2026-08-24T07:11:27Z',
       answered_at: null,
-      unavailable_at: null
+      unavailable_at: null,
+      head_arrived_at: HEAD_ARRIVED
     });
     expect(externalReviewSettled(evidence, POLICY)).toBe(false);
+    expect(externalReviewHold(evidence, POLICY)).toBe('pending');
   });
 
   it('settles once the reviewer answers for the exact head', () => {
     const evidence = collectExternalReviewEvidence({
       headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
       policy: POLICY,
       reviews: [
         { login: 'chatgpt-codex-connector[bot]', commit_id: PREVIOUS_HEAD, submitted_at: '2026-08-23T13:58:24Z' },
@@ -63,6 +70,20 @@ describe('external review evidence', () => {
     expect(externalReviewSettled(evidence, POLICY)).toBe(true);
   });
 
+  it('lets an answer for the exact head settle even without an arrival time', () => {
+    // answered_at is head-bound by construction — the review names the commit
+    // it reviewed — so it must not depend on the timeline lookup succeeding.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: null,
+      policy: POLICY,
+      reviews: [{ login: 'chatgpt-codex-connector[bot]', commit_id: HEAD, submitted_at: '2026-08-24T07:19:58Z' }],
+      comments: [REQUEST]
+    });
+    expect(evidence.head_arrived_at).toBeNull();
+    expect(externalReviewSettled(evidence, POLICY)).toBe(true);
+  });
+
   it('reopens the wait when a newer request outlives the last answer', () => {
     // A run that stops while Codex is still answering can be redispatched, and
     // the fresh run may post a second request. The first answer does not answer
@@ -71,6 +92,7 @@ describe('external review evidence', () => {
     // is the failure this gate exists to prevent.
     const evidence = collectExternalReviewEvidence({
       headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
       policy: POLICY,
       reviews: [{
         login: 'chatgpt-codex-connector[bot]',
@@ -86,9 +108,11 @@ describe('external review evidence', () => {
 
   it('settles on an explicit unavailability notice', () => {
     // conclusion-ai/ai-platform#569: the quota notice landed ten seconds after
-    // the request, which is what real unavailability looks like.
+    // the request, which is what real unavailability looks like. The head was
+    // already on the PR when the request went out, so the notice vouches for it.
     const evidence = collectExternalReviewEvidence({
       headSha: HEAD,
+      headArrivedAt: '2026-08-23T10:13:02Z',
       policy: POLICY,
       reviews: [],
       comments: [
@@ -104,6 +128,75 @@ describe('external review evidence', () => {
     expect(externalReviewSettled(evidence, POLICY)).toBe(true);
   });
 
+  it('refuses a notice answering a request older than the current head', () => {
+    // The stale-request hole found five times on conclusion-ai/ai-platform#579:
+    // a request goes out for commit A, new commits land, the reviewer posts a
+    // usage-limit notice. The notice postdates the request, but the request
+    // predates the head — nobody ever asked for a review of this head, so the
+    // decline is evidence for a previous one and must not settle anything.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: '2026-08-24T07:15:00Z',
+      policy: POLICY,
+      reviews: [],
+      comments: [
+        REQUEST,
+        {
+          login: 'chatgpt-codex-connector[bot]',
+          body: 'You have reached your Codex usage limits for code reviews.',
+          created_at: '2026-08-24T07:16:30Z'
+        }
+      ]
+    });
+    expect(evidence.unavailable_at).toBe('2026-08-24T07:16:30Z');
+    expect(externalReviewSettled(evidence, POLICY)).toBe(false);
+    expect(externalReviewHold(evidence, POLICY)).toBe('stale_request');
+  });
+
+  it('holds unavailability when the head arrival time is unknown', () => {
+    // A gate that cannot verify must hold, not pass: without an arrival time
+    // there is no way to tell whether the request was for this head.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: null,
+      policy: POLICY,
+      reviews: [],
+      comments: [
+        REQUEST,
+        {
+          login: 'chatgpt-codex-connector[bot]',
+          body: 'You have reached your Codex usage limits for code reviews.',
+          created_at: '2026-08-24T07:16:30Z'
+        }
+      ]
+    });
+    expect(externalReviewSettled(evidence, POLICY)).toBe(false);
+    expect(externalReviewHold(evidence, POLICY)).toBe('stale_request');
+  });
+
+  it('waits for the answer to the newest of two requests around a notice', () => {
+    // Request, notice, request: the notice settled the first request, but the
+    // second is outstanding and a review for it may still land.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
+      policy: POLICY,
+      reviews: [],
+      comments: [
+        REQUEST,
+        {
+          login: 'chatgpt-codex-connector[bot]',
+          body: 'You have reached your Codex usage limits for code reviews.',
+          created_at: '2026-08-24T07:16:30Z'
+        },
+        { login: 'bdelleman', body: '@codex review', created_at: '2026-08-24T08:30:00Z' }
+      ]
+    });
+    expect(evidence.requested_at).toBe('2026-08-24T08:30:00Z');
+    expect(externalReviewSettled(evidence, POLICY)).toBe(false);
+    expect(externalReviewHold(evidence, POLICY)).toBe('pending');
+  });
+
   it('recognises every configured notice form, not just the first', () => {
     // A reviewer declines in more than one voice. conclusion-ai/ai-platform#579
     // drew "To use Codex here, create an environment for this repo", which
@@ -111,6 +204,7 @@ describe('external review evidence', () => {
     // leave the workflow declaring a settled state the gate could not confirm.
     const evidence = collectExternalReviewEvidence({
       headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
       policy: POLICY,
       reviews: [],
       comments: [
@@ -129,6 +223,7 @@ describe('external review evidence', () => {
   it('ignores an unavailability notice that predates the current request', () => {
     const evidence = collectExternalReviewEvidence({
       headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
       policy: POLICY,
       reviews: [],
       comments: [
@@ -147,6 +242,7 @@ describe('external review evidence', () => {
   it('does not let the reviewer start its own clock by quoting the marker', () => {
     const evidence = collectExternalReviewEvidence({
       headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
       policy: POLICY,
       reviews: [],
       comments: [{
@@ -160,8 +256,10 @@ describe('external review evidence', () => {
 
   it('stays inert when no reviewer bot is configured', () => {
     const policy = resolveExternalReviewPolicy({});
-    const evidence = collectExternalReviewEvidence({ headSha: HEAD, policy, reviews: [], comments: [REQUEST] });
-    expect(evidence).toEqual({ requested_at: null, answered_at: null, unavailable_at: null });
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD, headArrivedAt: HEAD_ARRIVED, policy, reviews: [], comments: [REQUEST]
+    });
+    expect(evidence).toEqual({ requested_at: null, answered_at: null, unavailable_at: null, head_arrived_at: null });
     expect(externalReviewSettled(evidence, policy)).toBe(true);
   });
 });
@@ -204,6 +302,7 @@ function githubFixture(options: {
   reviews: Array<Record<string, unknown>>;
   issueComments: Array<Record<string, unknown>>;
   threads: Array<{ id: string; isResolved: boolean }>;
+  timeline?: Array<Record<string, unknown>>;
 }): typeof fetch {
   return (async (input: string | URL | Request) => {
     const url = new URL(String(input));
@@ -216,7 +315,8 @@ function githubFixture(options: {
           repository: {
             pullRequest: {
               reviewDecision: 'REVIEW_REQUIRED',
-              reviewThreads: { nodes: options.threads, pageInfo: { hasNextPage: false } }
+              reviewThreads: { nodes: options.threads, pageInfo: { hasNextPage: false } },
+              timelineItems: { nodes: options.timeline ?? [] }
             }
           }
         }
@@ -292,5 +392,89 @@ describe('snapshot feedback derivation', () => {
     const snapshot = await client.fetchSnapshot('acme/repo', 1, 'symphony-reviewer[bot]');
     expect(snapshot.unresolved_review_threads).toBe(3);
     expect(externalReviewSettled(snapshot.external_review, POLICY)).toBe(true);
+  });
+
+  it('binds an unavailability notice to the head via the PR timeline', async () => {
+    // The force-push event names its after-commit and is stamped when GitHub
+    // applied it, so it wins over the same head's committedDate: the latest
+    // matching timestamp errs later, which only tightens the gate.
+    const client = new GitHubReviewClient({
+      token: 'test-token',
+      externalReviewPolicy: POLICY,
+      fetchFn: githubFixture({
+        reviews: [],
+        issueComments: [
+          { id: 10, user: { login: 'BDelleman' }, body: '@codex review', created_at: '2026-08-24T07:11:27Z' },
+          {
+            id: 11, user: { login: 'chatgpt-codex-connector[bot]' },
+            body: 'You have reached your Codex usage limits for code reviews.',
+            created_at: '2026-08-24T07:12:00Z'
+          }
+        ],
+        threads: [],
+        timeline: [
+          { __typename: 'PullRequestCommit', commit: { oid: HEAD, committedDate: '2026-08-24T07:02:00Z' } },
+          { __typename: 'HeadRefForcePushedEvent', createdAt: '2026-08-24T07:10:12Z', afterCommit: { oid: HEAD } }
+        ]
+      })
+    });
+    const snapshot = await client.fetchSnapshot('acme/repo', 1, 'symphony-reviewer[bot]');
+    expect(snapshot.external_review.head_arrived_at).toBe('2026-08-24T07:10:12Z');
+    expect(externalReviewSettled(snapshot.external_review, POLICY)).toBe(true);
+  });
+
+  it('falls back to the committed date when the head arrived by plain push', async () => {
+    const client = new GitHubReviewClient({
+      token: 'test-token',
+      externalReviewPolicy: POLICY,
+      fetchFn: githubFixture({
+        reviews: [],
+        issueComments: [
+          { id: 10, user: { login: 'BDelleman' }, body: '@codex review', created_at: '2026-08-24T07:11:27Z' },
+          {
+            id: 11, user: { login: 'chatgpt-codex-connector[bot]' },
+            body: 'You have reached your Codex usage limits for code reviews.',
+            created_at: '2026-08-24T07:12:00Z'
+          }
+        ],
+        threads: [],
+        timeline: [
+          { __typename: 'PullRequestCommit', commit: { oid: PREVIOUS_HEAD, committedDate: '2026-08-23T13:40:00Z' } },
+          { __typename: 'PullRequestCommit', commit: { oid: HEAD, committedDate: '2026-08-24T07:02:00Z' } }
+        ]
+      })
+    });
+    const snapshot = await client.fetchSnapshot('acme/repo', 1, 'symphony-reviewer[bot]');
+    expect(snapshot.external_review.head_arrived_at).toBe('2026-08-24T07:02:00Z');
+    expect(externalReviewSettled(snapshot.external_review, POLICY)).toBe(true);
+  });
+
+  it('fails closed when the head never appears in the timeline', async () => {
+    // A head the timeline cannot date is a head the gate cannot verify a
+    // request against, so the notice settles nothing — the head-bound review
+    // path stays the only way through.
+    const client = new GitHubReviewClient({
+      token: 'test-token',
+      externalReviewPolicy: POLICY,
+      fetchFn: githubFixture({
+        reviews: [],
+        issueComments: [
+          { id: 10, user: { login: 'BDelleman' }, body: '@codex review', created_at: '2026-08-24T07:11:27Z' },
+          {
+            id: 11, user: { login: 'chatgpt-codex-connector[bot]' },
+            body: 'You have reached your Codex usage limits for code reviews.',
+            created_at: '2026-08-24T07:12:00Z'
+          }
+        ],
+        threads: [],
+        timeline: [
+          { __typename: 'PullRequestCommit', commit: { oid: PREVIOUS_HEAD, committedDate: '2026-08-23T13:40:00Z' } }
+        ]
+      })
+    });
+    const snapshot = await client.fetchSnapshot('acme/repo', 1, 'symphony-reviewer[bot]');
+    expect(snapshot.external_review.head_arrived_at).toBeNull();
+    expect(externalReviewSettled(snapshot.external_review, POLICY)).toBe(false);
+    expect(externalReviewHold(snapshot.external_review, POLICY)).toBe('stale_request');
   });
 });

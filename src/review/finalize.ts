@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { encodeReviewOutcome, normalizeReviewMarkdown, receiptSha256, reviewSha256 } from './contract';
 import {
-  externalReviewSettled,
+  externalReviewHold,
   resolveExternalReviewPolicy,
   type ExternalReviewEvidence,
   type ExternalReviewPolicy
@@ -84,9 +84,12 @@ function assertReviewFeedbackSatisfiesRoute(
   policy: ExternalReviewPolicy
 ): void {
   if (externalReviewRequirementForRoute(route) === 'none') return;
-  if (!externalReviewSettled(snapshot.external_review, policy)) {
-    throw new Error('review_finalize_external_review_pending');
-  }
+  // Two distinct refusals: "the reviewer has not spoken" and "the reviewer's
+  // decline vouches for a head nobody requested a review of". Operators react
+  // differently — the first wants patience, the second wants a fresh request.
+  const hold = externalReviewHold(snapshot.external_review, policy);
+  if (hold === 'stale_request') throw new Error('review_finalize_external_review_stale_request');
+  if (hold !== null) throw new Error('review_finalize_external_review_pending');
   if (snapshot.unresolved_review_threads > 0) {
     throw new Error(`review_finalize_unresolved_review_threads:${snapshot.unresolved_review_threads}`);
   }
