@@ -29,7 +29,7 @@ const dirs: string[] = [];
 // No reviewer bot is configured in these fixtures, so the external-review
 // requirement is inert and every snapshot reads as a finished conversation.
 function settledExternalReview(): ExternalReviewEvidence {
-  return { requested_at: null, answered_at: null, unavailable_at: null };
+  return { requested_at: null, answered_at: null, unavailable_at: null, head_arrived_at: null };
 }
 const baseSha = 'a'.repeat(40);
 const headSha = 'b'.repeat(40);
@@ -525,7 +525,10 @@ describe('review finalize feedback gate', () => {
   };
   const pending = {
     unresolved_review_threads: 0,
-    external_review: { requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null }
+    external_review: {
+      requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null,
+      head_arrived_at: '2026-08-24T07:10:12Z'
+    }
   };
 
   it('refuses an approval route while the external reviewer has not answered for this head', async () => {
@@ -547,7 +550,10 @@ describe('review finalize feedback gate', () => {
     const bodyFile = await draftFor(root, head);
     const client = { fetchSnapshot: vi.fn(async () => snapshotFor(head, {
       unresolved_review_threads: 3,
-      external_review: { requested_at: '2026-08-24T07:11:27Z', answered_at: '2026-08-24T07:19:58Z', unavailable_at: null }
+      external_review: {
+        requested_at: '2026-08-24T07:11:27Z', answered_at: '2026-08-24T07:19:58Z', unavailable_at: null,
+        head_arrived_at: '2026-08-24T07:10:12Z'
+      }
     })) } as any;
     await expect(finalizeAgentReview({
       issue: 'NIE-574', pr: 574, route: 'merging', bodyFile, cwd: root, env, client
@@ -561,7 +567,10 @@ describe('review finalize feedback gate', () => {
     const bodyFile = await draftFor(root, head);
     const client = { fetchSnapshot: vi.fn(async () => snapshotFor(head, {
       unresolved_review_threads: 3,
-      external_review: { requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null }
+      external_review: {
+        requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null,
+        head_arrived_at: '2026-08-24T07:10:12Z'
+      }
     })) } as any;
     for (const route of ['in_progress', 'rework'] as const) {
       await expect(finalizeAgentReview({
@@ -570,7 +579,7 @@ describe('review finalize feedback gate', () => {
     }
   });
 
-  it('approves once the reviewer has declined to review', async () => {
+  it('approves once the reviewer has declined to review the requested head', async () => {
     const { root, head } = await initReviewRepo('git@github.com:nielsgl/symphony.git');
     const bodyFile = await draftFor(root, head);
     const client = { fetchSnapshot: vi.fn(async () => snapshotFor(head, {
@@ -578,12 +587,37 @@ describe('review finalize feedback gate', () => {
       external_review: {
         requested_at: '2026-08-23T10:14:44Z',
         answered_at: null,
-        unavailable_at: '2026-08-23T10:14:54Z'
+        unavailable_at: '2026-08-23T10:14:54Z',
+        head_arrived_at: '2026-08-23T10:13:02Z'
       }
     })) } as any;
     await expect(finalizeAgentReview({
       issue: 'NIE-574', pr: 574, route: 'merging', bodyFile, cwd: root, env, client
     })).resolves.toMatchObject({ receipt: { route: 'merging', verdict: 'pass' } });
+  });
+
+  it('refuses a decline that answers a request older than the current head', async () => {
+    // Request for commit A, new commits land, the reviewer declines: the
+    // notice postdates the request but the request predates the head, so the
+    // decline vouches for a head nobody asked about. The refusal carries its
+    // own reason code because the fix differs from pending — post a fresh
+    // request instead of waiting.
+    const { root, head } = await initReviewRepo('git@github.com:nielsgl/symphony.git');
+    const bodyFile = await draftFor(root, head);
+    const staleRequest = {
+      requested_at: '2026-08-24T07:11:27Z',
+      answered_at: null,
+      unavailable_at: '2026-08-24T07:16:30Z'
+    };
+    for (const headArrivedAt of ['2026-08-24T07:15:00Z', null]) {
+      const client = { fetchSnapshot: vi.fn(async () => snapshotFor(head, {
+        unresolved_review_threads: 0,
+        external_review: { ...staleRequest, head_arrived_at: headArrivedAt }
+      })) } as any;
+      await expect(finalizeAgentReview({
+        issue: 'NIE-574', pr: 574, route: 'merging', bodyFile, cwd: root, env, client
+      })).rejects.toThrow('review_finalize_external_review_stale_request');
+    }
   });
 
   it('stays inert for projects with no configured external reviewer', async () => {
@@ -643,7 +677,10 @@ describe('supervisor feedback mirror', () => {
         fetchSnapshot: vi.fn(async () => snapshotFor(head, {
           context_sha256: receipt.github_context_sha256,
           unresolved_review_threads: 0,
-          external_review: { requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null }
+          external_review: {
+            requested_at: '2026-08-24T07:11:27Z', answered_at: null, unavailable_at: null,
+            head_arrived_at: '2026-08-24T07:10:12Z'
+          }
         }))
       } as any,
       brokerFactory: () => ({

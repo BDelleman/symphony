@@ -12,9 +12,10 @@ import type { ReviewApprovalActionRecord, ReviewApprovalActionStatus } from '../
 import { resolveWorkspaceGitDirectory } from './capsule';
 import { extractReviewArtifact, extractReviewReceipt, receiptSha256, reviewSha256 } from './contract';
 import {
-  externalReviewSettled,
+  externalReviewHold,
   resolveExternalReviewPolicy,
   type ExternalReviewEvidence,
+  type ExternalReviewHold,
   type ExternalReviewPolicy
 } from './external-review';
 import { checksRequirementForRoute, externalReviewRequirementForRoute } from './finalize';
@@ -68,10 +69,10 @@ function feedbackSatisfiesRoute(
   route: ReviewRoute,
   snapshot: { unresolved_review_threads: number; external_review: ExternalReviewEvidence },
   policy: ExternalReviewPolicy
-): { settled: boolean; unresolved: number } {
-  if (externalReviewRequirementForRoute(route) === 'none') return { settled: true, unresolved: 0 };
+): { hold: ExternalReviewHold | null; unresolved: number } {
+  if (externalReviewRequirementForRoute(route) === 'none') return { hold: null, unresolved: 0 };
   return {
-    settled: externalReviewSettled(snapshot.external_review, policy),
+    hold: externalReviewHold(snapshot.external_review, policy),
     unresolved: snapshot.unresolved_review_threads
   };
 }
@@ -201,7 +202,7 @@ export class ReviewApprovalCoordinator {
           || snapshot.head_sha !== action.head_sha
           || snapshot.context_sha256 !== action.github_context_sha256
           || !checksSatisfyRoute(route, snapshot)
-          || !feedback.settled
+          || feedback.hold !== null
           || feedback.unresolved > 0
         ) {
           persist('superseded', { reason_code: REASON_CODES.reviewApprovalContextMismatch });
@@ -443,7 +444,7 @@ export class ReviewApprovalCoordinator {
       }
       if (snapshot.context_sha256 !== receipt.github_context_sha256) contextMismatches.push('github_context_drift');
       const feedback = feedbackSatisfiesRoute(receipt.route, snapshot, this.externalReviewPolicy);
-      if (!feedback.settled) contextMismatches.push('external_review_pending');
+      if (feedback.hold !== null) contextMismatches.push(`external_review_${feedback.hold}`);
       if (feedback.unresolved > 0) contextMismatches.push(`unresolved_review_threads(${feedback.unresolved})`);
       if (contextMismatches.length > 0) {
         updateAction('superseded', { reason_code: REASON_CODES.reviewApprovalContextMismatch });

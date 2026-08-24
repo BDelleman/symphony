@@ -245,6 +245,13 @@ export class GitHubReviewClient {
             pullRequest(number: $number) {
               reviewDecision
               reviewThreads(first: 100) { nodes { id isResolved } pageInfo { hasNextPage } }
+              timelineItems(last: 100, itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT]) {
+                nodes {
+                  __typename
+                  ... on PullRequestCommit { commit { oid committedDate } }
+                  ... on HeadRefForcePushedEvent { createdAt afterCommit { oid } }
+                }
+              }
             }
           }
         }`,
@@ -295,12 +302,45 @@ export class GitHubReviewClient {
     if (pageInfo.hasNextPage === true) throw new Error('review_approval_feedback_incomplete');
     const threads = Array.isArray(threadConnection.nodes) ? threadConnection.nodes.map(asRecord) : [];
     const unresolvedReviewThreads = threads.filter((thread) => thread.isResolved !== true).length;
+    // When did this head appear on the PR? Commit.pushedDate is deprecated, so
+    // the timeline is the source: a HEAD_REF_FORCE_PUSHED_EVENT names its
+    // after-commit and is stamped when GitHub applied the push, which is exact;
+    // a plain push leaves only a PULL_REQUEST_COMMIT node, whose committedDate
+    // is a lower bound (the commit may predate its push). The latest matching
+    // timestamp wins — erring later only tightens the stale-request rule. A
+    // head absent from the last 100 items yields null, which fails closed in
+    // externalReviewSettled rather than aborting the snapshot: unavailability
+    // then settles nothing while the head-bound review path keeps working.
+    const timelineConnection = pullRequestNode.timelineItems && typeof pullRequestNode.timelineItems === 'object'
+      ? pullRequestNode.timelineItems as Record<string, unknown>
+      : {};
+    const timelineNodes = Array.isArray(timelineConnection.nodes)
+      ? timelineConnection.nodes.filter((node): node is Record<string, unknown> =>
+        Boolean(node) && typeof node === 'object' && !Array.isArray(node))
+      : [];
+    const headArrivals = timelineNodes.flatMap((node) => {
+      if (node.__typename === 'HeadRefForcePushedEvent') {
+        const after = node.afterCommit && typeof node.afterCommit === 'object'
+          ? node.afterCommit as Record<string, unknown>
+          : {};
+        return stringValue(after.oid) === headSha && stringValue(node.createdAt) ? [stringValue(node.createdAt)] : [];
+      }
+      if (node.__typename === 'PullRequestCommit') {
+        const commit = node.commit && typeof node.commit === 'object' ? node.commit as Record<string, unknown> : {};
+        return stringValue(commit.oid) === headSha && stringValue(commit.committedDate)
+          ? [stringValue(commit.committedDate)]
+          : [];
+      }
+      return [];
+    }).sort();
+    const headArrivedAt = headArrivals.length > 0 ? headArrivals[headArrivals.length - 1]! : null;
     // Built from the same payloads the hash is built from, but deliberately kept
     // out of semantic_context: context_sha256 must stay policy-independent so a
     // worker and the supervisor hash identical bytes.
     const externalReview = this.externalReviewPolicy.bot_login
       ? collectExternalReviewEvidence({
         headSha,
+        headArrivedAt,
         policy: this.externalReviewPolicy,
         reviews: reviews.map((review) => ({
           login: userLogin(review.user),
