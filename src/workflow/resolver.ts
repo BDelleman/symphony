@@ -431,6 +431,8 @@ export class ConfigResolver {
     const hooks = asRecord(config.hooks);
     const agent = asRecord(config.agent);
     const reviewApproval = asRecord(config.review_approval);
+    const externalReview = asRecord(reviewApproval.external_review);
+    const externalReviewBotLogin = readString(externalReview.bot_login, '').trim().toLowerCase().replace(/\[bot\]$/, '');
     const dispatchBackpressure = asRecord(agent.dispatch_backpressure);
     const budget = asRecord(config.budget);
     const codex = asRecord(config.codex);
@@ -711,7 +713,16 @@ export class ConfigResolver {
         ? {
             review_approval: {
               provider: readString(reviewApproval.provider, '') as 'github_app',
-              required: reviewApproval.required === true
+              required: reviewApproval.required === true,
+              ...(externalReviewBotLogin
+                ? {
+                    external_review: {
+                      bot_login: externalReviewBotLogin,
+                      request_marker: readString(externalReview.request_marker, '@codex review').trim().toLowerCase(),
+                      unavailable_pattern: readString(externalReview.unavailable_pattern, 'usage limits').trim().toLowerCase()
+                    }
+                  }
+                : {})
             }
           }
         : {}),

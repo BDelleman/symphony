@@ -70,6 +70,31 @@ describe('ConfigResolver', () => {
     expect(config.review_approval).toEqual({ provider: 'github_app', required: true });
   });
 
+  it('normalises the external reviewer contract and omits it when no bot is named', () => {
+    const resolver = new ConfigResolver({ env: {}, homedir: () => '/home/tester', tmpdir: () => '/tmp' });
+    const config = resolver.resolve({
+      config: {
+        review_approval: {
+          provider: 'github_app',
+          required: true,
+          external_review: { bot_login: 'chatgpt-codex-connector[bot]', unavailable_pattern: 'Usage Limits' }
+        }
+      },
+      prompt_template: 'prompt'
+    });
+    expect(config.review_approval?.external_review).toEqual({
+      bot_login: 'chatgpt-codex-connector',
+      request_marker: '@codex review',
+      unavailable_pattern: 'usage limits'
+    });
+
+    const withoutBot = resolver.resolve({
+      config: { review_approval: { provider: 'github_app', required: true, external_review: { request_marker: '@codex review' } } },
+      prompt_template: 'prompt'
+    });
+    expect(withoutBot.review_approval?.external_review).toBeUndefined();
+  });
+
   it('resolves budget controls with defaults for optional policy fields', () => {
     const resolver = new ConfigResolver({ env: {}, homedir: () => '/home/tester', tmpdir: () => '/tmp' });
 

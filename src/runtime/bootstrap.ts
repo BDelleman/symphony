@@ -1117,6 +1117,7 @@ export function createRuntimeEnvironment(options: RuntimeBootstrapOptions = {}):
         managedWorkspaceRoot: effectiveConfig.workspace.root,
         baseRef: effectiveConfig.workspace.provisioner.base_ref,
         env: process.env,
+        externalReviewPolicy: effectiveConfig.review_approval?.external_review,
         fetchFn: options.fetchFn,
         logger,
         actionLedger: persistenceStore ?? undefined

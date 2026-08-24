@@ -14,7 +14,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { WorkerCompletionReason } from './types';
 import type { AgentReviewOutcome, ReviewApprovalResult } from '../review';
-import { readCapsuleReviewOutcome, reviewOutcomesEqual } from '../review';
+import { externalReviewEnvironment, readCapsuleReviewOutcome, reviewOutcomesEqual } from '../review';
 
 const DEFAULT_CONTINUATION_PROMPT =
   'Continue on the same thread for this issue. Focus on incremental progress and report outcomes clearly.';
@@ -141,7 +141,8 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
             : {
                 ...codexSpawnCommand.env,
                 SYMPHONY_ATTEMPT_ID: input.symphonyAttemptId,
-                SYMPHONY_BASE_REF: input.config.workspace.provisioner.base_ref.replace(/^origin\//, '')
+                SYMPHONY_BASE_REF: input.config.workspace.provisioner.base_ref.replace(/^origin\//, ''),
+                ...externalReviewEnvironment(input.config.review_approval?.external_review)
               },
         workspaceCwd: workspace.path,
         workerHost: input.worker_host,
@@ -164,7 +165,8 @@ export async function runLocalWorkerAttempt(input: LocalWorkerRunInput): Promise
           issue_identifier: currentIssue.identifier,
           attempt: input.attempt,
           symphony_attempt_id: input.symphonyAttemptId,
-          base_ref: input.config.workspace.provisioner.base_ref.replace(/^origin\//, '')
+          base_ref: input.config.workspace.provisioner.base_ref.replace(/^origin\//, ''),
+          external_review: input.config.review_approval?.external_review
         }
       };
       const turnResult: AgentRunResult | undefined =
