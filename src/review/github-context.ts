@@ -2,6 +2,13 @@ import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 
 import { REASON_CODES } from '../observability/reason-codes';
+import {
+  collectExternalReviewEvidence,
+  EXTERNAL_REVIEW_ABSENT,
+  resolveExternalReviewPolicy,
+  type ExternalReviewEvidence,
+  type ExternalReviewPolicy
+} from './external-review';
 
 export interface GitHubPullRequestSnapshot {
   repository: string;
@@ -16,6 +23,8 @@ export interface GitHubPullRequestSnapshot {
   checks_green: boolean;
   checks_settled: boolean;
   review_decision: string | null;
+  unresolved_review_threads: number;
+  external_review: ExternalReviewEvidence;
   semantic_context: Record<string, unknown>;
   context_sha256: string;
 }
@@ -24,6 +33,7 @@ interface GitHubClientOptions {
   token?: string;
   fetchFn?: typeof fetch;
   apiBase?: string;
+  externalReviewPolicy?: ExternalReviewPolicy;
 }
 
 interface GhApiFetchOptions {
@@ -127,11 +137,13 @@ export class GitHubReviewClient {
   private readonly token: string;
   private readonly fetchFn: typeof fetch;
   private readonly apiBase: string;
+  private readonly externalReviewPolicy: ExternalReviewPolicy;
 
   constructor(options: GitHubClientOptions = {}) {
     this.token = options.token ?? resolveGitHubToken();
     this.fetchFn = options.fetchFn ?? fetch;
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
+    this.externalReviewPolicy = options.externalReviewPolicy ?? resolveExternalReviewPolicy(process.env);
   }
 
   async request(pathname: string, init: RequestInit = {}): Promise<unknown> {
@@ -282,6 +294,25 @@ export class GitHubReviewClient {
       : {};
     if (pageInfo.hasNextPage === true) throw new Error('review_approval_feedback_incomplete');
     const threads = Array.isArray(threadConnection.nodes) ? threadConnection.nodes.map(asRecord) : [];
+    const unresolvedReviewThreads = threads.filter((thread) => thread.isResolved !== true).length;
+    // Built from the same payloads the hash is built from, but deliberately kept
+    // out of semantic_context: context_sha256 must stay policy-independent so a
+    // worker and the supervisor hash identical bytes.
+    const externalReview = this.externalReviewPolicy.bot_login
+      ? collectExternalReviewEvidence({
+        headSha,
+        policy: this.externalReviewPolicy,
+        reviews: reviews.map((review) => ({
+          login: userLogin(review.user),
+          commit_id: stringValue(review.commit_id)
+        })),
+        comments: comments.map((comment) => ({
+          login: userLogin(comment.user),
+          body: stringValue(comment.body),
+          created_at: stringValue(comment.created_at)
+        }))
+      })
+      : { ...EXTERNAL_REVIEW_ABSENT };
 
     const semanticContext = {
       repository,
@@ -302,7 +333,8 @@ export class GitHubReviewClient {
           commit_id: stringValue(review.commit_id)
         }))),
       comments: stableById(comments.map((comment) => ({
-        id: numberValue(comment.id), user: userLogin(comment.user), body: stringValue(comment.body)
+        id: numberValue(comment.id), user: userLogin(comment.user), body: stringValue(comment.body),
+        created_at: stringValue(comment.created_at)
       }))),
       inline_comments: stableById(inline.map((comment) => ({
         id: numberValue(comment.id), user: userLogin(comment.user), body: stringValue(comment.body),
@@ -324,6 +356,8 @@ export class GitHubReviewClient {
       checks_green: checksGreen,
       checks_settled: checksSettled,
       review_decision: reviewDecision,
+      unresolved_review_threads: unresolvedReviewThreads,
+      external_review: externalReview,
       semantic_context: semanticContext,
       context_sha256: crypto.createHash('sha256').update(canonicalJson(semanticContext)).digest('hex')
     };

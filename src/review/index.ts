@@ -2,6 +2,7 @@ export * from './capsule';
 export * from './contract';
 export * from './coordinator';
 export * from './credential-boundary';
+export * from './external-review';
 export * from './finalize';
 export * from './github-app-broker';
 export * from './github-context';

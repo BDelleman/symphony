@@ -11,7 +11,13 @@ import type { WorkspaceInfo } from '../workspace';
 import type { ReviewApprovalActionRecord, ReviewApprovalActionStatus } from '../persistence';
 import { resolveWorkspaceGitDirectory } from './capsule';
 import { extractReviewArtifact, extractReviewReceipt, receiptSha256, reviewSha256 } from './contract';
-import { checksRequirementForRoute } from './finalize';
+import {
+  externalReviewSettled,
+  resolveExternalReviewPolicy,
+  type ExternalReviewEvidence,
+  type ExternalReviewPolicy
+} from './external-review';
+import { checksRequirementForRoute, externalReviewRequirementForRoute } from './finalize';
 import { GitHubAppApprovalBroker } from './github-app-broker';
 import { GitHubReviewClient, parseGitHubRemote } from './github-context';
 import type { AgentReviewOutcome, ReviewApprovalResult, ReviewRoute } from './types';
@@ -30,6 +36,7 @@ export interface ReviewApprovalCoordinatorOptions {
     listNonterminalReviewApprovalActions?(): ReviewApprovalActionRecord[];
   };
   githubClient?: GitHubReviewClient;
+  externalReviewPolicy?: ExternalReviewPolicy;
   brokerFactory?: () => Pick<GitHubAppApprovalBroker, 'separatedIdentity' | 'approve'>;
 }
 
@@ -51,6 +58,22 @@ function checksSatisfyRoute(
   snapshot: { checks_green: boolean; checks_settled: boolean }
 ): boolean {
   return checksRequirementForRoute(route) === 'green' ? snapshot.checks_green : snapshot.checks_settled;
+}
+
+// Mirrors the finalize-side feedback gate for the same reason the checks gate is
+// mirrored: finalize runs inside the worker and the receipt is a plain hash, so
+// the supervisor has to re-derive the verdict from its own snapshot rather than
+// trust the route the worker minted.
+function feedbackSatisfiesRoute(
+  route: ReviewRoute,
+  snapshot: { unresolved_review_threads: number; external_review: ExternalReviewEvidence },
+  policy: ExternalReviewPolicy
+): { settled: boolean; unresolved: number } {
+  if (externalReviewRequirementForRoute(route) === 'none') return { settled: true, unresolved: 0 };
+  return {
+    settled: externalReviewSettled(snapshot.external_review, policy),
+    unresolved: snapshot.unresolved_review_threads
+  };
 }
 
 function git(workspace: string, args: string[]): string {
@@ -82,12 +105,15 @@ function canonicalFailureReason(detail: string): string {
 export class ReviewApprovalCoordinator {
   private readonly env: NodeJS.ProcessEnv;
   private readonly client: GitHubReviewClient;
+  private readonly externalReviewPolicy: ExternalReviewPolicy;
 
   constructor(private readonly options: ReviewApprovalCoordinatorOptions) {
     this.env = options.env ?? process.env;
+    this.externalReviewPolicy = options.externalReviewPolicy ?? resolveExternalReviewPolicy(this.env);
     this.client = options.githubClient ?? new GitHubReviewClient({
         token: this.env.GH_TOKEN ?? this.env.GITHUB_TOKEN,
-        fetchFn: options.fetchFn
+        fetchFn: options.fetchFn,
+        externalReviewPolicy: this.externalReviewPolicy
       });
   }
 
@@ -166,6 +192,7 @@ export class ReviewApprovalCoordinator {
         const identity = await broker.separatedIdentity();
         const snapshot = await this.client.fetchSnapshot(action.repository, action.pr_number, identity.login);
         const passRoute = route === 'merging' || route === 'human_review';
+        const feedback = feedbackSatisfiesRoute(route, snapshot, this.externalReviewPolicy);
         if (
           snapshot.state !== 'open'
           || snapshot.draft
@@ -174,6 +201,8 @@ export class ReviewApprovalCoordinator {
           || snapshot.head_sha !== action.head_sha
           || snapshot.context_sha256 !== action.github_context_sha256
           || !checksSatisfyRoute(route, snapshot)
+          || !feedback.settled
+          || feedback.unresolved > 0
         ) {
           persist('superseded', { reason_code: REASON_CODES.reviewApprovalContextMismatch });
           superseded += 1;
@@ -413,6 +442,9 @@ export class ReviewApprovalCoordinator {
         );
       }
       if (snapshot.context_sha256 !== receipt.github_context_sha256) contextMismatches.push('github_context_drift');
+      const feedback = feedbackSatisfiesRoute(receipt.route, snapshot, this.externalReviewPolicy);
+      if (!feedback.settled) contextMismatches.push('external_review_pending');
+      if (feedback.unresolved > 0) contextMismatches.push(`unresolved_review_threads(${feedback.unresolved})`);
       if (contextMismatches.length > 0) {
         updateAction('superseded', { reason_code: REASON_CODES.reviewApprovalContextMismatch });
         return fail(`${REASON_CODES.reviewApprovalContextMismatch}:${contextMismatches.join('+')}`);
