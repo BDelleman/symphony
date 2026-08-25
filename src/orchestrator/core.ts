@@ -2297,6 +2297,42 @@ export class OrchestratorCore {
 
     const eligibility = shouldDispatchIssue(issue, this.state, this.config, { skipClaimCheckForIssueId: issue.id });
     if (!eligibility.eligible) {
+      if (eligibility.reason === 'not_active') {
+        // The issue has left the workflow's active states (done, cancelled, backlog):
+        // it will never dispatch again, so holding the breaker would strand a permanent
+        // ghost on the blocked list. Clear the fault without redispatching.
+        await this.clearCircuitBreaker(issue.id);
+        this.state.redispatch_progress?.delete(issue.id);
+        this.state.claimed.delete(issue.id);
+        this.recordRuntimeEvent({
+          event: CANONICAL_EVENT.orchestration.automationFaultCleared,
+          severity: 'info',
+          issue_identifier: issue.identifier,
+          detail: `${reasonNote} (issue no longer active; breaker cleared without redispatch)`,
+          reason_code: REASON_CODES.operatorClearAutomationFault
+        });
+        this.recordOperatorAction(issue.id, {
+          action: 'clear_automation_fault',
+          requested_at_ms: this.nowMs(),
+          result: 'accepted',
+          result_code: REASON_CODES.operatorClearAutomationFault,
+          message: 'automation fault cleared; issue no longer active so no redispatch',
+          actor: params.actor ?? null,
+          reason_note: reasonNote,
+          pre_state: preState,
+          post_state: this.describeIssueRuntimeState(issue.id)
+        });
+        this.ports.notifyObservers?.();
+        return {
+          ok: true,
+          issue_id: issue.id,
+          status: 'held',
+          result_code: REASON_CODES.operatorClearAutomationFault,
+          message: 'automation fault cleared; issue no longer active so no redispatch',
+          dispatch_started: false,
+          breaker_cleared: true
+        };
+      }
       return hold(eligibility.reason, `Issue ${issue.identifier} is not dispatchable: ${eligibility.reason}`);
     }
     if ((this.config.github_linking_mode ?? 'off') === 'required' && issue.has_github_issue_link !== true) {
