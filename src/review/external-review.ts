@@ -100,6 +100,21 @@ export function externalReviewEnvironment(
   };
 }
 
+// A reviewer with findings submits a PR review, which GitHub binds to a commit
+// via commit_id. A reviewer with none only posts a plain comment naming the
+// commit it looked at ("Reviewed commit: `7b12b50c21`"), so the clean case has
+// no commit_id to bind with — the mention in the body is the binding. Ten hex
+// characters is the shortest form the reviewer emits; anything shorter is too
+// weak to bind and is ignored, which fails closed into 'pending'.
+const HEAD_MENTION_MIN_HEX = 10;
+
+export function commentNamesHead(body: string, headSha: string): boolean {
+  const head = headSha.trim().toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(head)) return false;
+  const mentions = body.toLowerCase().match(/[0-9a-f]{10,40}/g) ?? [];
+  return mentions.some((mention) => mention.length >= HEAD_MENTION_MIN_HEX && head.startsWith(mention));
+}
+
 export function collectExternalReviewEvidence(input: {
   headSha: string;
   // Recorded as a fact, applied as a rule in externalReviewSettled: the
@@ -131,9 +146,14 @@ export function collectExternalReviewEvidence(input: {
     return sorted.length > 0 ? sorted[sorted.length - 1] : null;
   };
 
-  const answeredAt = latest(input.reviews
-    .filter((review) => isBot(review.login) && review.commit_id === input.headSha)
-    .map((review) => review.submitted_at));
+  const answeredAt = latest([
+    ...input.reviews
+      .filter((review) => isBot(review.login) && review.commit_id === input.headSha)
+      .map((review) => review.submitted_at),
+    ...input.comments
+      .filter((comment) => isBot(comment.login) && commentNamesHead(comment.body, input.headSha))
+      .map((comment) => comment.created_at)
+  ]);
 
   const unavailableAt = latest(input.comments
     .filter((comment) =>
@@ -159,8 +179,10 @@ export type ExternalReviewHold = 'pending' | 'stale_request';
 // answer is still outstanding, so a second review may still land; treating the
 // earlier answer as final there would reopen the very race this gate closes.
 //
-// A review names the commit it reviewed, so answered_at is head-bound by
-// construction. An unavailability notice names nothing, and the bare request
+// A review names the commit it reviewed — via commit_id when submitted as a PR
+// review, via the SHA in its body when the reviewer had no findings and only
+// commented — so answered_at is head-bound by construction either way. An
+// unavailability notice names nothing, and the bare request
 // it answers names nothing either, so ordering alone lets a notice for an old
 // head settle a new one: request for commit A, commits land, the reviewer
 // declines — the decline postdates the request and vouches for a head nobody
