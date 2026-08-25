@@ -10,6 +10,7 @@ import {
   type ExternalReviewPolicy
 } from './external-review';
 import { createGhApiFetch, GitHubReviewClient, parseGitHubRemote } from './github-context';
+import { parseWaitExternalArgs, renderWaitExternalResult, waitForExternalReview } from './wait-external';
 import type { AgentReviewOutcome, ReviewReceiptV2, ReviewRoute, ReviewVerdict } from './types';
 
 interface FinalizeOptions {
@@ -214,10 +215,19 @@ export async function runReviewCommand(argv: readonly string[], deps: {
   stderr: (text: string) => void;
 }): Promise<number> {
   if (argv.length === 1 && (argv[0] === '--help' || argv[0] === '-h')) {
-    deps.stdout('Usage: symphony review finalize --issue <identifier> --pr <number> --route <route> --body-file <path>\n');
+    deps.stdout(
+      'Usage: symphony review finalize --issue <identifier> --pr <number> --route <route> --body-file <path>\n'
+      + '       symphony review wait-external --pr <number> [--budget-seconds <n>] [--poll-seconds <n>]\n'
+    );
     return 0;
   }
   try {
+    if (argv[0] === 'wait-external') {
+      const parsed = parseWaitExternalArgs(argv);
+      const result = await waitForExternalReview({ ...parsed, cwd: deps.cwd, env: deps.env });
+      deps.stdout(`${renderWaitExternalResult(result)}\n`);
+      return 0;
+    }
     const parsed = parseFinalizeArgs(argv);
     const result = await finalizeAgentReview({ ...parsed, cwd: deps.cwd, env: deps.env });
     deps.stdout(`review_artifact=${result.finalPath}\nreview_receipt=${result.receiptPath}\n${result.envelope}\n`);

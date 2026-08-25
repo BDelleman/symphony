@@ -7,3 +7,4 @@ export * from './finalize';
 export * from './github-app-broker';
 export * from './github-context';
 export * from './types';
+export * from './wait-external';
