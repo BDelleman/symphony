@@ -84,6 +84,100 @@ describe('external review evidence', () => {
     expect(externalReviewSettled(evidence, POLICY)).toBe(true);
   });
 
+  it('settles on a clean verdict posted as a comment naming the head', () => {
+    // conclusion-ai/ai-platform#601: Codex submits a PR review only when it has
+    // findings. A clean verdict arrives as an issue comment ("Didn't find any
+    // major issues. Reviewed commit: `7b12b50c21`"), which carries no commit_id
+    // — the SHA in the body is the only binding. Without this channel the gate
+    // can never settle on exactly the runs that should pass.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
+      policy: POLICY,
+      reviews: [],
+      comments: [REQUEST, {
+        login: 'chatgpt-codex-connector[bot]',
+        body: 'Codex Review: Didn\'t find any major issues.\n\n**Reviewed commit:** `01a4e58a10`',
+        created_at: '2026-08-24T07:19:58Z'
+      }]
+    });
+    expect(evidence.answered_at).toBe('2026-08-24T07:19:58Z');
+    expect(externalReviewSettled(evidence, POLICY)).toBe(true);
+  });
+
+  it('refuses a clean comment that names a previous head', () => {
+    // The mention is the binding, so a clean comment from the prior round must
+    // vouch for nothing once commits land — the same rule commit_id enforces
+    // for submitted reviews.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
+      policy: POLICY,
+      reviews: [],
+      comments: [REQUEST, {
+        login: 'chatgpt-codex-connector[bot]',
+        body: 'Codex Review: Didn\'t find any major issues.\n\n**Reviewed commit:** `4d0e32a24f`',
+        created_at: '2026-08-24T07:19:58Z'
+      }]
+    });
+    expect(evidence.answered_at).toBeNull();
+    expect(externalReviewHold(evidence, POLICY)).toBe('pending');
+  });
+
+  it('does not let anyone but the reviewer answer by quoting the head', () => {
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
+      policy: POLICY,
+      reviews: [],
+      comments: [REQUEST, {
+        login: 'bdelleman',
+        body: `Reviewed commit ${HEAD} myself, looks fine.`,
+        created_at: '2026-08-24T07:19:58Z'
+      }]
+    });
+    expect(evidence.answered_at).toBeNull();
+  });
+
+  it('ignores a head mention too short to bind', () => {
+    // Nine hex characters could be a checks id or a timestamp fragment; ten is
+    // the shortest form the reviewer emits, so anything below it fails closed.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
+      policy: POLICY,
+      reviews: [],
+      comments: [REQUEST, {
+        login: 'chatgpt-codex-connector[bot]',
+        body: 'Reviewed commit `01a4e58a1` and found nothing.',
+        created_at: '2026-08-24T07:19:58Z'
+      }]
+    });
+    expect(evidence.answered_at).toBeNull();
+  });
+
+  it('reopens the wait when a newer request outlives a clean comment', () => {
+    // Same ordering rule as submitted reviews: a clean comment for this head
+    // answers only requests that precede it, so a fresh request keeps holding.
+    const evidence = collectExternalReviewEvidence({
+      headSha: HEAD,
+      headArrivedAt: HEAD_ARRIVED,
+      policy: POLICY,
+      reviews: [],
+      comments: [
+        REQUEST,
+        {
+          login: 'chatgpt-codex-connector[bot]',
+          body: 'Codex Review: Didn\'t find any major issues.\n\n**Reviewed commit:** `01a4e58a10`',
+          created_at: '2026-08-24T07:19:58Z'
+        },
+        { login: 'bdelleman', body: '@codex review', created_at: '2026-08-24T08:30:00Z' }
+      ]
+    });
+    expect(evidence.answered_at).toBe('2026-08-24T07:19:58Z');
+    expect(externalReviewSettled(evidence, POLICY)).toBe(false);
+  });
+
   it('reopens the wait when a newer request outlives the last answer', () => {
     // A run that stops while Codex is still answering can be redispatched, and
     // the fresh run may post a second request. The first answer does not answer
